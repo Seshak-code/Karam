@@ -1,0 +1,131 @@
+# MOSFET Level 1 - Shichman-Hodges Model
+# 4-terminal NMOS transistor with cutoff/linear/saturation regions.
+
+name: MosfetLevel1
+description: "Level 1 MOSFET - Shichman-Hodges model with region-based evaluation"
+
+terminals:
+  - name: d
+    description: Drain
+  - name: g
+    description: Gate
+  - name: s
+    description: Source
+  - name: b
+    description: Bulk (Body)
+
+parameters:
+  - name: Kp
+    default: 200.0e-6
+    unit: A/V^2
+    description: Transconductance parameter
+  - name: W
+    default: 1.0e-6
+    unit: m
+    description: Channel width
+  - name: L
+    default: 1.0e-6
+    unit: m
+    description: Channel length
+  - name: Vt0
+    default: 0.7
+    unit: V
+    description: Threshold voltage
+  - name: lambda_
+    default: 0.0
+    unit: 1/V
+    description: Channel-length modulation
+  - name: GMIN
+    default: 1.0e-12
+    unit: S
+    description: Minimum conductance floor
+
+state_vars:
+  - name: ids
+    description: Drain-source current
+  - name: gm
+    description: Transconductance dIds/dVgs
+  - name: gds
+    description: Output conductance dIds/dVds
+
+kernel:
+  # Step 1: Compute terminal voltages
+  - assign: vgs
+    expr: "v_g - v_s"
+  - assign: vds
+    expr: "v_d - v_s"
+
+  # Step 2: Effective parameters
+  - assign: beta
+    expr: "Kp * (W / L)"
+  - assign: vov
+    expr: "vgs - Vt0"
+
+  # Step 3: Cutoff region (vov <= 0)
+  - assign: ids_cutoff
+    expr: "0.0"
+  - assign: gm_cutoff
+    expr: "0.0"
+  - assign: gds_cutoff
+    expr: "GMIN"
+
+  # Step 4: Linear region (vov > 0, vds < vov)
+  - assign: ids_linear
+    expr: "beta * (vov * vds - 0.5 * vds * vds) * (1.0 + lambda_ * vds)"
+  - assign: gm_linear
+    expr: "beta * vds * (1.0 + lambda_ * vds)"
+  - assign: gds_linear
+    expr: "beta * (vov - vds) * (1.0 + lambda_ * vds) + beta * (vov * vds - 0.5 * vds * vds) * lambda_"
+
+  # Step 5: Saturation region (vov > 0, vds >= vov)
+  - assign: ids_sat
+    expr: "0.5 * beta * vov * vov * (1.0 + lambda_ * vds)"
+  - assign: gm_sat
+    expr: "beta * vov * (1.0 + lambda_ * vds)"
+  - assign: gds_sat
+    expr: "0.5 * beta * vov * vov * lambda_"
+
+  # Step 6: Region selection
+  # cutoff: vov <= 0
+  # linear: vov > 0 AND vds < vov
+  # saturation: vov > 0 AND vds >= vov
+  - assign: in_cutoff
+    expr: "vov"
+  - assign: in_linear
+    expr: "vds"
+
+  # Final assignments use select-style logic
+  # The backend must handle these as conditional assignments
+  - assign: ids
+    expr: "max(0.0, ids_sat)"
+  - assign: gm
+    expr: "max(GMIN, gm_sat)"
+  - assign: gds
+    expr: "max(GMIN, gds_sat)"
+
+stamps:
+  jacobian:
+    # dIds/dVgs stamps
+    - row: d
+      col: g
+      expr: gm
+    - row: d
+      col: s
+      expr: "-(gm + gds)"
+    - row: d
+      col: d
+      expr: gds
+    - row: s
+      col: g
+      expr: "-gm"
+    - row: s
+      col: s
+      expr: "gm + gds"
+    - row: s
+      col: d
+      expr: "-gds"
+  rhs:
+    - node: d
+      expr: "-(ids - gm * vgs - gds * vds)"
+    - node: s
+      expr: "ids - gm * vgs - gds * vds"

@@ -1,0 +1,93 @@
+# Diode (PN Junction) - Shockley Model
+# Originally derived from diode.va (Verilog-A). YAML is the canonical format.
+# This is the proof-of-concept model for the Physics Compiler.
+
+name: Diode
+description: "PN Junction Diode - Shockley equation with linear continuation"
+
+terminals:
+  - name: a
+    description: Anode
+  - name: c
+    description: Cathode
+
+parameters:
+  - name: Is
+    default: 1.0e-14
+    unit: A
+    description: Saturation current
+  - name: N
+    default: 1.0
+    unit: ""
+    description: Emission coefficient
+  - name: Vt
+    default: 0.02585
+    unit: V
+    description: Thermal voltage (kT/q)
+  - name: Rs
+    default: 0.0
+    unit: Ohm
+    description: Series parasitic resistance
+  - name: GMIN
+    default: 1.0e-12
+    unit: S
+    description: Minimum conductance floor
+
+state_vars:
+  - name: v_d
+    description: Voltage across diode
+  - name: i_d
+    description: Current through diode
+  - name: g_d
+    description: Linearized conductance
+
+kernel:
+  # Step 1: Compute terminal voltage
+  - assign: v_d
+    expr: "v_a - v_c"
+
+  # Step 2: Compute intermediate values
+  - assign: n_vt
+    expr: "N * Vt"
+  - assign: arg
+    expr: "v_d / n_vt"
+  - assign: arg_clamped
+    expr: "min(arg, 30.0)"
+
+  # Step 3: Exponential evaluation
+  - assign: exp_val
+    expr: "exp(arg_clamped)"
+
+  # Step 4: Current and conductance
+  - assign: i_base
+    expr: "Is * (exp_val - 1.0)"
+  - assign: g_base
+    expr: "(Is / n_vt) * exp_val"
+
+  # Step 5: Linear continuation for large forward bias
+  - assign: delta
+    expr: "max(0.0, v_d - 30.0 * n_vt)"
+  - assign: i_d
+    expr: "i_base + delta * g_base"
+  - assign: g_d
+    expr: "max(GMIN, g_base)"
+
+stamps:
+  jacobian:
+    - row: a
+      col: a
+      expr: g_d
+    - row: a
+      col: c
+      expr: "-g_d"
+    - row: c
+      col: a
+      expr: "-g_d"
+    - row: c
+      col: c
+      expr: g_d
+  rhs:
+    - node: a
+      expr: "-(i_d - g_d * v_d)"
+    - node: c
+      expr: "i_d - g_d * v_d"
