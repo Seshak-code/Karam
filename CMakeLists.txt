@@ -73,10 +73,58 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Source files (populated incrementally as migration phases complete)
+# Source files
 # ---------------------------------------------------------------------------
-# Phase A: infra headers (header-only, no sources yet)
-# Phase B1+: source files added here per migration batch
+
+target_sources(acutesim_engine_objects PRIVATE
+    # === Façade (engine-api boundary) ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/engine_impl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_context_manager.cpp
+
+    # === Solvers ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/ac_solver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/fourier_analysis.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/pz_analysis.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/tf_analysis.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/superposition.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/webgpu_solver.cpp
+
+    # === Tensors (SIMD kernels) ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/kernel_dispatch.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_tensors.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
+
+    # === Infrastructure ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler_ctx.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
+
+    # === Netlist ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/netlist/netlist_export.cpp
+
+    # === Physics (Verilog-A model compiler pipeline) ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/physics/quick_analysis.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/lexer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/parser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/ast.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/analyzer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/graph_assembler.cpp
+)
+
+# AVX-512 source gets an explicit -mavx512f flag even if -march=native is absent
+if(NOT EMSCRIPTEN)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx512f"
+    )
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx2"
+    )
+endif()
 
 # ---------------------------------------------------------------------------
 # STATIC library wrapper
