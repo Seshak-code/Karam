@@ -6,7 +6,7 @@
 // ============================================================================
 
 #include "engine_api/simulation_dto.h"
-#include "components/circuit.h"
+#include "acutesim_engine/netlist/circuit.h"
 #include <vector>
 
 namespace acutesim {

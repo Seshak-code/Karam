@@ -10,10 +10,10 @@
 // Phase 4.5
 // ============================================================================
 
-#include "compute/solvers/tf_analysis.h"
+#include "acutesim_engine/solvers/tf_analysis.h"
 #include "compute/analysis_registry.h"
 #include "engine_api/simulation_dto.h"
-#include "compute/solvers/ac_solver.h"
+#include "acutesim_engine/solvers/ac_solver.h"
 
 #include <cmath>
 #include <algorithm>

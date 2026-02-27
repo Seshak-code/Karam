@@ -12,16 +12,16 @@
 // Phase 4.5 / Reconcile — stubs replaced with real implementations.
 // ============================================================================
 
-#include "compute/solvers/register_analyses.h"
+#include "acutesim_engine/solvers/register_analyses.h"
 #include "compute/analysis_registry.h"
-#include "compute/solvers/tf_analysis.h"
-#include "compute/solvers/pz_analysis.h"
-#include "compute/solvers/fourier_analysis.h"
+#include "acutesim_engine/solvers/tf_analysis.h"
+#include "acutesim_engine/solvers/pz_analysis.h"
+#include "acutesim_engine/solvers/fourier_analysis.h"
 
 // Full physics headers for handler implementations
-#include "physics/circuitsim.h"
-#include "physics/corner_config.h"
-#include "components/circuit.h"
+#include "acutesim_engine/physics/circuitsim.h"
+#include "acutesim_engine/physics/corner_config.h"
+#include "acutesim_engine/netlist/circuit.h"
 
 namespace acutesim {
 namespace compute {

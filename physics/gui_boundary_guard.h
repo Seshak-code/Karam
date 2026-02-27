@@ -12,7 +12,7 @@
 //   #include "engine_api/isimulation_driver.h"
 //
 // INCORRECT pattern (caught by this guard):
-//   #include "physics/circuitsim.h"   // ERROR in gui/ sources
+//   #include "acutesim_engine/physics/circuitsim.h"   // ERROR in gui/ sources
 // ============================================================================
 
 #ifdef ACUTESIM_GUI_BUILD

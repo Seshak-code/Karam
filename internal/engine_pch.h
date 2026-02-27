@@ -34,11 +34,11 @@
 #if __has_include("acutesim_engine/math/emulated_f64.h")
     #include "acutesim_engine/math/emulated_f64.h"
 #elif __has_include("compute/math/emulated_f64.h")
-    #include "compute/math/emulated_f64.h"   // transitional
+    #include "acutesim_engine/math/emulated_f64.h"   // transitional
 #endif
 
 #if __has_include("acutesim_engine/autodiff/dual.h")
     #include "acutesim_engine/autodiff/dual.h"
 #elif __has_include("autodiff/dual.h")
-    #include "autodiff/dual.h"               // transitional
+    #include "acutesim_engine/autodiff/dual.h"               // transitional
 #endif

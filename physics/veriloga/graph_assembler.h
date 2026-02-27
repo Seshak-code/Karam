@@ -9,7 +9,7 @@
 
 #include "ast.h"
 #include "analyzer.h"
-#include "components/circuit.h"
+#include "acutesim_engine/netlist/circuit.h"
 #include <string>
 
 namespace acutesim {
