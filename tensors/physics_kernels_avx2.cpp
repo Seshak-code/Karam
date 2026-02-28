@@ -3,7 +3,7 @@
 // Layout Hash: 5ecfcf18bdcf0ede
 // FMA: disabled (deterministic)
 
-#include "physics_tensors.h"  // Tensor structs
+#include "../tensors/physics_tensors.h"  // Tensor structs
 #include <vector>
 #include <cmath>
 #include <algorithm>

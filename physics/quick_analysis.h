@@ -1,8 +1,8 @@
 #pragma once
 
 #include <unordered_map>
-#include "circuit.h"
-#include "circuitsim.h"
+#include "acutesim_engine/netlist/circuit.h"
+#include "../physics/circuitsim.h"
 
 /**
  * QuickAnalysis - Fast approximate DC analysis for hover previews

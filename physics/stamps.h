@@ -1,5 +1,5 @@
 #pragma once
-#include "linalg.h"
+#include "../math/linalg.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>

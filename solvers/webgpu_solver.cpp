@@ -1,10 +1,11 @@
+#ifdef ACUTESIM_GPU_ENABLED
 /**
  * webgpu_solver.cpp
  * Phase D5b: Pipeline-overlapped hybrid NR loop.
  * GPU dispatches physics for iteration N+1 while CPU solves LU for iteration N.
  */
 
-#include "webgpu_solver.h"
+#include "../solvers/webgpu_solver.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -15,7 +16,7 @@
 #include <unordered_map>
 #include "../infrastructure/netlist_compiler.h"
 #include "../math/linalg.h"          // MatrixConstructor, solveLU_Pivoted, Csr_matrix
-#include "../../components/circuit.h" // Resistor, BJT, Mosfet, Diode, etc.
+#include "../netlist/circuit.h" // Resistor, BJT, Mosfet, Diode, etc.
 
 // Helper for Dawn's WGPUStringView API
 #ifdef __EMSCRIPTEN__
@@ -129,6 +130,16 @@ WebGPUSolver::WebGPUSolver() {
     initWebGPU();
 }
 
+WebGPUSolver::WebGPUSolver(WGPUDevice externalDevice, WGPUQueue externalQueue)
+    : device(externalDevice)
+    , queue(externalQueue)
+    , ownsDevice_(false)
+{
+    // procs already registered by GPUContextManager::initialize().
+    // Device already created — skip initWebGPU().
+    // Caller (GPUContextManager) retains ownership and must outlive this solver.
+}
+
 WebGPUSolver::~WebGPUSolver() {
     auto rel = [](WGPUBuffer& b){ if(b){ wgpuBufferRelease(b); b=nullptr; } };
     rel(diodeSoABuffer);   rel(mosfetSoABuffer); rel(bjtSoABuffer);
@@ -154,9 +165,11 @@ WebGPUSolver::~WebGPUSolver() {
     relPL(residualPipeline);       relPL(convergencePipeline);
     relPL(recordWaveformPipeline);
 
-    if (queue)    wgpuQueueRelease(queue);
-    if (device)   wgpuDeviceRelease(device);
-    if (instance) wgpuInstanceRelease(instance);
+    // Only release handles we own. When constructed via the external-device
+    // ctor (ownsDevice_ = false), these handles are owned by GPUContextManager.
+    if (queue    && ownsDevice_) wgpuQueueRelease(queue);
+    if (device   && ownsDevice_) wgpuDeviceRelease(device);
+    if (instance && ownsDevice_) wgpuInstanceRelease(instance);
 }
 
 bool WebGPUSolver::initWebGPU() {
@@ -171,8 +184,12 @@ bool WebGPUSolver::initWebGPU() {
     instance = wgpuCreateInstance(nullptr);
     if (!instance) { std::cerr << "[ERROR] WGPU Instance failed\n"; return false; }
 
-    static auto nativeInstance = new dawn::native::Instance();
-    auto adapters = nativeInstance->EnumerateAdapters();
+    // Stack-allocated static: avoids heap leak while still providing
+    // one-time construction (function-local statics are fine here because
+    // initWebGPU() is only called from the default ctor — the owning-device
+    // path. The GPUContextManager path uses the external-device ctor instead).
+    static dawn::native::Instance nativeInstance;
+    auto adapters = nativeInstance.EnumerateAdapters();
 
     dawn::native::Adapter selected;
     for (auto& a : adapters) {
@@ -619,10 +636,12 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
         // Dispatch GPU physics + assembly (uses uploaded voltages)
         dispatchPhysicsAsync(time, h);
 
-        // CPU: stamp all devices (linear + nonlinear via MatrixConstructor)
-        // Note: in the full pipeline-overlap design, we'd merge GPU Jacobian
-        // readback with CPU linear stamps. For this iteration we use the
-        // CPU-only path to guarantee correctness; GPU overlap hides latency.
+        // CPU: stamp all devices (linear + nonlinear via MatrixConstructor).
+        // Phase 4 overlap TODO: replace this block with initiateReadback() +
+        // readback-wait to merge GPU Jacobian/RHS into CPU LU solve. For now
+        // the CPU-only stamping path ensures correctness; the GPU physics
+        // dispatch above (dispatchPhysicsAsync) is waveform-recording
+        // infrastructure and a latency-hiding scaffold for that upgrade.
         MatrixConstructor mc;
         mc.setDimensions((int)N, (int)N);
         std::vector<double> rhs(N, 0.0);
@@ -635,11 +654,11 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
             if (n1 >= 0) { mc.add(n1, n1, g); if (n2 >= 0) mc.add(n1, n2, -g); }
             if (n2 >= 0) { mc.add(n2, n2, g); if (n1 >= 0) mc.add(n2, n1, -g); }
         }
-        // Stamp voltage sources (KVL: treat as large conductance for simplified NR)
+        // Stamp voltage sources (stiff conductance — matches stampSoABlock g_int=1e3)
         for (const auto& vs : netlist.globalBlock.voltageSources) {
             int np = vs.nodePositive - 1;
             int nn = vs.nodeNegative - 1;
-            const double G_VS = 1e6; // Stiff conductance approximation
+            const double G_VS = 1e3; // Must match circuitsim.h::stampSoABlock g_int=1e3
             if (np >= 0) { mc.add(np, np, G_VS); rhs[np] += G_VS * vs.voltage_V; }
             if (nn >= 0) { mc.add(nn, nn, G_VS); rhs[nn] -= G_VS * vs.voltage_V; }
         }
@@ -773,3 +792,10 @@ void WebGPUSolver::recordCopyToStaging(WGPUCommandEncoder enc,
 }
 
 void WebGPUSolver::createBindGroups() {}
+
+#else
+// Stub for non-GPU builds
+#include "../solvers/webgpu_solver.h"
+WebGPUSolver::WebGPUSolver() {}
+WebGPUSolver::~WebGPUSolver() {}
+#endif

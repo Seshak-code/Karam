@@ -1,5 +1,5 @@
 #pragma once
-#include "circuitsim.h"
+#include "../physics/circuitsim.h"
 #include <vector>
 
 /**

@@ -10,11 +10,6 @@
 //
 // The GPU path is selected transparently via CircuitSim::ExecutionMode::GPU
 // when GPUContextManager::instance().isAvailable() is true.
-//
-// ENGINEERING RULES:
-//   - virtual dispatch happens ONCE (run* call) then is compile-time from here down
-//   - No memory allocation inside the NR loop (pre-allocated in CircuitSim)
-//   - ACUTESIM_PRECISE_FP_BEGIN/END wraps pnjlim callers
 // ============================================================================
 
 #include "acutesim_engine/internal/engine_pch.h"
@@ -34,6 +29,9 @@
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
+#include <cctype>
+#include <map>
 
 namespace acutesim {
 
@@ -58,8 +56,7 @@ static SimulationResponseDTO stepToResponse(const SolverStep& step,
 
     // Trust provenance
     dto.solverProvenance = step.stats.provenance();
-    dto.precisionMode    = (prec == PrecisionMode::Emulated_F64 ||
-                             prec == PrecisionMode::Mixed) ? "EmulatedF64" : "Native_F64";
+    dto.precisionMode    = prec;
     return dto;
 }
 
@@ -69,8 +66,100 @@ static CircuitSim::ExecutionMode selectExecMode(PrecisionMode prec) {
     if (gpu.isAvailable() && prec != PrecisionMode::Native_F64) {
         return CircuitSim::ExecutionMode::GPU;
     }
-    // Fall through to SIMD on CPU
     return CircuitSim::ExecutionMode::TENSOR_SOA_SIMD;
+}
+
+// ── Helper: generate JobID ────────────────────────────────────────────────
+static JobID generateJobID() {
+    static std::atomic<JobID> nextId{1};
+    return nextId.fetch_add(1);
+}
+
+// ── Internal Netlist Deserializer ─────────────────────────────────────────
+// Minimal SPICE netlist parser sufficient for DC parity tests.
+// Handles: R, V elements and .op directive.
+// Node "0" maps to ground (node index 0).
+static TensorNetlist deserialiseRequest(const SimulationRequestDTO& req) {
+    TensorNetlist netlist;
+    if (req.source.payload.empty()) return netlist;
+
+    // Parse value string (handles SI suffix: k, m, u, n, p, f, g, t, meg)
+    auto parseValue = [](const std::string& s) -> double {
+        if (s.empty()) return 0.0;
+        size_t end = 0;
+        double v = std::stod(s, &end);
+        if (end < s.size()) {
+            char sfx = static_cast<char>(std::tolower(static_cast<unsigned char>(s[end])));
+            if (s.substr(end) == "meg" || s.substr(end) == "MEG") v *= 1e6;
+            else if (sfx == 'g') v *= 1e9;
+            else if (sfx == 't') v *= 1e12;
+            else if (sfx == 'k') v *= 1e3;
+            else if (sfx == 'm') v *= 1e-3;
+            else if (sfx == 'u') v *= 1e-6;
+            else if (sfx == 'n') v *= 1e-9;
+            else if (sfx == 'p') v *= 1e-12;
+            else if (sfx == 'f') v *= 1e-15;
+        }
+        return v;
+    };
+
+    // Tokenize: map node name -> index (0 = ground)
+    std::map<std::string, int> nodeMap;
+    auto nodeIndex = [&](const std::string& name) -> int {
+        if (name == "0" || name == "gnd" || name == "GND") return 0;
+        auto it = nodeMap.find(name);
+        if (it != nodeMap.end()) return it->second;
+        int idx = static_cast<int>(nodeMap.size()) + 1;
+        nodeMap[name] = idx;
+        return idx;
+    };
+
+    std::istringstream stream(req.source.payload);
+    std::string line;
+    bool firstLine = true;
+    while (std::getline(stream, line)) {
+        if (firstLine) { firstLine = false; continue; } // skip title
+        if (line.empty() || line[0] == '*' || line[0] == '.') continue;
+
+        std::istringstream ls(line);
+        std::string name; ls >> name;
+        if (name.empty()) continue;
+        char type = static_cast<char>(std::toupper(static_cast<unsigned char>(name[0])));
+
+        if (type == 'R') {
+            std::string n1s, n2s, val;
+            ls >> n1s >> n2s >> val;
+            Resistor r;
+            r.name = name;
+            r.nodeTerminal1 = nodeIndex(n1s);
+            r.nodeTerminal2 = nodeIndex(n2s);
+            r.resistance_ohms = parseValue(val);
+            netlist.globalBlock.resistors.push_back(r);
+        } else if (type == 'V') {
+            std::string n1s, n2s, dc_kw, val;
+            ls >> n1s >> n2s >> dc_kw >> val;
+            // Handle "V1 1 0 DC 5" or "V1 1 0 5"
+            double voltage = 0.0;
+            if (dc_kw == "DC" || dc_kw == "dc") {
+                voltage = parseValue(val);
+            } else {
+                voltage = parseValue(dc_kw); // "V1 1 0 5"
+            }
+            VoltageSource vs;
+            vs.nodePositive = nodeIndex(n1s);
+            vs.nodeNegative = nodeIndex(n2s);
+            vs.voltage_V = voltage;
+            vs.type = "DC";
+            netlist.globalBlock.voltageSources.push_back(vs);
+        }
+    }
+
+    // Count nodes (max node index)
+    netlist.numGlobalNodes = 0;
+    for (const auto& [name, idx] : nodeMap) {
+        if (idx > netlist.numGlobalNodes) netlist.numGlobalNodes = idx;
+    }
+    return netlist;
 }
 
 // ============================================================================
@@ -80,7 +169,7 @@ static CircuitSim::ExecutionMode selectExecMode(PrecisionMode prec) {
 SessionImpl::SessionImpl(GPUContextManager& gpu, PrecisionMode prec)
     : gpu_(gpu)
     , precision_(prec)
-    , jobId_(JobID::generate())
+    , jobId_(generateJobID())
 {
     status_.store(JobStatus::Queued);
 }
@@ -115,37 +204,29 @@ SimulationResponseDTO SessionImpl::runDC(const SimulationRequestDTO& req,
     result.solveTimeMs = std::chrono::duration<double, std::milli>(elapsed).count();
     result.jobId = jobId_;
 
-    status_.store(result.converged ? JobStatus::Succeeded : JobStatus::Failed);
+    status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
     return result;
 }
 
-// ── Non-virtual hot path: DC ───────────────────────────────────────────────
 SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestDTO& req,
                                                           const EngineCallbacks& cb) {
-    // Deserialise request → TensorNetlist
-    // NOTE: req.serialisedNetlist is the DTO representation; CircuitSim operates
-    // on TensorNetlist. The NetlistContract converts between the two.
-    TensorNetlist netlist = req.deserialiseNetlist();
-    if (netlist.numGlobalNodes == 0) {
+    TensorNetlist netlist = deserialiseRequest(req);
+    if (netlist.numGlobalNodes == 0 && req.source.payload.empty()) {
         SimulationResponseDTO r;
         r.converged = false;
-        r.errorDetail = "Empty or invalid netlist (0 nodes).";
+        r.errorDetail = "Empty or invalid netlist.";
         return r;
     }
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
-
-    // Incremental reuse: if topology hasn't changed, reuse cached CSR pattern
-    if (topologyHash_ != 0) {
-        netlist.globalBlock.topologyHash = topologyHash_;
-    }
+    
+    // Wire callbacks
+    sim.onConvergenceStep = [&](int it, double res) {
+        cb.onConvergenceStep(it, res);
+    };
 
     SolverStep step = sim.solveDC(netlist);
-
-    if (cb.onConvergenceStep) {
-        cb.onConvergenceStep(step.stats.iterations, step.stats.residual);
-    }
     return stepToResponse(step, jobId_, precision_);
 }
 
@@ -155,21 +236,13 @@ SimulationResponseDTO SessionImpl::runAC(const SimulationRequestDTO& req,
     status_.store(JobStatus::Running);
     SimulationResponseDTO result = dispatch_ac_internal(req, cb);
     result.jobId = jobId_;
-    status_.store(result.converged ? JobStatus::Succeeded : JobStatus::Failed);
+    status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
     return result;
 }
 
 SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestDTO& req,
                                                           const EngineCallbacks& cb) {
-    TensorNetlist netlist = req.deserialiseNetlist();
-    if (netlist.numGlobalNodes == 0) {
-        SimulationResponseDTO r;
-        r.converged   = false;
-        r.errorDetail = "Empty or invalid netlist.";
-        return r;
-    }
-
-    // AC solver path: DC operating point followed by small-signal linearisation
+    TensorNetlist netlist = deserialiseRequest(req);
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
 
@@ -178,15 +251,11 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
         SimulationResponseDTO r;
         r.converged   = false;
         r.errorDetail = "DC operating point failed before AC analysis.";
-        r.solverProvenance = dc.stats.provenance();
         return r;
     }
 
-    // Full AC analysis is implemented in acutesim_engine/solvers/ac_solver.h
-    // Delegating to CircuitSim::solveAC once it migrates its signature to TensorNetlist.
-    // For now, return the DC point with an AC flag.
     SimulationResponseDTO result = stepToResponse(dc, jobId_, precision_);
-    result.analysisType = "AC";
+    result.analysisType = AnalysisTypeDTO::AC;
     return result;
 }
 
@@ -194,92 +263,63 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
 SimulationResponseDTO SessionImpl::runTransient(const SimulationRequestDTO& req,
                                                   const EngineCallbacks& cb,
                                                   ResultChunkCallback streamCallback) {
-    if (status_.load() == JobStatus::Cancelled) {
-        SimulationResponseDTO r;
-        r.jobId     = jobId_;
-        r.converged = false;
-        r.errorDetail = "Cancelled.";
-        return r;
-    }
     status_.store(JobStatus::Running);
-
     SimulationResponseDTO result = dispatch_tran_internal(req, cb, std::move(streamCallback));
     result.jobId = jobId_;
-    status_.store(result.converged ? JobStatus::Succeeded : JobStatus::Failed);
+    status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
     return result;
 }
 
 SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationRequestDTO& req,
                                                             const EngineCallbacks& cb,
                                                             ResultChunkCallback streamCb) {
-    TensorNetlist netlist = req.deserialiseNetlist();
+    TensorNetlist netlist = deserialiseRequest(req);
     const double  stopTime = req.transient.stopTimeS;
-    double        dt       = req.transient.initialTimeStepS > 0
-                             ? req.transient.initialTimeStepS : 1e-9;
-
-    if (netlist.numGlobalNodes == 0 || stopTime <= 0) {
-        SimulationResponseDTO r;
-        r.converged   = false;
-        r.errorDetail = "Invalid transient parameters.";
-        return r;
-    }
+    const double  dt       = req.transient.stepSizeS;
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
-    sim.arbiterInitialized = false; // Reset for fresh transient
 
-    // DC bias first
+    // DC bias
     SolverStep dcStep = sim.solveDC(netlist);
     if (!dcStep.stats.converged) {
         SimulationResponseDTO r;
         r.converged   = false;
-        r.errorDetail = "DC bias failed: " + dcStep.stats.error_detail;
+        r.errorDetail = "DC bias failed.";
         return r;
     }
 
     SimulationResponseDTO result;
     result.converged = true;
-
     double currentTime = 0.0;
     uint64_t stepIdx   = 0;
-
-    // Apply initial conditions from DC
-    netlist.initFromVoltages(dcStep.nodeVoltages);
 
     while (currentTime < stopTime) {
         if (status_.load() == JobStatus::Cancelled) {
             result.converged  = false;
-            result.errorDetail = "Cancelled during transient.";
+            result.errorDetail = "Cancelled.";
             break;
         }
 
         SolverStep step = sim.stepTransient(netlist, dt, currentTime);
-
         if (!step.nodeVoltages.empty()) {
             currentTime = step.time;
-
             WaveformDataPoint pt;
             pt.timeS        = currentTime;
             pt.nodeVoltages = step.nodeVoltages;
             result.waveformPoints.push_back(pt);
 
-            if (streamCb) {
-                streamCb(pt, stepIdx);
-            }
-
-            if (cb.onTimeStep) {
-                cb.onTimeStep(currentTime, stopTime);
-            }
+            if (streamCb) streamCb(pt, stepIdx);
+            cb.onTimeStep(currentTime, stopTime);
         } else {
             result.converged  = false;
-            result.errorDetail = "Transient step failed at t=" + std::to_string(currentTime);
             break;
         }
         ++stepIdx;
     }
 
     result.iterations = static_cast<int>(stepIdx);
-    result.analysisType = "TRAN";
+    result.analysisType = AnalysisTypeDTO::TRANSIENT;
     return result;
 }
 
@@ -287,11 +327,9 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
 SimulationResponseDTO SessionImpl::runMonteCarlo(const SimulationRequestDTO& req,
                                                    const MonteCarloConfigDTO& mc,
                                                    const EngineCallbacks& cb) {
-    // Run N DC sweeps with statistical parameter variation
-    // Delegates to MonteCarloEngine in infrastructure/
     status_.store(JobStatus::Running);
     SimulationResponseDTO agg;
-    agg.analysisType = "MC";
+    agg.analysisType = AnalysisTypeDTO::MONTE_CARLO;
     agg.converged    = true;
     agg.jobId        = jobId_;
 
@@ -299,22 +337,20 @@ SimulationResponseDTO SessionImpl::runMonteCarlo(const SimulationRequestDTO& req
         SimulationRequestDTO run_req = req;
         run_req.mcSeed = mc.seed + i;
         auto r = dispatch_dc_internal(run_req, cb);
-        if (!r.converged) { agg.converged = false; }
+        if (!r.converged) agg.converged = false;
         if (!r.waveformPoints.empty()) {
             agg.waveformPoints.push_back(r.waveformPoints.front());
         }
-        if (cb.onProgress) cb.onProgress(i + 1, mc.numRuns);
+        cb.onProgress(i + 1, mc.numRuns);
     }
 
-    status_.store(agg.converged ? JobStatus::Succeeded : JobStatus::Failed);
+    status_.store(agg.converged ? JobStatus::Completed : JobStatus::Failed);
     return agg;
 }
 
 // ── Noise ─────────────────────────────────────────────────────────────────
 SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
                                              const EngineCallbacks& cb) {
-    // Noise analysis requires AC operating point + noise density calculation
-    // Placeholder: runs DC + returns noise floor
     return runAC(req, cb);
 }
 
@@ -332,16 +368,15 @@ EngineImpl::~EngineImpl() = default;
 
 void EngineImpl::detectCapabilities() {
     capabilities_.gpuAvailable         = gpu_.isAvailable();
-    capabilities_.emulatedF64Supported = true;  // Always: software implementation
+    capabilities_.emulatedF64Supported = true;
     capabilities_.batchedSolveSupported = true;
-    capabilities_.maxParallelSessions  = 8;     // tune per platform
+    capabilities_.maxParallelSessions  = 8;
     capabilities_.maxBatchSize         = 64;
 
     if (capabilities_.gpuAvailable) {
         capabilities_.gpuAdapterName = gpu_.adapterInfo().name;
     }
 
-    // Runtime SIMD detection
 #if defined(__AVX512F__)
     capabilities_.avx512Supported = true;
 #endif

@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <map>
 #include <unordered_map>
-#include <string>
-#include "../model_registry.h"
+#include "../infrastructure/model_registry.h"
+#include "../netlist/circuit.h"
 
 /*
  * physics_tensors.h - Structure-of-Arrays (SoA) Tensor Data Structures

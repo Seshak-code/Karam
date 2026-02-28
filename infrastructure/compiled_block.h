@@ -1,8 +1,8 @@
 #pragma once
 
 #include "../tensors/physics_tensors.h"
-#include "../../components/circuit.h"   // TensorNetlist (embedded structural copy)
-#include "../../components/design_db.h" // NetUUID
+#include "../netlist/circuit.h"   // TensorNetlist (embedded structural copy)
+#include "components/design_db.h" // NetUUID — in components/ (not migrated)
 #include <cstddef>
 #include <memory>
 #include <string>

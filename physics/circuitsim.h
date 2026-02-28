@@ -1,8 +1,8 @@
 #pragma once
 #include "gui_boundary_guard.h"
-#include "circuit.h"
-#include "linalg.h"
-#include "../compute/infrastructure/compiled_block.h"
+#include "../netlist/circuit.h"
+#include "../math/linalg.h"
+#include "../infrastructure/compiled_block.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -21,23 +21,23 @@
 #include "../autodiff/dual.h"
 #include "device_physics.h"
 #include "physics_constants.h"
-#include "physics_tensors.h"
+#include "../tensors/physics_tensors.h"
 #include "stamps.h"
-#include "../compute/model_registry.h"
+#include "../infrastructure/model_registry.h"
 
 // ============================================================================
 // CIRCUITSIM CLASS
 // ============================================================================
 
-#include "simtrace.h"
-#include "tensorscheduler.h"
+#include "../infrastructure/simtrace.h"
+#include "../infrastructure/tensorscheduler.h"
 #include "corner_config.h"
 
 // ============================================================================
 // CIRCUITSIM CLASS
 // ============================================================================
 
-#include "integration_method.h"
+#include "../math/integration_method.h"
 
 /**
  * CircuitSim is the primary engine of the simulator.
@@ -301,6 +301,10 @@ public:
   // CSR pattern cache (Sparse Merge — Phase D5): frozen per topology change
   std::unique_ptr<CachedCsrPattern> cachedPattern_;
   uint64_t cachedPatternHash_ = 0;  // topology hash when pattern was last built
+
+  // Callbacks for orchestration
+  std::function<void(int, double)> onConvergenceStep;
+  std::function<void(float)>       onProgress;
 
   // Phase 2.10: Expose cached pattern for AC solver fast-path
   const CachedCsrPattern* getCachedPattern() const { return cachedPattern_.get(); }
@@ -1004,13 +1008,12 @@ public:
       }
   }
 
-  // ── Legacy API (internal — used by compiled-block overloads) ─────────
   SolverStep solveDC(TensorNetlist &netlist);
-  SolverStep stepTransient(TensorNetlist &netlist, double &timeStep, double currentTime);
+  SolverStep stepTransient(TensorNetlist &netlist, double timeStep, double currentTime);
   
   // ── New API: Solver operates on pre-compiled block only ─────────────
   SolverStep solveDC(const CompiledTensorBlock& block);
-  SolverStep stepTransient(const CompiledTensorBlock& block, double &timeStep, double currentTime);
+  SolverStep stepTransient(const CompiledTensorBlock& block, double timeStep, double currentTime);
   
   void resetArbiter() { arbiterInitialized = false; }
 
@@ -2808,6 +2811,7 @@ public:
     }
   }
 
+  // Placeholder for audit logic (implemented in audit file)
 #include "circuitsim_audit.inc"
 };
 

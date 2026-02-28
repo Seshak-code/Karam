@@ -1,5 +1,5 @@
 #include "netlist_compiler.h"
-#include "../../components/circuit.h"
+#include "../netlist/circuit.h"
 #include "../tensors/physics_tensors.h"
 
 /**

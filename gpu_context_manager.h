@@ -25,6 +25,11 @@
 #include <webgpu/webgpu_cpp.h>
 using GPUDevice = wgpu::Device;
 using GPUQueue  = wgpu::Queue;
+#ifndef __EMSCRIPTEN__
+// Forward declaration: avoids pulling DawnNative.h into every translation unit.
+// Full type required only in gpu_context_manager.cpp (where DawnNative.h is included).
+namespace dawn { namespace native { class Instance; } }
+#endif
 #else
 // Stub types for CPU-only builds
 struct GPUDevice { bool valid() const { return false; } };
@@ -55,7 +60,15 @@ public:
     GPUAdapterInfo  adapterInfo() const;
     GPUQueue        sharedQueue() const;
 
-    // Called during engine shutdown — release all Dawn resources
+#ifdef ACUTESIM_GPU_ENABLED
+    // Raw handle accessors for C-API consumers (e.g. WebGPUSolver).
+    // Caller must NOT release these handles — the Manager owns them.
+    WGPUDevice  rawDevice() const;
+    WGPUQueue   rawQueue()  const;
+#endif
+
+    // Called during engine shutdown — release all Dawn resources.
+    // Must not be called concurrently with acquire() or sharedQueue().
     void shutdown();
 
     // Non-copyable singleton
@@ -78,7 +91,10 @@ private:
     GPUDevice         primaryDevice_;
     GPUQueue          queue_;
     std::vector<GPUDevice> pool_;
-    std::mutex        poolMutex_;
+    mutable std::mutex poolMutex_;
+#ifndef __EMSCRIPTEN__
+    std::unique_ptr<dawn::native::Instance> nativeInstance_;
+#endif
 #endif
 };
 

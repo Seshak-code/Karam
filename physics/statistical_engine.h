@@ -5,7 +5,7 @@
 #include <map>
 #include <cmath>
 #include <algorithm>
-#include "../components/circuit.h"
+#include "../netlist/circuit.h"
 
 /**
  * statistical_engine.h

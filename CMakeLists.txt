@@ -15,18 +15,11 @@ cmake_minimum_required(VERSION 3.20)
 add_library(acutesim_engine_objects OBJECT)
 
 # === HARDENING: Symbol Visibility Discipline ===
-# Without -fvisibility=hidden:
-#   - templates leak ABI across translation units
-#   - internal solver symbols become link dependencies
-#   - .so/.dylib transition breaks instantly
-# Only ENGINE_API-annotated symbols escape into consumers.
 target_compile_options(acutesim_engine_objects PRIVATE
     -fvisibility=hidden
     -fvisibility-inlines-hidden
 )
 
-# Performance flags — safe because EmulatedF64 covers IEEE-critical paths.
-# Sections requiring strict IEEE compliance use ACUTESIM_PRECISE_FP_BEGIN/END.
 if(NOT EMSCRIPTEN)
     target_compile_options(acutesim_engine_objects PRIVATE
         -ffast-math
@@ -34,9 +27,9 @@ if(NOT EMSCRIPTEN)
     )
 endif()
 
-target_compile_options(acutesim_engine_objects PRIVATE
-    -fno-rtti
-    -fno-exceptions       # No exception overhead in hot path
+# Enable exceptions and RTTI for legacy solver logic
+set_target_properties(acutesim_engine_objects PROPERTIES
+    COMPILE_FLAGS "-O3 -march=native"
 )
 
 target_compile_definitions(acutesim_engine_objects PRIVATE
@@ -46,30 +39,32 @@ target_compile_definitions(acutesim_engine_objects PRIVATE
 # ---------------------------------------------------------------------------
 # Include directories
 # ---------------------------------------------------------------------------
-# PUBLIC: only engine_api/ is visible to consumers — never acutesim_engine/ internals
-# PRIVATE: internal directory is for engine code only
 target_include_directories(acutesim_engine_objects
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/engine_api>
         $<INSTALL_INTERFACE:include/engine_api>
     PRIVATE
         ${CMAKE_SOURCE_DIR}/acutesim_engine
-        ${CMAKE_SOURCE_DIR}   # for transitional includes during migration
+        ${CMAKE_SOURCE_DIR}   # for transitional includes
 )
 
 # ---------------------------------------------------------------------------
-# GPU: Dawn/WebGPU — PRIVATE only, consumers never see GPU types
+# GPU: Dawn/WebGPU
 # ---------------------------------------------------------------------------
-if(TARGET dawn::webgpu)
+if(NOT EMSCRIPTEN AND TARGET dawn_native)
+    target_include_directories(acutesim_engine_objects PRIVATE
+        ${DAWN_INTERNAL_INCLUDES}
+    )
     target_link_libraries(acutesim_engine_objects PRIVATE
-        dawn::webgpu
-        dawn::native
+        dawn_native
+        dawn_proc
+        webgpu_cpp
     )
     target_compile_definitions(acutesim_engine_objects PRIVATE
         ACUTESIM_GPU_ENABLED=1
+        ACUTESIM_HAS_DAWN_NATIVE=1
+        ACUTESIM_GPU_PROBE_AVAILABLE=1
     )
-else()
-    message(STATUS "acutesim_engine: Dawn not found — GPU solver disabled")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -81,6 +76,12 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/engine_impl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_context_manager.cpp
 
+    # === Infrastructure ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler_ctx.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
+
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/ac_solver.cpp
@@ -90,17 +91,14 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/superposition.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/webgpu_solver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/analysis_registry.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/staged_dispatcher.cpp
 
     # === Tensors (SIMD kernels) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/kernel_dispatch.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_tensors.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
-
-    # === Infrastructure ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler_ctx.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
 
     # === Netlist ===
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/netlist_export.cpp
@@ -114,16 +112,18 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/graph_assembler.cpp
 )
 
-# AVX-512 source gets an explicit -mavx512f flag even if -march=native is absent
+# AVX-512 source flags
 if(NOT EMSCRIPTEN)
-    set_source_files_properties(
-        ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
-        PROPERTIES COMPILE_OPTIONS "-mavx512f"
-    )
-    set_source_files_properties(
-        ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
-        PROPERTIES COMPILE_OPTIONS "-mavx2"
-    )
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)")
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f"
+        )
+        set_source_files_properties(
+            ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2"
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -133,13 +133,20 @@ add_library(acutesim_engine STATIC
     $<TARGET_OBJECTS:acutesim_engine_objects>
 )
 
-# Re-export the PUBLIC include directories so linking targets pick them up
 target_link_libraries(acutesim_engine PUBLIC acutesim_engine_objects)
 
+if(NOT EMSCRIPTEN AND TARGET dawn_native)
+    target_link_libraries(acutesim_engine PUBLIC
+        dawn_native
+        dawn_proc
+        webgpu_cpp
+    )
+endif()
+
 # ---------------------------------------------------------------------------
-# Headless CLI runner (Phase E verification)
+# CLI — Engine Consumer
 # ---------------------------------------------------------------------------
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cli/engine_cli_main.cpp)
     add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
-    target_link_libraries(acutesim_engine_cli PRIVATE acutesim_engine)
+    target_link_libraries(acutesim_engine_cli PRIVATE acutesim_sim_layer acutesim_orchestration acutesim_engine)
 endif()

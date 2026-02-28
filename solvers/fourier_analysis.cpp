@@ -9,7 +9,7 @@
 // ============================================================================
 
 #include "acutesim_engine/solvers/fourier_analysis.h"
-#include "compute/analysis_registry.h"
+#include "acutesim_engine/solvers/analysis_registry.h"
 #include "engine_api/simulation_dto.h"
 
 #include <cmath>
@@ -62,7 +62,7 @@ SimulationResponseDTO runFourierAnalysis(
     const int N = static_cast<int>(waveform.size());
     if (N < 4 || timeVector.size() < 2) {
         resp.success      = false;
-        resp.errorMessage = "Fourier analysis: insufficient transient data (need >= 4 samples)";
+        resp.errorDetail = "Fourier analysis: insufficient transient data (need >= 4 samples)";
         return resp;
     }
 
@@ -83,12 +83,12 @@ SimulationResponseDTO runFourierAnalysis(
         try { return std::stoi(it->second); } catch (...) { return def; }
     };
 
-    double fundamentalHz = getParam("fundamental", 1e3);
+    double fundamentalFrequencyHz = getParam("fundamental", 1e3);
     int    harmonicCount = getParamInt("harmonics", 9);
     harmonicCount = std::max(1, std::min(harmonicCount, 20));
 
     FourierResultDTO fourier;
-    fourier.fundamentalHz = fundamentalHz;
+    fourier.fundamentalFrequencyHz = fundamentalFrequencyHz;
 
     const double toDB  = 20.0 / std::log(10.0);
     const double toDeg = 180.0 / M_PI;
@@ -109,11 +109,10 @@ SimulationResponseDTO runFourierAnalysis(
     double harm_power_sum = 0.0;
 
     for (int h = 1; h <= harmonicCount; ++h) {
-        double freq = h * fundamentalHz;
+        double freq = h * fundamentalFrequencyHz;
         Complex c   = goertzel(sig, freq, sampleRateHz);
         double mag  = std::abs(c) * 2.0; // one-sided spectrum
 
-        fourier.harmonicFreqHz.push_back(freq);
         fourier.harmonicMagDb.push_back(
             toDB * std::log(std::max(mag, 1e-300)));
         fourier.harmonicPhaseDeg.push_back(std::arg(c) * toDeg);
@@ -148,7 +147,7 @@ orchestration::SimulationResponseDTO fourierStub(
 {
     orchestration::SimulationResponseDTO r;
     r.success = false;
-    r.errorMessage = "FOURIER: use ISimulationDriver::submitJob with AnalysisTypeDTO::FOURIER";
+    r.errorDetail = "FOURIER: use ISimulationDriver::submitJob with AnalysisTypeDTO::FOURIER";
     return r;
 }
 

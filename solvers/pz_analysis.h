@@ -7,6 +7,7 @@
 
 #include "engine_api/simulation_dto.h"
 #include "acutesim_engine/netlist/circuit.h"
+#include "engine_api/isimulation_engine.h"
 #include <vector>
 
 namespace acutesim {
@@ -15,16 +16,8 @@ namespace solvers {
 
 /**
  * Run pole-zero analysis.
- *
- * Builds the linearised Y(0) Jacobian at the DC operating point,
- * then computes eigenvalues via power iteration to find poles.
- *
- * @param netlist     Fully-constructed TensorNetlist.
- * @param dcSolution  DC operating-point voltages.
- * @param req         Request carrying parameters and topologyHash.
- * @return            SimulationResponseDTO with extended.pz populated.
  */
-orchestration::SimulationResponseDTO runPZAnalysis(
+ENGINE_API orchestration::SimulationResponseDTO runPZAnalysis(
     const TensorNetlist& netlist,
     const std::vector<double>& dcSolution,
     const orchestration::SimulationRequestDTO& req);

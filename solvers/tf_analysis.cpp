@@ -11,7 +11,7 @@
 // ============================================================================
 
 #include "acutesim_engine/solvers/tf_analysis.h"
-#include "compute/analysis_registry.h"
+#include "acutesim_engine/solvers/analysis_registry.h"
 #include "engine_api/simulation_dto.h"
 #include "acutesim_engine/solvers/ac_solver.h"
 
@@ -71,7 +71,7 @@ SimulationResponseDTO runTFAnalysis(
 
     if (netlist.numGlobalNodes == 0) {
         resp.success      = false;
-        resp.errorMessage = "TF analysis: empty netlist";
+        resp.errorDetail = "TF analysis: empty netlist";
         return resp;
     }
 
@@ -160,7 +160,7 @@ orchestration::SimulationResponseDTO tfStub(
 {
     orchestration::SimulationResponseDTO r;
     r.success = false;
-    r.errorMessage = "TF: use ISimulationDriver::submitJob with AnalysisTypeDTO::TRANSFER_FUNCTION";
+    r.errorDetail = "TF: use ISimulationDriver::submitJob with AnalysisTypeDTO::TRANSFER_FUNCTION";
     return r;
 }
 

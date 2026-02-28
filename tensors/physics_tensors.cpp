@@ -1,6 +1,7 @@
-#include "physics_tensors.h"
+#include "../tensors/physics_tensors.h"
 #include "kernel_dispatch.h"
-#include "../../components/circuit.h"
+#include "../infrastructure/model_registry.h"
+#include "../netlist/circuit.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>

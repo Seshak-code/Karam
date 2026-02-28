@@ -1,6 +1,6 @@
 #pragma once
-#include "circuit.h"
-#include "linalg.h"
+#include "../netlist/circuit.h"
+#include "../math/linalg.h"
 #include <vector>
 #include <cmath>
 #include <memory>

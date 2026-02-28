@@ -10,7 +10,7 @@
 // ============================================================================
 
 #include "acutesim_engine/solvers/pz_analysis.h"
-#include "compute/analysis_registry.h"
+#include "acutesim_engine/solvers/analysis_registry.h"
 #include "engine_api/simulation_dto.h"
 #include "acutesim_engine/solvers/ac_solver.h"
 
@@ -74,7 +74,7 @@ SimulationResponseDTO runPZAnalysis(
     int n = netlist.numGlobalNodes;
     if (n == 0) {
         resp.success      = false;
-        resp.errorMessage = "PZ analysis: empty netlist";
+        resp.errorDetail = "PZ analysis: empty netlist";
         return resp;
     }
 
@@ -150,7 +150,7 @@ orchestration::SimulationResponseDTO pzStub(
 {
     orchestration::SimulationResponseDTO r;
     r.success = false;
-    r.errorMessage = "PZ: use ISimulationDriver::submitJob with AnalysisTypeDTO::POLE_ZERO";
+    r.errorDetail = "PZ: use ISimulationDriver::submitJob with AnalysisTypeDTO::POLE_ZERO";
     return r;
 }
 

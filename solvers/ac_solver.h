@@ -4,10 +4,10 @@
 #include <vector>
 #include <string>
 #include <cmath>
-#include "../../components/circuit.h"
-#include "../../physics/device_physics.h"
-#include "../../physics/noise_models.h"
-#include "../../autodiff/dual.h"
+#include "../netlist/circuit.h"
+#include "../physics/device_physics.h"
+#include "../physics/noise_models.h"
+#include "../autodiff/dual.h"
 #include "../infrastructure/simtrace.h"
 #include "../math/linalg.h"  // Phase 2.10: ComplexCsr, ComplexMatrixConstructor, solveComplexLU_Sparse
 

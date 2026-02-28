@@ -1,6 +1,6 @@
 #pragma once
 
-#include "compiled_block.h"
+#include "../infrastructure/compiled_block.h"
 #include "engine_api/simulation_context.h"
 #include <memory>
 

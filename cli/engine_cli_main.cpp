@@ -24,6 +24,12 @@
 #include <chrono>
 #include <iomanip>
 
+// ENGINE_API visibility macro (provided by engine, consumed by clients)
+#ifndef ENGINE_API
+  #define ENGINE_API
+#endif
+
+namespace {
 using namespace acutesim;
 using namespace acutesim::compute::orchestration;
 
@@ -43,32 +49,36 @@ static SimulationRequestDTO parseSpice(std::istream& in) {
     // Store raw netlist text in DTO for the engine's internal parser
     std::ostringstream oss;
     for (auto& l : lines) oss << l << "\n";
-    req.rawNetlistText = oss.str();
+    req.source.payload = oss.str();
+    req.source.format  = NetlistFormatDTO::VERILOG_A;
 
     // Detect analysis type from .control cards
     for (auto& l : lines) {
         std::string lower = l;
         for (char& c : lower) c = static_cast<char>(std::tolower(c));
         if (lower.rfind(".tran", 0) == 0) {
-            req.analysisType = "TRAN";
+            req.analysis = AnalysisTypeDTO::TRANSIENT;
             // .tran <step> <stop>
             double step = 1e-9, stop = 1e-6;
             std::istringstream ss(l.substr(5));
             ss >> step >> stop;
-            req.transient.initialTimeStepS = step;
-            req.transient.stopTimeS        = stop;
+            req.transient.stepSizeS = step;
+            req.transient.stopTimeS  = stop;
         } else if (lower.rfind(".ac", 0) == 0) {
-            req.analysisType = "AC";
+            req.analysis = AnalysisTypeDTO::AC;
         } else if (lower.rfind(".dc", 0) == 0 || lower.rfind(".op", 0) == 0) {
-            req.analysisType = "DC";
+            req.analysis = AnalysisTypeDTO::DC;
         }
     }
-    if (req.analysisType.empty()) req.analysisType = "DC";
     return req;
 }
+} // anonymous namespace
 
 int main(int argc, char** argv) {
     // ── Create engine ──────────────────────────────────────────────────────
+    using namespace acutesim;
+    using namespace acutesim::compute::orchestration;
+
     auto engine = ISimulationEngine::create();
     auto caps   = engine->capabilities();
 
@@ -94,7 +104,7 @@ int main(int argc, char** argv) {
         req = parseSpice(std::cin);
     }
 
-    std::cout << "Analysis: " << req.analysisType << "\n";
+    // Analysis type is chosen per req.analysis
 
     // ── Run simulation ─────────────────────────────────────────────────────
     auto session = engine->createSession();
@@ -112,9 +122,9 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     SimulationResponseDTO result;
 
-    if (req.analysisType == "TRAN") {
+    if (req.analysis == AnalysisTypeDTO::TRANSIENT) {
         result = session->runTransient(req, cb, nullptr);
-    } else if (req.analysisType == "AC") {
+    } else if (req.analysis == AnalysisTypeDTO::AC) {
         result = session->runAC(req, cb);
     } else {
         result = session->runDC(req, cb);

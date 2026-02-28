@@ -1,11 +1,13 @@
 #pragma once
 
-#include "physics_tensors.h"
-#include "../../components/circuit.h"
+#include "../tensors/physics_tensors.h"
+#include "../netlist/circuit.h"
 #include <vector>
 #include <string>
 #include <functional>
+#include <mutex>
 
+#ifdef ACUTESIM_GPU_ENABLED
 #ifdef __EMSCRIPTEN__
 #include <webgpu/webgpu.h>
 #else
@@ -13,6 +15,7 @@
 #include <dawn/native/DawnNative.h>
 #include <dawn/webgpu_cpp.h>
 #include <dawn/dawn_proc.h>
+#endif
 #endif
 
 // Forward declarations from linalg.h / circuitsim.h
@@ -22,25 +25,26 @@ struct SolverStep;
 /**
  * WebGPUSolver
  * Implements GPU-resident Newton-Raphson simulation using EmulatedF64 logic.
- *
- * Features:
- * - Persistent GPU Residency: All MNA buffers stay on GPU.
- * - EmulatedF64 Architecture: hi-lo float32 pairs for double-precision parity.
- * - Pipeline-Overlapped Hybrid NR Loop: GPU physics N+1 overlaps CPU LU solve N.
- * - CSR pattern caching for deterministic O(N) sparse assembly.
  */
 class WebGPUSolver {
 public:
     WebGPUSolver();
     ~WebGPUSolver();
 
+#ifdef ACUTESIM_GPU_ENABLED
+    // External-device constructor: borrows an already-created device and queue
+    // from GPUContextManager. Does NOT call initWebGPU(), does NOT call
+    // dawnProcSetProcs(), and does NOT release the handles on destruction.
+    explicit WebGPUSolver(WGPUDevice externalDevice, WGPUQueue externalQueue);
+#endif
+
+#ifdef ACUTESIM_GPU_ENABLED
     bool initialize(const TensorNetlist& netlist);
 
     // Core netlist upload (freezes topology, builds CSR stamp maps)
     void uploadNetlist(const TensorNetlist& netlist);
 
     // Pipeline-overlapped NR loop (primary solver entry point)
-    // Returns node voltages after convergence (or maxIter exhaustion).
     std::vector<double> runHybridNRLoop(
         const TensorNetlist& netlist,
         int   maxIter,
@@ -49,123 +53,115 @@ public:
         double time = 0.0,
         double h    = 0.0);
 
-    // Legacy single-step interface (kept for compatibility)
-    void runNRStep(double time, double h);
-    bool checkConvergence();
-
     // Download final solution from GPU → CPU
     std::vector<double> downloadSolution();
-
-    // Waveform ring-buffer readback (Phase 2.2)
-    std::vector<std::vector<double>> downloadWaveform();
-
-    // Upload CPU-computed deltaV back to GPU (pipeline overlap step)
-    void uploadDeltaV(const std::vector<double>& deltaV);
-
-    // Async physics dispatch: kicks off GPU kernels, returns immediately
-    void dispatchPhysicsAsync(double time, double h);
-
-    // Initiate async Jacobian/RHS readback from GPU → staging buffers
-    void initiateReadback();
-
-    // Poll whether last readback is complete (returns true when data is ready)
-    bool isReadbackReady();
-
-    // --- Double-buffered NR iteration state (ping-pong for pipeline overlap) ---
-    struct NRIterationState {
-        std::vector<float> jacobian_hi, jacobian_lo;
-        std::vector<float> rhs_hi, rhs_lo;
-        bool ready = false;
-    };
-    NRIterationState& getReadbackData();
+#endif
 
 private:
+#ifdef ACUTESIM_GPU_ENABLED
+    // Core WebGPU handles
     WGPUDevice   device   = nullptr;
     WGPUQueue    queue    = nullptr;
     WGPUInstance instance = nullptr;
 
-    // --- Persistent MNA Buffers (EmulatedF64 split) ---
+    // SoA device buffers (GPU-resident physics state)
+    WGPUBuffer diodeSoABuffer  = nullptr;
+    WGPUBuffer mosfetSoABuffer = nullptr;
+    WGPUBuffer bjtSoABuffer    = nullptr;
+
+    // MNA voltage / delta-V (EmulatedF64 hi/lo pairs)
     WGPUBuffer voltageBufferHi  = nullptr;
     WGPUBuffer voltageBufferLo  = nullptr;
     WGPUBuffer deltaVBufferHi   = nullptr;
     WGPUBuffer deltaVBufferLo   = nullptr;
+
+    // Jacobian / RHS (CSR, EmulatedF64)
     WGPUBuffer rhsBufferHi      = nullptr;
     WGPUBuffer rhsBufferLo      = nullptr;
-    WGPUBuffer jacobianBufferHi = nullptr;  // CSR hi — replaces CsrMatrix struct
-    WGPUBuffer jacobianBufferLo = nullptr;  // CSR lo
+    WGPUBuffer jacobianBufferHi = nullptr;
+    WGPUBuffer jacobianBufferLo = nullptr;
 
-    // --- Topology Buffers (Frozen per netlist upload) ---
-    WGPUBuffer csrRowPtrBuffer  = nullptr;
-    WGPUBuffer csrColIdxBuffer  = nullptr;
-    WGPUBuffer diodeMapBuffer   = nullptr;
-    WGPUBuffer mosfetMapBuffer  = nullptr;
-    WGPUBuffer bjtMapBuffer     = nullptr;  // BJT CSR stamp maps (new)
+    // CSR topology
+    WGPUBuffer csrRowPtrBuffer = nullptr;
+    WGPUBuffer csrColIdxBuffer = nullptr;
+
+    // Device stamp position maps
+    WGPUBuffer diodeMapBuffer  = nullptr;
+    WGPUBuffer mosfetMapBuffer = nullptr;
+    WGPUBuffer bjtMapBuffer    = nullptr;
+
+    // Global time/step state
     WGPUBuffer globalStateBuffer = nullptr;
 
-    // --- Component SoA Buffers ---
-    WGPUBuffer diodeSoABuffer  = nullptr;
-    WGPUBuffer mosfetSoABuffer = nullptr;
-    WGPUBuffer bjtSoABuffer    = nullptr;  // BJTs (new)
+    // Convergence
+    WGPUBuffer residualBuffer     = nullptr;
+    WGPUBuffer convergenceFlagBuf = nullptr;
 
-    // --- Convergence / Residual Buffers ---
-    WGPUBuffer residualBuffer     = nullptr;  // Per-workgroup max norms
-    WGPUBuffer convergenceFlagBuf = nullptr;  // [0] = 1 if converged
-
-    // --- Waveform Buffering (Phase 2.2) ---
+    // Waveform ring buffer
     WGPUBuffer waveformConfigBuffer = nullptr;
     WGPUBuffer waveformStateBuffer  = nullptr;
     WGPUBuffer waveformDataBuffer   = nullptr;
 
-    // --- Staging Buffers for Async Readback ---
-    WGPUBuffer stagingJacobianHi  = nullptr;
-    WGPUBuffer stagingJacobianLo  = nullptr;
-    WGPUBuffer stagingRhsHi       = nullptr;
-    WGPUBuffer stagingRhsLo       = nullptr;
-    WGPUBuffer stagingVoltageHi   = nullptr;
-    WGPUBuffer stagingVoltageLo   = nullptr;
+    // CPU-readable staging buffers
+    WGPUBuffer stagingJacobianHi = nullptr;
+    WGPUBuffer stagingJacobianLo = nullptr;
+    WGPUBuffer stagingRhsHi      = nullptr;
+    WGPUBuffer stagingRhsLo      = nullptr;
+    WGPUBuffer stagingVoltageHi  = nullptr;
+    WGPUBuffer stagingVoltageLo  = nullptr;
 
-    // --- Persistent Bind Groups ---
-    WGPUBindGroup bindGroup0 = nullptr;  // MNA state
-    WGPUBindGroup bindGroup1 = nullptr;  // Topology + simulation state
-    WGPUBindGroup bindGroup2 = nullptr;  // Waveform
+    // Bind groups
+    WGPUBindGroup bindGroup0 = nullptr;
+    WGPUBindGroup bindGroup1 = nullptr;
+    WGPUBindGroup bindGroup2 = nullptr;
 
-    // --- Compute Pipelines ---
-    WGPUComputePipeline physicsPipelineDiodes   = nullptr;
-    WGPUComputePipeline physicsPipelineMosfets  = nullptr;
-    WGPUComputePipeline physicsPipelineBJTs     = nullptr;  // new
-    WGPUComputePipeline assemblyPipeline        = nullptr;
-    WGPUComputePipeline solutionUpdatePipeline  = nullptr;  // renamed from solverPipeline
-    WGPUComputePipeline residualPipeline        = nullptr;  // new
-    WGPUComputePipeline convergencePipeline     = nullptr;
-    WGPUComputePipeline recordWaveformPipeline  = nullptr;
+    // Compute pipelines
+    WGPUComputePipeline physicsPipelineDiodes  = nullptr;
+    WGPUComputePipeline physicsPipelineMosfets = nullptr;
+    WGPUComputePipeline physicsPipelineBJTs    = nullptr;
+    WGPUComputePipeline assemblyPipeline       = nullptr;
+    WGPUComputePipeline solutionUpdatePipeline = nullptr;
+    WGPUComputePipeline residualPipeline       = nullptr;
+    WGPUComputePipeline convergencePipeline    = nullptr;
+    WGPUComputePipeline recordWaveformPipeline = nullptr;
 
-    // --- Topology State (frozen per uploadNetlist) ---
+    // Topology/sizing
     size_t numNodes_   = 0;
     size_t numDiodes_  = 0;
     size_t numMosfets_ = 0;
     size_t numBJTs_    = 0;
     int    csrNnz_     = 0;
 
-    // --- Pipeline-Overlap Double Buffer ---
+    // Pipeline-overlap readback state
+    struct NRIterationState {
+        std::vector<double> jacobianHi;
+        std::vector<double> jacobianLo;
+        std::vector<double> rhsHi;
+        std::vector<double> rhsLo;
+    };
     NRIterationState readbackBuffers_[2];
-    int activeReadback_ = 0;
+    int  activeReadback_  = 0;
     bool readbackPending_ = false;
 
-    // --- Internal Helpers ---
-    bool initWebGPU();
-    void setupResources(const TensorNetlist& netlist);
-    void createPipelines(WGPUShaderModule shaderModule);
-    void createBindGroups();
+    bool ownsDevice_ = true;   // false when device/queue provided externally
 
-    WGPUShaderModule loadShader(const std::string& source);
-
-    // Create a MAP_READ staging buffer of the given byte size
-    WGPUBuffer createStagingBuffer(size_t byteSize, const char* label);
-
-    // Record a CopyBufferToBuffer into the given encoder (GPU→staging)
-    void recordCopyToStaging(WGPUCommandEncoder enc,
-                             WGPUBuffer src, WGPUBuffer dst, size_t byteSize);
-
-    // Build CSR position maps for diodes/mosfets/BJTs from the pattern
-    void buildStampMaps(const TensorNetlist& netlist);
+    // Private implementation methods
+    bool              initWebGPU();
+    WGPUShaderModule  loadShader(const std::string& source);
+    void              setupResources(const TensorNetlist& netlist);
+    void              createPipelines(WGPUShaderModule sm);
+    void              buildStampMaps(const TensorNetlist& netlist);
+    void              uploadDeltaV(const std::vector<double>& deltaV);
+    void              dispatchPhysicsAsync(double time, double h);
+    void              initiateReadback();
+    bool              isReadbackReady();
+    NRIterationState& getReadbackData();
+    void              runNRStep(double time, double h);
+    bool              checkConvergence();
+    std::vector<std::vector<double>> downloadWaveform();
+    WGPUBuffer        createStagingBuffer(size_t byteSize, const char* label = nullptr);
+    void              recordCopyToStaging(WGPUCommandEncoder enc,
+                                          WGPUBuffer src, WGPUBuffer dst, size_t sz);
+    void              createBindGroups();
+#endif
 };

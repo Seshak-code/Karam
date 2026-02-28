@@ -26,6 +26,8 @@
 
 namespace acutesim {
 
+using namespace compute::orchestration;
+
 // ── SessionImpl ────────────────────────────────────────────────────────────
 // Internal, non-virtual session. All solver calls are compile-time bound.
 // (CircuitSim, WebGPUSolver, etc. are included in engine_impl.cpp — not here)

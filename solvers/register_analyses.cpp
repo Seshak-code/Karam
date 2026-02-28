@@ -13,7 +13,7 @@
 // ============================================================================
 
 #include "acutesim_engine/solvers/register_analyses.h"
-#include "compute/analysis_registry.h"
+#include "acutesim_engine/solvers/analysis_registry.h"
 #include "acutesim_engine/solvers/tf_analysis.h"
 #include "acutesim_engine/solvers/pz_analysis.h"
 #include "acutesim_engine/solvers/fourier_analysis.h"
@@ -46,7 +46,7 @@ static bool applyCornerAndDC(
     dcOut = sim.solveDC(runNetlist);
     if (!dcOut.stats.converged) {
         errOut.success      = false;
-        errOut.errorMessage = "DC operating point failed: " + dcOut.stats.error_detail;
+        errOut.errorDetail = "DC operating point failed: " + dcOut.stats.error_detail;
         return false;
     }
     return true;

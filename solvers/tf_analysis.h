@@ -7,6 +7,7 @@
 
 #include "engine_api/simulation_dto.h"
 #include "acutesim_engine/netlist/circuit.h"
+#include "engine_api/isimulation_engine.h"
 #include <vector>
 
 namespace acutesim {
@@ -15,14 +16,8 @@ namespace solvers {
 
 /**
  * Run transfer-function analysis H(jω) = V_out/V_in.
- *
- * @param netlist     Fully-constructed TensorNetlist.
- * @param dcSolution  DC operating-point voltages (from a prior solveDC call).
- * @param req         Request carrying parameters (fStart, fStop, points,
- *                    outputNode, inputNode) and topologyHash.
- * @return            SimulationResponseDTO with extended.tf populated.
  */
-orchestration::SimulationResponseDTO runTFAnalysis(
+ENGINE_API orchestration::SimulationResponseDTO runTFAnalysis(
     const TensorNetlist& netlist,
     const std::vector<double>& dcSolution,
     const orchestration::SimulationRequestDTO& req);

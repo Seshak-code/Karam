@@ -2,7 +2,7 @@
 #include <string>
 #include <unordered_map>
 #include "circuit.h"
-#include "../compute/orchestration/dto/schematic_dto.h"
+#include "compute/orchestration/dto/schematic_dto.h"
 
 namespace NetlistExporter {
 

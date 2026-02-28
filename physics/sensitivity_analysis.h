@@ -4,7 +4,7 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
-#include "../components/circuit.h"
+#include "acutesim_engine/netlist/circuit.h"
 #include "statistical_engine.h"
 
 // Note: Requires a solve() callback or function pointer to run simulations

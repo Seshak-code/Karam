@@ -1,5 +1,5 @@
 #pragma once
-#include "circuit.h"
+#include "../netlist/circuit.h"
 #include <vector>
 #include <map>
 #include <string>

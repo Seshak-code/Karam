@@ -10,15 +10,16 @@
  * Phase 1 Hardening: Refactored for NASA-style safety.
  */
 
-#include "circuitsim.h"
-#include "physics_tensors.h"
-#include "convergence_engine.h"
-#include "../../physics/device_physics.h"
-#include "../../physics/physics_constants.h"
+#include "../physics/circuitsim.h"
+#include "acutesim_engine/netlist/netlist_export.h"
+#include "../solvers/convergence_engine.h"
+#include "../physics/device_physics.h"
+#include "../physics/physics_constants.h"
 #include "../infrastructure/safe_utils.h"
 #include "../infrastructure/compiled_block.h"
 #if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
-#include "webgpu_solver.h"
+#include "../solvers/webgpu_solver.h"
+#include "acutesim_engine/gpu_context_manager.h"
 #endif
 
 // =============================================================================
@@ -177,7 +178,9 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // GPU execution path — delegate to WebGPUSolver hybrid NR loop
   if (execMode == ExecutionMode::GPU || execMode == ExecutionMode::GPU_DEBUG) {
     netlist.globalBlock.computeTopologyHash();
-    WebGPUSolver gpuSolver;
+    // Borrow device + queue from the singleton — no second device creation.
+    auto& gpuMgr = acutesim::GPUContextManager::instance();
+    WebGPUSolver gpuSolver(gpuMgr.rawDevice(), gpuMgr.rawQueue());
     if (gpuSolver.initialize(netlist)) {
         gpuSolver.uploadNetlist(netlist);
         constexpr int    GPU_MAX_ITER = 50;
@@ -484,7 +487,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
 
 
-SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double &timeStep,
+SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
                                double currentTime) {
     if (netlist.numGlobalNodes == 0)
         return {currentTime, {}, {0, 0.0, true}, 0};
@@ -720,7 +723,7 @@ SolverStep CircuitSim::solveDC(const CompiledTensorBlock& block) {
 }
 
 SolverStep CircuitSim::stepTransient(const CompiledTensorBlock& block,
-                                     double &timeStep, double currentTime) {
+                                     double timeStep, double currentTime) {
     // Pre-load the SoA tensors
     soaBlock = block.tensors;
 

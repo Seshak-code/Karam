@@ -1,6 +1,6 @@
 #pragma once
 
-#include "linalg.h"
+#include "../math/linalg.h"
 #include <vector>
 #include <algorithm>
 #include <numeric>
