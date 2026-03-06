@@ -17,6 +17,9 @@
 #include "../physics/physics_constants.h"
 #include "../infrastructure/safe_utils.h"
 #include "../infrastructure/compiled_block.h"
+#include "../solvers/schur_solver.h"
+#include "../solvers/contraction_executor.h"
+#include "../infrastructure/mpo_builder.h"
 #if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
 #include "../solvers/webgpu_solver.h"
 #include "acutesim_engine/gpu_context_manager.h"
@@ -263,27 +266,93 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         cachedPattern_ = std::make_unique<CachedCsrPattern>(matrixBuilder.buildPattern());
         cachedPatternHash_ = netlist.globalBlock.topologyHash;
         matrix = matrixBuilder.createCsr();
+
+        // Phase B: Compute symbolic factorization from Phase A elimination ordering.
+        // The Min-Fill ordering IS the fill-reducing permutation for sparse LU.
+        if (compiledBlock_ && compiledBlock_->tnAnalysis.isAnalyzed &&
+            !compiledBlock_->tnAnalysis.eliminationOrdering.empty()) {
+            cachedSymbolic_ = std::make_unique<SymbolicFactorization>(
+                symbolicFactorize(*cachedPattern_,
+                                  compiledBlock_->tnAnalysis.eliminationOrdering));
+        } else {
+            cachedSymbolic_.reset();
+        }
+
+        // Phase 5.3.3: Invalidate contraction workspace on topology change
+        cachedWorkspace_.reset();
     } else {
         matrix = matrixBuilder.assembleFast(*cachedPattern_);
     }
-    
-    // Solver Selection: Use LU for circuits with active (non-linear) devices
-    // PCG requires symmetric positive-definite, which BJTs violate
+
+    // Phase B: Treewidth-guided solver selection.
+    // Replaces the old binary hasActiveDevices ? LU : PCG selector with a
+    // multi-tier strategy informed by the Phase A treewidth analysis.
     SolverResult result;
-    bool hasActiveDevices = !netlist.globalBlock.bjts.empty() || 
-                            !netlist.globalBlock.diodes.empty() ||
-                            !netlist.globalBlock.mosfets.empty();
-    
-    if (hasActiveDevices || netlist.numGlobalNodes < 20) {
-      // Direct LU solver for small matrices or active devices
-      result = solveLU_Pivoted(matrix, rhsVector);
-    } else {
-      // PCG for large linear-only circuits
-      result = solvePCG(matrix, rhsVector, 1e-6, PCG_MAX_ITER);
-      if (!result.converged) {
-        // Fallback to LU if PCG fails
+    const auto& tw = compiledBlock_ ? compiledBlock_->tnAnalysis : TreewidthAnalysis{};
+
+    if (!tw.isAnalyzed || netlist.numGlobalNodes < 20) {
+        // Small circuits or no treewidth data: dense LU (current path)
         result = solveLU_Pivoted(matrix, rhsVector);
-      }
+    } else if (tw.estimatedTreewidth <= SPARSE_LU_TW_LIMIT && cachedSymbolic_) {
+        // Low-treewidth circuits: sparse LU with Min-Fill ordering
+        result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
+        // Fallback safety: if sparse solver produces a bad residual, retry dense
+        if (result.converged && result.finalResidual > 1e-6) {
+            SolverResult denseResult = solveLU_Pivoted(matrix, rhsVector);
+            if (denseResult.converged && denseResult.finalResidual < result.finalResidual) {
+                result = denseResult;
+            }
+        }
+    } else if (tw.estimatedTreewidth <= CONTRACTION_TW_LIMIT &&
+               compiledBlock_ && compiledBlock_->tnProgram &&
+               compiledBlock_->tnProgram->viable) {
+        // Phase 5.3.3: Tensor contraction execution engine
+        // Rebuild MPOs at current voltage state for nonlinear RHS accuracy
+        auto& prog = *compiledBlock_->tnProgram;
+        prog.mpos = MPOBuilder::buildMPOs(soaBlock, voltageEstimate,
+                                          netlist.environment.ambient_temp_K);
+
+        // Allocate or reuse cached workspace
+        if (!cachedWorkspace_) {
+            cachedWorkspace_ = std::make_unique<TensorWorkspace>();
+            cachedWorkspace_->allocate(prog.tree);
+        }
+
+        result = ContractionExecutor::solve(
+            prog, *cachedWorkspace_,
+            netlist.numGlobalNodes, gmin_factor);
+
+        // Fallback: if contraction solve fails or has poor residual, try sparse/dense
+        if (!result.converged || result.finalResidual > 1e-6) {
+            if (cachedSymbolic_) {
+                result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
+            }
+            if (!result.converged || result.finalResidual > 1e-6) {
+                result = solveLU_Pivoted(matrix, rhsVector);
+            }
+        }
+    } else if (tw.estimatedTreewidth <= SCHUR_TW_LIMIT &&
+               compiledBlock_ && compiledBlock_->tnProgram &&
+               compiledBlock_->tnProgram->viable &&
+               compiledBlock_->partitions.size() > 1) {
+        // Phase 5.3.2: Schur complement domain decomposition
+        result = SchurSolver::solve(
+            compiledBlock_->partitions, matrix, rhsVector);
+        // Fallback safety: if Schur solve produces a bad residual, retry sparse/dense
+        if (!result.converged || result.finalResidual > 1e-6) {
+            if (cachedSymbolic_) {
+                result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
+            }
+            if (!result.converged || result.finalResidual > 1e-6) {
+                result = solveLU_Pivoted(matrix, rhsVector);
+            }
+        }
+    } else {
+        // High-treewidth or no symbolic data: PCG then dense fallback
+        result = solvePCG(matrix, rhsVector, 1e-6, PCG_MAX_ITER);
+        if (!result.converged) {
+            result = solveLU_Pivoted(matrix, rhsVector);
+        }
     }
     // Phase 2.9: Capture pivot diagnostics from LU
     if (result.smallestPivot < smallestPivotOverall) {
@@ -521,6 +590,12 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
         std::vector<double> nrEstimate = arbiter.getPrevVoltages();
         if (nrEstimate.empty()) nrEstimate.assign(netlist.numGlobalNodes, 0.0);
 
+        // ─── TAA: History Rejection ──────────────────────────────────────
+        // Reject polynomial predictors for nodes undergoing violent switching.
+        // Replaces their guess with first-order Euler to prevent NR divergence
+        // without globally cutting the timestep.
+        arbiter.rejectHistory(nrEstimate, actualTimeStep);
+
         bool nrConverged = false;
         for (int iteration = 0; iteration < MAX_NR_ITER; ++iteration) {
              scheduler.schedule(netlist);
@@ -716,10 +791,19 @@ SolverStep CircuitSim::solveDC(const CompiledTensorBlock& block) {
     // Pre-load the SoA tensors so tensorizeNetlist() inside is a no-op
     soaBlock = block.tensors;
 
+    // Phase B: Make the compiled block available for treewidth-guided routing.
+    // Use a non-owning shared_ptr (aliasing constructor) since the block
+    // outlives this call — the caller holds ownership.
+    compiledBlock_ = std::shared_ptr<const CompiledTensorBlock>(
+        std::shared_ptr<const CompiledTensorBlock>{}, &block);
+
     // Delegate to internal TensorNetlist-based solver
     // A mutable copy is needed because the solver writes to instance states
     TensorNetlist nl = block.structural_;
-    return solveDC(nl);
+    auto result = solveDC(nl);
+
+    compiledBlock_.reset(); // Release non-owning reference
+    return result;
 }
 
 SolverStep CircuitSim::stepTransient(const CompiledTensorBlock& block,
@@ -727,7 +811,14 @@ SolverStep CircuitSim::stepTransient(const CompiledTensorBlock& block,
     // Pre-load the SoA tensors
     soaBlock = block.tensors;
 
+    // Phase B: Make the compiled block available for treewidth-guided routing.
+    compiledBlock_ = std::shared_ptr<const CompiledTensorBlock>(
+        std::shared_ptr<const CompiledTensorBlock>{}, &block);
+
     // Delegate to internal TensorNetlist-based solver
     TensorNetlist nl = block.structural_;
-    return stepTransient(nl, timeStep, currentTime);
+    auto result = stepTransient(nl, timeStep, currentTime);
+
+    compiledBlock_.reset();
+    return result;
 }

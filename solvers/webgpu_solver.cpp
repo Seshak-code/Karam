@@ -149,6 +149,7 @@ WebGPUSolver::~WebGPUSolver() {
     rel(jacobianBufferHi); rel(jacobianBufferLo);
     rel(csrRowPtrBuffer);  rel(csrColIdxBuffer);
     rel(diodeMapBuffer);   rel(mosfetMapBuffer);  rel(bjtMapBuffer);
+    rel(diodeVoltageRouteBuffer); rel(mosfetVoltageRouteBuffer); rel(bjtVoltageRouteBuffer);
     rel(globalStateBuffer);
     rel(residualBuffer);   rel(convergenceFlagBuf);
     rel(waveformConfigBuffer); rel(waveformStateBuffer); rel(waveformDataBuffer);
@@ -283,6 +284,18 @@ void WebGPUSolver::setupResources(const TensorNetlist& netlist) {
     diodeMapBuffer   = makeBuffer(device, dm, STORAGE_RW, "dmap");
     mosfetMapBuffer  = makeBuffer(device, mm, STORAGE_RW, "mmap");
     bjtMapBuffer     = makeBuffer(device, bm, STORAGE_RW, "bmap");
+
+    // Phase B: voltage route buffers — precomputed terminal index lists for
+    // cooperative workgroup voltage preload via var<workgroup> cache.
+    // Sentinel 0xFFFFFFFF means the terminal connects to ground (node 0).
+    const WGPUBufferUsage STORAGE_RO =
+        (WGPUBufferUsage)(WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    size_t dr = std::max(numDiodes_  * 2 * sizeof(uint32_t), size_t(4)); // 2 terminals
+    size_t mr = std::max(numMosfets_ * 4 * sizeof(uint32_t), size_t(4)); // 4 terminals
+    size_t br = std::max(numBJTs_    * 3 * sizeof(uint32_t), size_t(4)); // 3 terminals
+    diodeVoltageRouteBuffer  = makeBuffer(device, dr, STORAGE_RO, "v_route_diode");
+    mosfetVoltageRouteBuffer = makeBuffer(device, mr, STORAGE_RO, "v_route_mosfet");
+    bjtVoltageRouteBuffer    = makeBuffer(device, br, STORAGE_RO, "v_route_bjt");
 
     globalStateBuffer = makeBuffer(device, 4*sizeof(float), STORAGE_RW, "gstate");
 
@@ -452,6 +465,49 @@ void WebGPUSolver::buildStampMaps(const TensorNetlist& netlist) {
                         indexOf(e,c),  indexOf(e,ba),  indexOf(e,e)  };
         }
         wgpuQueueWriteBuffer(queue, bjtMapBuffer, 0, maps.data(), maps.size() * sizeof(BJTStampMapCPU));
+    }
+
+    // Phase B: populate voltage route buffers.
+    // Each entry is a 0-based voltage index (node - 1); 0xFFFFFFFF = ground.
+    // These enable the workgroup shared-memory preload in the WGSL kernels.
+    auto toRouteIdx = [](int node) -> uint32_t {
+        return (node > 0) ? static_cast<uint32_t>(node - 1) : 0xFFFFFFFFu;
+    };
+
+    if (numDiodes_ > 0 && diodeVoltageRouteBuffer) {
+        std::vector<uint32_t> routes(numDiodes_ * 2);
+        for (size_t i = 0; i < numDiodes_; ++i) {
+            const auto& d = netlist.globalBlock.diodes[i];
+            routes[i * 2 + 0] = toRouteIdx(d.anode);
+            routes[i * 2 + 1] = toRouteIdx(d.cathode);
+        }
+        wgpuQueueWriteBuffer(queue, diodeVoltageRouteBuffer, 0,
+                             routes.data(), routes.size() * sizeof(uint32_t));
+    }
+
+    if (numMosfets_ > 0 && mosfetVoltageRouteBuffer) {
+        std::vector<uint32_t> routes(numMosfets_ * 4);
+        for (size_t i = 0; i < numMosfets_; ++i) {
+            const auto& m = netlist.globalBlock.mosfets[i];
+            routes[i * 4 + 0] = toRouteIdx(m.drain);
+            routes[i * 4 + 1] = toRouteIdx(m.gate);
+            routes[i * 4 + 2] = toRouteIdx(m.source);
+            routes[i * 4 + 3] = toRouteIdx(m.body);
+        }
+        wgpuQueueWriteBuffer(queue, mosfetVoltageRouteBuffer, 0,
+                             routes.data(), routes.size() * sizeof(uint32_t));
+    }
+
+    if (numBJTs_ > 0 && bjtVoltageRouteBuffer) {
+        std::vector<uint32_t> routes(numBJTs_ * 3);
+        for (size_t i = 0; i < numBJTs_; ++i) {
+            const auto& b = netlist.globalBlock.bjts[i];
+            routes[i * 3 + 0] = toRouteIdx(b.nodeCollector);
+            routes[i * 3 + 1] = toRouteIdx(b.base);
+            routes[i * 3 + 2] = toRouteIdx(b.emitter);
+        }
+        wgpuQueueWriteBuffer(queue, bjtVoltageRouteBuffer, 0,
+                             routes.data(), routes.size() * sizeof(uint32_t));
     }
 }
 

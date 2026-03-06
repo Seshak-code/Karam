@@ -3,6 +3,8 @@
 #include "../tensors/physics_tensors.h"
 #include "../netlist/circuit.h"   // TensorNetlist (embedded structural copy)
 #include "components/design_db.h" // NetUUID — in components/ (not migrated)
+#include "graph_partitioner.h"    // TensorPartition
+#include "treewidth_analyzer.h"   // TreewidthAnalysis
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -62,6 +64,23 @@ struct CompiledTensorBlock {
     // ─── Structural Netlist (Internal — migration shim) ──────────────────
     // TODO: Remove once all solver internals operate on tensors only.
     TensorNetlist structural_;
+
+    // ─── Graph Partitions (Phase C) ──────────────────────────────────────
+    // Populated by NetlistCompiler after GraphPartitioner::partition().
+    // Each TensorPartition groups topology-adjacent devices into a workgroup
+    // to maximise node-voltage cache hits in the Phase B shared-memory preload.
+    // Empty if GPU is not enabled or partitioning was skipped.
+    std::vector<TensorPartition> partitions;
+
+    // ─── Analytical Topology Engine (Phase A) ────────────────────────────
+    // Populated by NetlistCompiler::compile() after TreewidthAnalyzer::analyze().
+    // Default-initialized (isAnalyzed = false) for trivially small circuits.
+    TreewidthAnalysis tnAnalysis;
+
+    // ─── TN Compiled Program (Phase 5.3.1) ──────────────────────────────
+    // Populated by NetlistCompiler::compile() via TNCompiler.
+    // Empty/non-viable for circuits where bond dimension grows exponentially.
+    std::shared_ptr<struct TNCompiledProgram> tnProgram;
 
     // ─── Future GPU Fields (Reserved) ────────────────────────────────────
     // size_t stampOffsets = 0;   // Pre-computed CSR column offsets

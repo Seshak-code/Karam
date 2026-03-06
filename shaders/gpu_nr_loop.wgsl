@@ -50,41 +50,46 @@ fn f64_div(a: f64, b: f64) -> f64 {
     return f64_mul(a, refined_recip);
 }
 
-// --- Proper f64_exp: range reduction + 6th-order Horner polynomial ---
-// Algorithm:
-//   1. Clamp large forward bias at MAX_ARG=30 (linear continuation)
-//   2. Range reduce: k = round(x / ln2), r = x - k*ln2
-//   3. exp(r) via Horner polynomial (degree 6)
-//   4. Reconstruct: exp(x) = 2^k * exp(r)
+// --- f64_select: component-wise select for EmulatedF64 structs ---
+// WGSL's built-in select() only operates on scalars and vectors, not structs.
+// This helper enables branchless predicated selection on f64 pairs.
+fn f64_select(false_val: f64, true_val: f64, cond: bool) -> f64 {
+    return f64(
+        select(false_val.hi, true_val.hi, cond),
+        select(false_val.lo, true_val.lo, cond)
+    );
+}
+
+// --- Proper f64_exp: fully predicated, no early-return branches ---
+// Algorithm (Virtual VLIW — all paths computed, select() picks result):
+//   A. Underflow path  (x.hi <= -87):   result = 0
+//   B. Linear path     (x.hi >= 30):    result = exp(30)*(1 + (x-30))
+//   C. Horner path     (-87 < x < 30):  range-reduce + degree-6 polynomial
+// All three are always computed; select() chooses the correct one.
+// This eliminates warp divergence vs the original early-return form.
 fn f64_exp(x: f64) -> f64 {
     let MAX_ARG: f32 = 30.0;
     let EXP30: f32 = 1.06864745815e13; // exp(30) in f32
 
-    // Underflow guard
-    if (x.hi <= -87.0) {
-        return f64(0.0, 0.0);
-    }
+    // Path B: linear continuation for large forward bias (mirrors CPU pnjlim)
+    // exp(x) ≈ exp(30) + exp(30)*(x - 30) = exp(30)*(1 + (x-30))
+    let slope    = f64(EXP30, 0.0);
+    let dx       = f64_sub(x, f64(MAX_ARG, 0.0));
+    let result_b = f64_add(slope, f64_mul(slope, dx));
 
-    // Linear continuation for large forward bias (mirrors CPU pnjlim clamping)
-    if (x.hi >= MAX_ARG) {
-        // exp(x) ≈ exp(30) + exp(30)*(x - 30) = exp(30)*(1 + (x-30))
-        let slope = f64(EXP30, 0.0);
-        let dx = f64_sub(x, f64(MAX_ARG, 0.0));
-        return f64_add(slope, f64_mul(slope, dx));
-    }
-
-    // Range reduction: k = round(x.hi / ln2), r = x - k*ln2
-    // ln2 in double-float: hi=0.6931471805599453, lo=2.3190468138463e-17
+    // Path C: range reduction + 6th-order Horner polynomial
+    // Clamp x.hi to valid Horner range to prevent f32 overflow in pow(2, k)
+    // when select() discards this path for large |x|.
     let INV_LN2: f32 = 1.4426950408889634;
-    let LN2_HI: f32 = 0.6931471805599453;
-    let LN2_LO: f32 = 2.3190468138463e-17;
+    let LN2_HI:  f32 = 0.6931471805599453;
+    let LN2_LO:  f32 = 2.3190468138463e-17;
 
-    let k = round(x.hi * INV_LN2);
-    let ln2_f64 = f64(LN2_HI, LN2_LO);
-    let r = f64_sub(x, f64_mul(f64(k, 0.0), ln2_f64));
+    let x_clamped = clamp(x.hi, -87.0, MAX_ARG);
+    let k         = round(x_clamped * INV_LN2);
+    let ln2_f64   = f64(LN2_HI, LN2_LO);
+    let r         = f64_sub(x, f64_mul(f64(k, 0.0), ln2_f64));
 
     // Horner: 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120 + r/720)))))
-    // Innermost to outermost:
     var p = f64(1.38888888888889e-3, 0.0); // 1/720
     p = f64_add(f64(8.33333333333333e-3, 0.0), f64_mul(r, p)); // 1/120
     p = f64_add(f64(4.16666666666667e-2, 0.0), f64_mul(r, p)); // 1/24
@@ -92,10 +97,17 @@ fn f64_exp(x: f64) -> f64 {
     p = f64_add(f64(5.0e-1, 0.0), f64_mul(r, p));              // 1/2
     p = f64_add(f64(1.0, 0.0), f64_mul(r, p));                 // 1
     p = f64_add(f64(1.0, 0.0), f64_mul(r, p));                 // 1 (outermost)
+    let scale    = pow(2.0, k);
+    let result_c = f64_mul(f64(scale, 0.0), p);
 
-    // Reconstruct: exp(x) = 2^k * exp(r)
-    let scale = pow(2.0, k);
-    return f64_mul(f64(scale, 0.0), p);
+    // Predicated selection — no branches, all threads take same path:
+    //   use_b:  x.hi >= MAX_ARG  → linear continuation
+    //   use_a:  x.hi <= -87      → underflow → 0
+    //   else:                    → Horner polynomial
+    let use_b = x.hi >= MAX_ARG;
+    let use_a = x.hi <= -87.0;
+    let base  = f64_select(result_c, result_b, use_b);
+    return f64_select(base, f64(0.0, 0.0), use_a);
 }
 
 // --- Data Structures (AoS) ---
@@ -214,20 +226,51 @@ struct BJTStampMap {
 @group(1) @binding(5) var<storage, read_write> residual_buffer: array<f32>; // Per-workgroup max residuals
 @group(1) @binding(6) var<storage, read_write> convergence_flag: array<u32>; // [0]=1 if converged
 
+// Phase B: Voltage route buffers — per-device terminal index lists.
+// Each entry is a 0-based index into voltages_hi/lo; 0xFFFFFFFF = ground (→ 0.0).
+// Enables cooperative workgroup preload via var<workgroup> cache + workgroupBarrier().
+@group(1) @binding(7) var<storage, read> diode_routes:  array<u32>; // [device*2+0]=anode, [+1]=cathode
+@group(1) @binding(8) var<storage, read> mosfet_routes: array<u32>; // [device*4+0..3]=D,G,S,B
+@group(1) @binding(9) var<storage, read> bjt_routes:    array<u32>; // [device*3+0..2]=C,B,E
+
+// --- Phase B: Workgroup Voltage Cache ---
+// Shared memory holds voltage pairs for up to 64 devices × 2 terminals.
+// After cooperative preload + workgroupBarrier(), each thread reads from
+// cache instead of global memory, reducing L2 pressure for shared nodes.
+var<workgroup> diode_vc_hi: array<f32, 128>; // [lid*2+0]=anode, [+1]=cathode hi
+var<workgroup> diode_vc_lo: array<f32, 128>; // same layout, lo components
+
 // --- Stage 1a: Batch Diode Physics ---
 
 @compute @workgroup_size(64)
-fn batchDiodePhysics(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
+fn batchDiodePhysics(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id)  local_id:  vec3<u32>
+) {
+    let i   = global_id.x;
+    let lid = local_id.x;
     if (i >= arrayLength(&diodes.devices)) { return; }
 
-    let nA = diodes.devices[i].anode;
-    let nC = diodes.devices[i].cathode;
+    // --- Phase B: Cooperative voltage preload ---
+    // Each thread loads its own 2 terminal voltages into workgroup cache.
+    // Sentinel 0xFFFFFFFF → ground (v = 0.0).  All threads participate
+    // unconditionally so workgroupBarrier() is always reached.
+    let route_a   = diode_routes[i * 2u + 0u];
+    let route_c   = diode_routes[i * 2u + 1u];
+    // Clamp sentinel to 0 before the array access so select() never evaluates
+    // voltages_hi[0xFFFFFFFF], keeping OOB protection strictly in-bounds.
+    let safe_ra   = select(0u, route_a, route_a != 0xFFFFFFFFu);
+    let safe_rc   = select(0u, route_c, route_c != 0xFFFFFFFFu);
 
-    var v_a = f64(0.0, 0.0);
-    if (nA > 0) { v_a = f64(voltages_hi[u32(nA-1)], voltages_lo[u32(nA-1)]); }
-    var v_c = f64(0.0, 0.0);
-    if (nC > 0) { v_c = f64(voltages_hi[u32(nC-1)], voltages_lo[u32(nC-1)]); }
+    diode_vc_hi[lid * 2u + 0u] = select(0.0, voltages_hi[safe_ra], route_a != 0xFFFFFFFFu);
+    diode_vc_lo[lid * 2u + 0u] = select(0.0, voltages_lo[safe_ra], route_a != 0xFFFFFFFFu);
+    diode_vc_hi[lid * 2u + 1u] = select(0.0, voltages_hi[safe_rc], route_c != 0xFFFFFFFFu);
+    diode_vc_lo[lid * 2u + 1u] = select(0.0, voltages_lo[safe_rc], route_c != 0xFFFFFFFFu);
+    workgroupBarrier();
+
+    // Read terminal voltages from workgroup cache (no further global reads).
+    let v_a = f64(diode_vc_hi[lid * 2u + 0u], diode_vc_lo[lid * 2u + 0u]);
+    let v_c = f64(diode_vc_hi[lid * 2u + 1u], diode_vc_lo[lid * 2u + 1u]);
 
     let v_d = f64_sub(v_a, v_c);
     diodes.devices[i].v_d_hi = v_d.hi;
@@ -249,30 +292,50 @@ fn batchDiodePhysics(@builtin(global_invocation_id) global_id: vec3<u32>) {
     diodes.devices[i].g_d_hi = g_d.hi; diodes.devices[i].g_d_lo = g_d.lo;
 }
 
+// Workgroup voltage cache for MOSFET kernel: 64 devices × 4 terminals.
+var<workgroup> mosfet_vc_hi: array<f32, 256>; // [lid*4+0..3] = D,G,S,B hi
+var<workgroup> mosfet_vc_lo: array<f32, 256>; // same layout, lo components
+
 // --- Stage 1b: Batch MOSFET Physics ---
 
 @compute @workgroup_size(64)
-fn batchMosfetPhysics(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
+fn batchMosfetPhysics(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id)  local_id:  vec3<u32>
+) {
+    let i   = global_id.x;
+    let lid = local_id.x;
     if (i >= arrayLength(&mosfets.devices)) { return; }
 
-    let nD = mosfets.devices[i].drain;
-    let nG = mosfets.devices[i].gate;
-    let nS = mosfets.devices[i].source;
-    let nB = mosfets.devices[i].body;
+    // --- Phase B: Cooperative voltage preload (4 terminals per MOSFET) ---
+    let rd = mosfet_routes[i * 4u + 0u]; // drain
+    let rg = mosfet_routes[i * 4u + 1u]; // gate
+    let rs = mosfet_routes[i * 4u + 2u]; // source
+    let rb = mosfet_routes[i * 4u + 3u]; // body
+    // Clamp sentinels before array access (same OOB-safety pattern as diode kernel).
+    let sd = select(0u, rd, rd != 0xFFFFFFFFu);
+    let sg = select(0u, rg, rg != 0xFFFFFFFFu);
+    let ss = select(0u, rs, rs != 0xFFFFFFFFu);
+    let sb = select(0u, rb, rb != 0xFFFFFFFFu);
 
-    var v_d_orig = f64(0.0, 0.0);
-    if (nD > 0) { v_d_orig = f64(voltages_hi[u32(nD-1)], voltages_lo[u32(nD-1)]); }
-    var v_g_orig = f64(0.0, 0.0);
-    if (nG > 0) { v_g_orig = f64(voltages_hi[u32(nG-1)], voltages_lo[u32(nG-1)]); }
-    var v_s_orig = f64(0.0, 0.0);
-    if (nS > 0) { v_s_orig = f64(voltages_hi[u32(nS-1)], voltages_lo[u32(nS-1)]); }
-    var v_b_orig = f64(0.0, 0.0);
-    if (nB > 0) { v_b_orig = f64(voltages_hi[u32(nB-1)], voltages_lo[u32(nB-1)]); }
+    mosfet_vc_hi[lid * 4u + 0u] = select(0.0, voltages_hi[sd], rd != 0xFFFFFFFFu);
+    mosfet_vc_lo[lid * 4u + 0u] = select(0.0, voltages_lo[sd], rd != 0xFFFFFFFFu);
+    mosfet_vc_hi[lid * 4u + 1u] = select(0.0, voltages_hi[sg], rg != 0xFFFFFFFFu);
+    mosfet_vc_lo[lid * 4u + 1u] = select(0.0, voltages_lo[sg], rg != 0xFFFFFFFFu);
+    mosfet_vc_hi[lid * 4u + 2u] = select(0.0, voltages_hi[ss], rs != 0xFFFFFFFFu);
+    mosfet_vc_lo[lid * 4u + 2u] = select(0.0, voltages_lo[ss], rs != 0xFFFFFFFFu);
+    mosfet_vc_hi[lid * 4u + 3u] = select(0.0, voltages_hi[sb], rb != 0xFFFFFFFFu);
+    mosfet_vc_lo[lid * 4u + 3u] = select(0.0, voltages_lo[sb], rb != 0xFFFFFFFFu);
+    workgroupBarrier();
 
+    let v_d_orig = f64(mosfet_vc_hi[lid * 4u + 0u], mosfet_vc_lo[lid * 4u + 0u]);
+    let v_g_orig = f64(mosfet_vc_hi[lid * 4u + 1u], mosfet_vc_lo[lid * 4u + 1u]);
+    let v_s_orig = f64(mosfet_vc_hi[lid * 4u + 2u], mosfet_vc_lo[lid * 4u + 2u]);
+    let v_b_orig = f64(mosfet_vc_hi[lid * 4u + 3u], mosfet_vc_lo[lid * 4u + 3u]);
+
+    // Predicated PMOS sign — select() replaces the divergent if (pmos != 0u).
     let pmos = mosfets.devices[i].isPMOS;
-    var sign = 1.0f;
-    if (pmos != 0u) { sign = -1.0f; }
+    let sign = select(1.0f, -1.0f, pmos != 0u);
 
     let vgs = f64_sub(v_g_orig, v_s_orig);
     let vds = f64_sub(v_d_orig, v_s_orig);
@@ -298,68 +361,92 @@ fn batchMosfetPhysics(@builtin(global_invocation_id) global_id: vec3<u32>) {
     );
     let vov = f64_sub(local_vgs, local_vth);
 
-    if (vov.hi <= 0.0) {
-        mosfets.devices[i].ids_hi = 0.0; mosfets.devices[i].ids_lo = 0.0;
-        mosfets.devices[i].gm_hi  = 0.0; mosfets.devices[i].gm_lo  = 0.0;
-        mosfets.devices[i].gmb_hi = 0.0; mosfets.devices[i].gmb_lo = 0.0;
-        mosfets.devices[i].gds_hi = 1e-12; mosfets.devices[i].gds_lo = 0.0; // GMIN
-    } else if (local_vds.hi < vov.hi) {
-        // Linear region
-        let ids = f64_mul(f64(sign, 0.0), f64_mul(K,
-            f64_sub(
-                f64_mul(f64(2.0, 0.0), f64_mul(vov, local_vds)),
-                f64_mul(local_vds, local_vds)
-            )
-        ));
-        let gm  = f64_mul(f64(2.0, 0.0), f64_mul(K, local_vds));
-        let gds = f64_mul(f64(2.0, 0.0), f64_mul(K, f64_sub(vov, local_vds)));
+    // Predicated MOSFET region selection (Virtual VLIW):
+    // All three operating regions are computed unconditionally; f64_select()
+    // picks the correct result.  Eliminates if/else if/else divergence.
+    let in_cutoff = vov.hi <= 0.0;
+    let in_linear = !in_cutoff & (local_vds.hi < vov.hi);
 
-        mosfets.devices[i].ids_hi = ids.hi; mosfets.devices[i].ids_lo = ids.lo;
-        mosfets.devices[i].gm_hi  = gm.hi;  mosfets.devices[i].gm_lo  = gm.lo;
-        mosfets.devices[i].gmb_hi = 0.0;    mosfets.devices[i].gmb_lo = 0.0;
-        mosfets.devices[i].gds_hi = gds.hi; mosfets.devices[i].gds_lo = gds.lo;
-    } else {
-        // Saturation region
-        let lam  = f64(mosfets.devices[i].lambda_hi, mosfets.devices[i].lambda_lo);
-        let term = f64_add(f64(1.0, 0.0), f64_mul(lam, local_vds));
-        let ids  = f64_mul(f64(sign, 0.0), f64_mul(K, f64_mul(f64_mul(vov, vov), term)));
-        let gm   = f64_mul(f64(2.0, 0.0), f64_mul(K, f64_mul(vov, term)));
-        let gds  = f64_mul(K, f64_mul(f64_mul(vov, vov), lam));
+    // --- Cutoff region ---
+    let ids_cut = f64(0.0,  0.0);
+    let gm_cut  = f64(0.0,  0.0);
+    let gds_cut = f64(1e-12, 0.0); // GMIN
 
-        mosfets.devices[i].ids_hi = ids.hi; mosfets.devices[i].ids_lo = ids.lo;
-        mosfets.devices[i].gm_hi  = gm.hi;  mosfets.devices[i].gm_lo  = gm.lo;
-        mosfets.devices[i].gmb_hi = 0.0;    mosfets.devices[i].gmb_lo = 0.0;
-        mosfets.devices[i].gds_hi = gds.hi; mosfets.devices[i].gds_lo = gds.lo;
-    }
+    // --- Linear region ---
+    let ids_lin = f64_mul(f64(sign, 0.0), f64_mul(K,
+        f64_sub(
+            f64_mul(f64(2.0, 0.0), f64_mul(vov, local_vds)),
+            f64_mul(local_vds, local_vds)
+        )
+    ));
+    let gm_lin  = f64_mul(f64(2.0, 0.0), f64_mul(K, local_vds));
+    let gds_lin = f64_mul(f64(2.0, 0.0), f64_mul(K, f64_sub(vov, local_vds)));
+
+    // --- Saturation region ---
+    let lam      = f64(mosfets.devices[i].lambda_hi, mosfets.devices[i].lambda_lo);
+    let term     = f64_add(f64(1.0, 0.0), f64_mul(lam, local_vds));
+    let ids_sat  = f64_mul(f64(sign, 0.0), f64_mul(K, f64_mul(f64_mul(vov, vov), term)));
+    let gm_sat   = f64_mul(f64(2.0, 0.0), f64_mul(K, f64_mul(vov, term)));
+    let gds_sat  = f64_mul(K, f64_mul(f64_mul(vov, vov), lam));
+
+    // Two-stage predicated select: cutoff > linear > saturation priority.
+    let ids_final = f64_select(f64_select(ids_sat, ids_lin, in_linear), ids_cut, in_cutoff);
+    let gm_final  = f64_select(f64_select(gm_sat,  gm_lin,  in_linear), gm_cut,  in_cutoff);
+    let gds_final = f64_select(f64_select(gds_sat, gds_lin, in_linear), gds_cut, in_cutoff);
+
+    mosfets.devices[i].ids_hi = ids_final.hi; mosfets.devices[i].ids_lo = ids_final.lo;
+    mosfets.devices[i].gm_hi  = gm_final.hi;  mosfets.devices[i].gm_lo  = gm_final.lo;
+    mosfets.devices[i].gmb_hi = 0.0;          mosfets.devices[i].gmb_lo = 0.0;
+    mosfets.devices[i].gds_hi = gds_final.hi; mosfets.devices[i].gds_lo = gds_final.lo;
 }
+
+// Workgroup voltage cache for BJT kernel: 64 devices × 3 terminals.
+var<workgroup> bjt_vc_hi: array<f32, 192>; // [lid*3+0..2] = C,B,E hi
+var<workgroup> bjt_vc_lo: array<f32, 192>; // same layout, lo components
 
 // --- Stage 1c: Batch BJT Physics (Ebers-Moll) ---
 
 @compute @workgroup_size(64)
-fn batchBJTPhysics(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
+fn batchBJTPhysics(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id)  local_id:  vec3<u32>
+) {
+    let i   = global_id.x;
+    let lid = local_id.x;
     if (i >= arrayLength(&bjts.devices)) { return; }
 
-    let nC = bjts.devices[i].collector;
-    let nB = bjts.devices[i].base;
-    let nE = bjts.devices[i].emitter;
+    // --- Phase B: Cooperative voltage preload (3 terminals per BJT) ---
+    // nC/nB/nE node indices are read by assembleJacobian from the device struct;
+    // the physics kernel only needs them for voltage loading, which now comes
+    // from the bjt_routes precomputed table.
+    let rc = bjt_routes[i * 3u + 0u];
+    let rb = bjt_routes[i * 3u + 1u];
+    let re = bjt_routes[i * 3u + 2u];
+    // Clamp sentinels before array access.
+    let sc = select(0u, rc, rc != 0xFFFFFFFFu);
+    let sb = select(0u, rb, rb != 0xFFFFFFFFu);
+    let se = select(0u, re, re != 0xFFFFFFFFu);
 
-    // Read node voltages (1-based; 0 = ground)
-    var v_c = f64(0.0, 0.0);
-    if (nC > 0) { v_c = f64(voltages_hi[u32(nC-1)], voltages_lo[u32(nC-1)]); }
-    var v_b = f64(0.0, 0.0);
-    if (nB > 0) { v_b = f64(voltages_hi[u32(nB-1)], voltages_lo[u32(nB-1)]); }
-    var v_e = f64(0.0, 0.0);
-    if (nE > 0) { v_e = f64(voltages_hi[u32(nE-1)], voltages_lo[u32(nE-1)]); }
+    bjt_vc_hi[lid * 3u + 0u] = select(0.0, voltages_hi[sc], rc != 0xFFFFFFFFu);
+    bjt_vc_lo[lid * 3u + 0u] = select(0.0, voltages_lo[sc], rc != 0xFFFFFFFFu);
+    bjt_vc_hi[lid * 3u + 1u] = select(0.0, voltages_hi[sb], rb != 0xFFFFFFFFu);
+    bjt_vc_lo[lid * 3u + 1u] = select(0.0, voltages_lo[sb], rb != 0xFFFFFFFFu);
+    bjt_vc_hi[lid * 3u + 2u] = select(0.0, voltages_hi[se], re != 0xFFFFFFFFu);
+    bjt_vc_lo[lid * 3u + 2u] = select(0.0, voltages_lo[se], re != 0xFFFFFFFFu);
+    workgroupBarrier();
+
+    let v_c = f64(bjt_vc_hi[lid * 3u + 0u], bjt_vc_lo[lid * 3u + 0u]);
+    let v_b = f64(bjt_vc_hi[lid * 3u + 1u], bjt_vc_lo[lid * 3u + 1u]);
+    let v_e = f64(bjt_vc_hi[lid * 3u + 2u], bjt_vc_lo[lid * 3u + 2u]);
 
     // Store voltages for assembly (i_eq requires vc, vb, ve)
     bjts.devices[i].vc_hi = v_c.hi; bjts.devices[i].vc_lo = v_c.lo;
     bjts.devices[i].vb_hi = v_b.hi; bjts.devices[i].vb_lo = v_b.lo;
     bjts.devices[i].ve_hi = v_e.hi; bjts.devices[i].ve_lo = v_e.lo;
 
+    // Predicated NPN/PNP sign — select() replaces the divergent if (isNPN == 0u).
     let isNPN = bjts.devices[i].isNPN;
-    var sign = 1.0f;
-    if (isNPN == 0u) { sign = -1.0f; }
+    let sign  = select(-1.0f, 1.0f, isNPN != 0u);
     let sign_f64 = f64(sign, 0.0);
 
     let Is   = f64(bjts.devices[i].Is_hi,  bjts.devices[i].Is_lo);

@@ -81,9 +81,21 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler_ctx.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/graph_partitioner.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/factor_graph.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/treewidth_analyzer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/bond_dimension_profiler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/mpo_builder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_tree.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/tn_compiler.cpp
+
+    # === Math ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/math/sparse_lu.cpp
 
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/schur_solver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/contraction_executor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/ac_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/fourier_analysis.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/pz_analysis.cpp
@@ -102,6 +114,7 @@ target_sources(acutesim_engine_objects PRIVATE
 
     # === Netlist ===
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/netlist_export.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
 
     # === Physics (Verilog-A model compiler pipeline) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/physics/quick_analysis.cpp

@@ -1,4 +1,8 @@
 #include "netlist_compiler.h"
+#include "graph_partitioner.h"
+#include "factor_graph.h"
+#include "treewidth_analyzer.h"
+#include "tn_compiler.h"
 #include "../netlist/circuit.h"
 #include "../tensors/physics_tensors.h"
 
@@ -35,7 +39,35 @@ NetlistCompiler::compile(const TensorNetlist& netlist)
     //   never holds a pointer to external GUI state.
     block->structural_ = netlist;
 
-    // ── 5. Propagate interface pin metadata from TensorBlock ──────────────
+    // ── 5. Run graph partitioner for Phase C GPU workgroup assignment ─────
+    //   Groups topology-adjacent devices into workgroup-sized batches so that
+    //   the Phase B shared-memory voltage cache achieves maximum node reuse.
+    {
+        GraphPartitioner partitioner;
+        block->partitions = partitioner.partition(block->tensors);
+    }
+
+    // ── 6. Analytical topology pass (Phase A) ─────────────────────────────
+    //   Builds a FactorGraph IR from the SoA tensors — including branch-current
+    //   MNA variables for voltage sources and inductors — then runs Min-Fill to
+    //   produce an elimination ordering and treewidth estimate.  The result is
+    //   stored in CompiledTensorBlock for use by the Phase 5.3 TN compiler.
+    //   This pass is purely analytical: it never modifies tensors or partitions.
+    FactorGraph fg = FactorGraph::fromTensorizedBlock(
+        block->tensors, static_cast<uint32_t>(block->nodeCount));
+    block->tnAnalysis = TreewidthAnalyzer::analyze(fg);
+
+    // ── 6.5. TN Compilation (Phase 5.3.1) ─────────────────────────────────
+    //   Build MPOs and contraction tree from the factor graph + treewidth data.
+    //   Only if treewidth analysis succeeded and circuit is large enough.
+    if (block->tnAnalysis.isAnalyzed && block->nodeCount >= 20) {
+        block->tnProgram = std::make_shared<TNCompiledProgram>(
+            TNCompiler::compile(fg, block->tnAnalysis, block->tensors,
+                               std::vector<double>(block->nodeCount, 0.0),
+                               block->ambientTempK));
+    }
+
+    // ── 7. Propagate interface pin metadata from TensorBlock ──────────────
     //   TensorBlock::InterfacePin (string-based UUID) → CompiledInterfacePin
     //   (typed NetUUID) for use by the hierarchy resolver and future
     //   HierarchyResolver class.

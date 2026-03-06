@@ -76,90 +76,22 @@ static JobID generateJobID() {
 }
 
 // ── Internal Netlist Deserializer ─────────────────────────────────────────
-// Minimal SPICE netlist parser sufficient for DC parity tests.
-// Handles: R, V elements and .op directive.
-// Node "0" maps to ground (node index 0).
+// Delegates to the full SPICE3f5 parser (netlist/spice_parser.h).
+// Handles all standard elements: R, C, L, K, V, I, D, M, Q, J, E, G, H, F, T, X.
+// Supports .model, .subckt/.ends, .param, waveform specs (PULSE, SIN), and SI suffixes.
+#include "acutesim_engine/netlist/spice_parser.h"
+
 static TensorNetlist deserialiseRequest(const SimulationRequestDTO& req) {
-    TensorNetlist netlist;
-    if (req.source.payload.empty()) return netlist;
+    if (req.source.payload.empty()) return TensorNetlist{};
 
-    // Parse value string (handles SI suffix: k, m, u, n, p, f, g, t, meg)
-    auto parseValue = [](const std::string& s) -> double {
-        if (s.empty()) return 0.0;
-        size_t end = 0;
-        double v = std::stod(s, &end);
-        if (end < s.size()) {
-            char sfx = static_cast<char>(std::tolower(static_cast<unsigned char>(s[end])));
-            if (s.substr(end) == "meg" || s.substr(end) == "MEG") v *= 1e6;
-            else if (sfx == 'g') v *= 1e9;
-            else if (sfx == 't') v *= 1e12;
-            else if (sfx == 'k') v *= 1e3;
-            else if (sfx == 'm') v *= 1e-3;
-            else if (sfx == 'u') v *= 1e-6;
-            else if (sfx == 'n') v *= 1e-9;
-            else if (sfx == 'p') v *= 1e-12;
-            else if (sfx == 'f') v *= 1e-15;
-        }
-        return v;
-    };
+    acutesim::SPICEParser parser;
+    auto result = parser.parse(req.source.payload);
 
-    // Tokenize: map node name -> index (0 = ground)
-    std::map<std::string, int> nodeMap;
-    auto nodeIndex = [&](const std::string& name) -> int {
-        if (name == "0" || name == "gnd" || name == "GND") return 0;
-        auto it = nodeMap.find(name);
-        if (it != nodeMap.end()) return it->second;
-        int idx = static_cast<int>(nodeMap.size()) + 1;
-        nodeMap[name] = idx;
-        return idx;
-    };
-
-    std::istringstream stream(req.source.payload);
-    std::string line;
-    bool firstLine = true;
-    while (std::getline(stream, line)) {
-        if (firstLine) { firstLine = false; continue; } // skip title
-        if (line.empty() || line[0] == '*' || line[0] == '.') continue;
-
-        std::istringstream ls(line);
-        std::string name; ls >> name;
-        if (name.empty()) continue;
-        char type = static_cast<char>(std::toupper(static_cast<unsigned char>(name[0])));
-
-        if (type == 'R') {
-            std::string n1s, n2s, val;
-            ls >> n1s >> n2s >> val;
-            Resistor r;
-            r.name = name;
-            r.nodeTerminal1 = nodeIndex(n1s);
-            r.nodeTerminal2 = nodeIndex(n2s);
-            r.resistance_ohms = parseValue(val);
-            netlist.globalBlock.resistors.push_back(r);
-        } else if (type == 'V') {
-            std::string n1s, n2s, dc_kw, val;
-            ls >> n1s >> n2s >> dc_kw >> val;
-            // Handle "V1 1 0 DC 5" or "V1 1 0 5"
-            double voltage = 0.0;
-            if (dc_kw == "DC" || dc_kw == "dc") {
-                voltage = parseValue(val);
-            } else {
-                voltage = parseValue(dc_kw); // "V1 1 0 5"
-            }
-            VoltageSource vs;
-            vs.nodePositive = nodeIndex(n1s);
-            vs.nodeNegative = nodeIndex(n2s);
-            vs.voltage_V = voltage;
-            vs.type = "DC";
-            netlist.globalBlock.voltageSources.push_back(vs);
-        }
+    if (!result.success) {
+        std::cerr << "[AcuteSim] SPICE parse error: " << result.errorMessage << "\n";
     }
 
-    // Count nodes (max node index)
-    netlist.numGlobalNodes = 0;
-    for (const auto& [name, idx] : nodeMap) {
-        if (idx > netlist.numGlobalNodes) netlist.numGlobalNodes = idx;
-    }
-    return netlist;
+    return std::move(result.netlist);
 }
 
 // ============================================================================

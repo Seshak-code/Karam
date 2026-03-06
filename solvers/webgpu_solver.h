@@ -90,6 +90,15 @@ private:
     WGPUBuffer mosfetMapBuffer = nullptr;
     WGPUBuffer bjtMapBuffer    = nullptr;
 
+    // Voltage route buffers — per-device terminal index lists.
+    // Enables cooperative workgroup preload into var<workgroup> cache (Phase B).
+    // Diode:  2 x u32 per device (anode-1, cathode-1; 0xFFFFFFFF = ground).
+    // MOSFET: 4 x u32 per device (drain, gate, source, body terminal indices).
+    // BJT:    3 x u32 per device (collector, base, emitter terminal indices).
+    WGPUBuffer diodeVoltageRouteBuffer  = nullptr;
+    WGPUBuffer mosfetVoltageRouteBuffer = nullptr;
+    WGPUBuffer bjtVoltageRouteBuffer    = nullptr;
+
     // Global time/step state
     WGPUBuffer globalStateBuffer = nullptr;
 

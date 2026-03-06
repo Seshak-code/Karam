@@ -2,6 +2,7 @@
 #include "gui_boundary_guard.h"
 #include "../netlist/circuit.h"
 #include "../math/linalg.h"
+#include "../math/sparse_lu.h"
 #include "../infrastructure/compiled_block.h"
 #include <algorithm>
 #include <cassert>
@@ -32,6 +33,7 @@
 #include "../infrastructure/simtrace.h"
 #include "../infrastructure/tensorscheduler.h"
 #include "corner_config.h"
+#include "../solvers/tensor_workspace.h"
 
 // ============================================================================
 // CIRCUITSIM CLASS
@@ -62,12 +64,81 @@ private:
   int instability_counter = 0;
   static constexpr int INSTABILITY_THRESHOLD = 3;
 
+  // ─── TAA (Temporal Anti-Aliasing) History Rejection ──────────────────────
+  // Per-node "motion vectors": tracks voltage acceleration (ddV/dt²) to
+  // detect violent switching events where polynomial predictors diverge.
+  // Analogy: TAA rejects history frames when motion vectors indicate rapid
+  // scene changes. Here we reject polynomial extrapolations when ddV/dt²
+  // indicates rapid switching, falling back to first-order Euler.
+  std::vector<double> prev_dv_dt_;   // First derivative at each node (t-1)
+  bool taaInitialized_ = false;
+
+  // Threshold for acceleration-based rejection. If |ddV/dt²| * dt² exceeds
+  // this value (in volts), the polynomial predictor is untrustworthy.
+  // Calibrated to reject at ~10mV of quadratic prediction error per step.
+  static constexpr double TAA_ACCEL_THRESHOLD = 0.01;  // 10mV
+
 public:
+  // ─── TAA: History Rejection API ──────────────────────────────────────────
+  // Computes per-node "motion vectors" (voltage acceleration) and rejects
+  // polynomial predictor guesses for nodes undergoing violent switching.
+  //
+  // @param predicted     In/out: polynomial-predicted voltage state
+  // @param current_v     Most recent converged voltage state (= prev_voltages)
+  // @param dt            Current timestep
+  // @return Number of nodes where history was rejected
+  int rejectHistory(std::vector<double>& predicted, double dt) const {
+      if (!taaInitialized_ || prev_voltages.empty() || prev_prev_voltages.empty() ||
+          dt <= 0 || prev_dt <= 0) {
+          return 0;
+      }
+
+      int rejectionCount = 0;
+      const size_t N = std::min(predicted.size(), prev_voltages.size());
+      const double dt_sq = dt * dt;
+
+      for (size_t i = 0; i < N; ++i) {
+          // Current first derivative estimate: dV/dt_{n-0.5}
+          double dv_dt_current = (prev_voltages[i] - prev_prev_voltages[i]) / prev_dt;
+
+          // Acceleration (second derivative): ddV/dt²
+          double ddv_dt2 = 0.0;
+          if (i < prev_dv_dt_.size()) {
+              ddv_dt2 = (dv_dt_current - prev_dv_dt_[i]) / (0.5 * (dt + prev_dt));
+          }
+
+          // Quadratic prediction error estimate: |ddV/dt²| * dt²
+          double accel_error = std::abs(ddv_dt2) * dt_sq;
+
+          if (accel_error > TAA_ACCEL_THRESHOLD) {
+              // Reject polynomial predictor → fall back to first-order Euler
+              // predicted[i] = V[n-1] + dV/dt * dt  (linear extrapolation only)
+              predicted[i] = prev_voltages[i] + dv_dt_current * dt;
+              ++rejectionCount;
+          }
+      }
+      return rejectionCount;
+  }
+
+  // Query: was a node's history rejected at the last call?
+  // Returns the acceleration magnitude for diagnostics.
+  double nodeAcceleration(size_t nodeIdx) const {
+      if (!taaInitialized_ || nodeIdx >= prev_voltages.size() ||
+          nodeIdx >= prev_prev_voltages.size() || prev_dt <= 0) {
+          return 0.0;
+      }
+      double dv_dt_current = (prev_voltages[nodeIdx] - prev_prev_voltages[nodeIdx]) / prev_dt;
+      if (nodeIdx >= prev_dv_dt_.size()) return 0.0;
+      return std::abs((dv_dt_current - prev_dv_dt_[nodeIdx]) / prev_dt);
+  }
+
   void initialize(const TensorNetlist &netlist) {
     int n = netlist.numGlobalNodes;
     prev_voltages.assign(n, 0.0);
     prev_prev_voltages.assign(n, 0.0);
     node_weights.assign(n, 1e-12);
+    prev_dv_dt_.assign(n, 0.0);
+    taaInitialized_ = false;
     prev_energy = 0.0;
     prev_dt = 1e-9;
     instability_counter = 0;
@@ -268,6 +339,19 @@ public:
         return 1; // Retry
     } else {
         instability_counter = std::max(0, instability_counter - 1);
+
+        // ─── TAA: Update motion vectors (dV/dt) for next step ──────────
+        // These are used by rejectHistory() to compute acceleration and
+        // detect violent switching events where polynomial predictors fail.
+        if (!prev_voltages.empty() && prev_dt > 0) {
+            const size_t N = current_voltages.size();
+            prev_dv_dt_.resize(N, 0.0);
+            for (size_t i = 0; i < N; ++i) {
+                prev_dv_dt_[i] = (current_voltages[i] - prev_voltages[i]) / dt;
+            }
+            taaInitialized_ = true;
+        }
+
         prev_prev_voltages = prev_voltages;
         prev_voltages = current_voltages;
         prev_energy = current_energy;
@@ -301,6 +385,21 @@ public:
   // CSR pattern cache (Sparse Merge — Phase D5): frozen per topology change
   std::unique_ptr<CachedCsrPattern> cachedPattern_;
   uint64_t cachedPatternHash_ = 0;  // topology hash when pattern was last built
+
+  // Phase B: Cached symbolic factorization for sparse LU solver.
+  // Recomputed when topology hash changes (alongside cachedPattern_).
+  std::unique_ptr<SymbolicFactorization> cachedSymbolic_;
+
+  // Phase B: Compiled block pointer for treewidth-guided solver routing.
+  // Set via setCompiledBlock() before solveDC/stepTransient calls.
+  std::shared_ptr<const CompiledTensorBlock> compiledBlock_;
+  void setCompiledBlock(std::shared_ptr<const CompiledTensorBlock> cb) {
+      compiledBlock_ = std::move(cb);
+  }
+
+  // Phase 5.3.3: Cached workspace for contraction executor.
+  // Allocated once per topology, reused across NR iterations via reset().
+  std::unique_ptr<TensorWorkspace> cachedWorkspace_;
 
   // Callbacks for orchestration
   std::function<void(int, double)> onConvergenceStep;
