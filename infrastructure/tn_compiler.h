@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bond_dimension_profiler.h"
+#include "contraction_render_graph.h"
 #include "contraction_tree.h"
 #include "factor_graph.h"
 #include "mpo_builder.h"
@@ -36,6 +37,12 @@ struct TNCompiledProgram {
     // Used by ContractionExecutor to verify no intermediate tensor exceeds
     // the SM shared memory limit at runtime.
     uint64_t tileMemoryBudget = 163840;    // default: 163KB (GPU SM limit)
+
+    // ─── Phase 5.7.4: Render Graph Schedule ──────────────────────────────
+    // Optimized GPU execution schedule: aliased workspace slots, wavefront
+    // groups for parallel dispatch, and per-pass barrier requirements.
+    // Computed by TNCompiler::compile() as the final pipeline step.
+    RenderGraphSchedule renderGraph;
 };
 
 class TNCompiler {

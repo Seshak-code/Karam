@@ -28,6 +28,13 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
 void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& voltages);
 #endif
 
+// Forward declare NEON kernels
+#ifdef __aarch64__
+void batchDiodePhysics_neon(DiodeTensor& tensor, const std::vector<double>& voltages);
+void batchMosfetPhysics_neon(MosfetTensor& tensor, const std::vector<double>& voltages);
+void batchBJTPhysics_neon(BJTTensor& tensor, const std::vector<double>& voltages);
+#endif
+
 namespace acutesim {
 namespace compute {
 
@@ -85,8 +92,10 @@ void KernelDispatcher::detectCpuAndBind() {
 
 #elif defined(__aarch64__)
     architecture = SimdArch::Neon;
-    std::cout << "[INFO] Compute: Detected ARM Neon." << std::endl;
-    // Bind Neon kernels here
+    batch_diode_physics = batchDiodePhysics_neon;
+    batch_mosfet_physics = batchMosfetPhysics_neon;
+    batch_bjt_physics = batchBJTPhysics_neon;
+    std::cout << "[INFO] Compute: Detected ARM Neon. Using NEON f64x2 kernels." << std::endl;
 #endif
     
     if (architecture == SimdArch::Generic) {

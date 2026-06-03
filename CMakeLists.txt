@@ -88,6 +88,7 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/mpo_builder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_tree.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/tn_compiler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_render_graph.cpp
 
     # === Math ===
     ${CMAKE_CURRENT_SOURCE_DIR}/math/sparse_lu.cpp
@@ -111,6 +112,7 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_tensors.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_neon.cpp
 
     # === Netlist ===
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/netlist_export.cpp

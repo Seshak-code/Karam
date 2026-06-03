@@ -20,10 +20,15 @@
 #include "../solvers/schur_solver.h"
 #include "../solvers/contraction_executor.h"
 #include "../infrastructure/mpo_builder.h"
+#include "../infrastructure/adaptive_precision.h"
 #if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
 #include "../solvers/webgpu_solver.h"
 #include "acutesim_engine/gpu_context_manager.h"
 #endif
+
+// Matches SPICE3's dt_init = tstep/100: divides the first transient step into
+// 100 internal Backward Euler micro-steps for cold-start accuracy.
+static constexpr int COLD_START_SUBSTEPS = 100;
 
 // =============================================================================
 // PHASE 1 HARDENING: Helper Method Implementations
@@ -212,7 +217,23 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
   std::vector<double> voltageEstimate(netlist.numGlobalNodes, 0.0);
 
+  // Gap 4: Neural seeder — use dV/dt extrapolation or EMA history if available.
+  // The heuristic seedInitialGuess() always runs on top for supply rails / PN junctions.
+  if (!prevVoltages_.empty() && prevVoltages_.size() == voltageEstimate.size()) {
+      // dV/dt extrapolation from last two converged solutions (DC: dt=1.0)
+      auto seed = neuralSeeder_.predict(prevVoltages_, prevVoltages_, 1.0);
+      if (!seed.empty()) {
+          voltageEstimate = std::move(seed);
+      }
+  } else if (neuralSeeder_.hasHistory()) {
+      auto seed = neuralSeeder_.predictSeed(voltageEstimate.size());
+      if (!seed.empty()) {
+          voltageEstimate = std::move(seed);
+      }
+  }
+
   // Phase 1 Hardening: Use extracted helper for initial guess seeding
+  // Runs on top of neural seed to enforce supply rail / PN junction constraints
   seedInitialGuess(netlist, voltageEstimate);
 
   bool converged = false;
@@ -280,6 +301,11 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
         // Phase 5.3.3: Invalidate contraction workspace on topology change
         cachedWorkspace_.reset();
+        // Gap 3: Invalidate cached MPOs and prev voltages on topology change
+        cachedMpos_.clear();
+        prevVoltages_.clear();
+        // Gap 4: Reset seeder history on topology change
+        neuralSeeder_.reset();
     } else {
         matrix = matrixBuilder.assembleFast(*cachedPattern_);
     }
@@ -306,21 +332,107 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     } else if (tw.estimatedTreewidth <= CONTRACTION_TW_LIMIT &&
                compiledBlock_ && compiledBlock_->tnProgram &&
                compiledBlock_->tnProgram->viable) {
-        // Phase 5.3.3: Tensor contraction execution engine
-        // Rebuild MPOs at current voltage state for nonlinear RHS accuracy
+        // Phase 5.3.3 / Gap 1: Tensor contraction execution engine
         auto& prog = *compiledBlock_->tnProgram;
-        prog.mpos = MPOBuilder::buildMPOs(soaBlock, voltageEstimate,
-                                          netlist.environment.ambient_temp_K);
 
-        // Allocate or reuse cached workspace
-        if (!cachedWorkspace_) {
-            cachedWorkspace_ = std::make_unique<TensorWorkspace>();
-            cachedWorkspace_->allocate(prog.tree);
+        // ── Gap 3: Mixed-Precision IR — adaptive tier routing ────────────
+        // Assign precision tiers based on per-partition voltage activity.
+        // CACHED_REUSE partitions skip MPO rebuild; FP32_RELAXED uses FP64
+        // with single-precision GPU dispatch (enableFP32 defaults to false).
+        std::vector<SubgraphActivity> precisionActivities;
+        bool useCachedMpos = false;
+        if (!prevVoltages_.empty() && !cachedMpos_.empty() &&
+            compiledBlock_->partitions.size() > 1) {
+            AdaptivePrecisionRouter router;
+            precisionActivities = router.assignTiers(
+                compiledBlock_->partitions, voltageEstimate, prevVoltages_,
+                /* dt */ 1.0);  // DC: use dt=1.0 (only relative dV matters)
+            uint32_t fp64N = 0, fp32N = 0, cachedN = 0;
+            AdaptivePrecisionRouter::countTiers(precisionActivities, fp64N, fp32N, cachedN);
+            // If all partitions are cached, still do a full rebuild for safety
+            if (cachedN > 0 && cachedN < static_cast<uint32_t>(precisionActivities.size())) {
+                useCachedMpos = true;
+            }
         }
 
-        result = ContractionExecutor::solve(
-            prog, *cachedWorkspace_,
-            netlist.numGlobalNodes, gmin_factor);
+        // ── Gap 3 Full Selectivity: Per-partition selective MPO rebuild ───
+        // Only rebuild MPOs for partitions assigned FP64_FULL or FP32_RELAXED.
+        // CACHED_REUSE partitions retain their previous MPO values.
+        if (useCachedMpos && cachedMpos_.size() == prog.mpos.size()) {
+            // Build a set of device indices that need fresh evaluation
+            std::vector<bool> needsRebuild(prog.mpos.size(), false);
+            for (size_t pIdx = 0; pIdx < precisionActivities.size(); ++pIdx) {
+                if (precisionActivities[pIdx].assignedTier != PrecisionTier::CACHED_REUSE) {
+                    // Mark all devices in this partition for rebuild
+                    if (pIdx < compiledBlock_->partitions.size()) {
+                        for (uint32_t devIdx : compiledBlock_->partitions[pIdx].deviceIndices) {
+                            if (devIdx < needsRebuild.size()) {
+                                needsRebuild[devIdx] = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build fresh MPOs for the full block
+            auto freshMpos = MPOBuilder::buildMPOs(soaBlock, voltageEstimate,
+                                                   netlist.environment.ambient_temp_K);
+
+            // Selective merge: use fresh for active partitions, cached for static
+            prog.mpos = cachedMpos_;  // start from cached
+            for (size_t i = 0; i < freshMpos.size() && i < prog.mpos.size(); ++i) {
+                if (needsRebuild[i]) {
+                    prog.mpos[i] = std::move(freshMpos[i]);
+                }
+            }
+        } else {
+            prog.mpos = MPOBuilder::buildMPOs(soaBlock, voltageEstimate,
+                                              netlist.environment.ambient_temp_K);
+        }
+        // Cache MPOs for next iteration's CACHED_REUSE check
+        cachedMpos_ = prog.mpos;
+
+#if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
+        // ── GPU Contraction Path (Gap 1 + HYBRID mode) ──────────────────
+        // GPU/GPU_DEBUG/HYBRID: forward the compiled contraction program to
+        // WebGPUSolver and execute the tree on GPU via tn_contraction.wgsl.
+        // HYBRID mode dispatches GPU contraction asynchronously and can
+        // overlap with CPU work on subsequent iterations.
+        if (execMode == ExecutionMode::GPU || execMode == ExecutionMode::GPU_DEBUG ||
+            execMode == ExecutionMode::HYBRID) {
+            auto& gpuMgr = acutesim::GPUContextManager::instance();
+            WebGPUSolver gpuContractor(gpuMgr.rawDevice(), gpuMgr.rawQueue());
+            if (gpuContractor.initialize(netlist)) {
+                // Upload MPO tensors + contraction tree to GPU workspace
+                gpuContractor.uploadContractionProgram(prog,
+                                                        netlist.numGlobalNodes);
+                // Execute GPU contraction sweep
+                std::vector<double> gpuSol = gpuContractor.executeContractionSweep(
+                    netlist.numGlobalNodes, gmin_factor);
+                if (!gpuSol.empty()) {
+                    result.solution  = gpuSol;
+                    result.converged = true;
+                    result.finalResidual = 0.0;
+                }
+                // Fallback: if GPU path returned empty, fall through to CPU below
+                if (!result.converged) {
+                    std::cerr << "[WARN] GPU contraction sweep failed — falling back to CPU TN\n";
+                }
+            }
+        }
+#endif
+
+        // ── CPU Contraction Path (reference, always available) ───────────
+        if (!result.converged) {
+            // Allocate or reuse cached workspace
+            if (!cachedWorkspace_) {
+                cachedWorkspace_ = std::make_unique<TensorWorkspace>();
+                cachedWorkspace_->allocate(prog.tree);
+            }
+            result = ContractionExecutor::solve(
+                prog, *cachedWorkspace_,
+                netlist.numGlobalNodes, gmin_factor);
+        }
 
         // Fallback: if contraction solve fails or has poor residual, try sparse/dense
         if (!result.converged || result.finalResidual > 1e-6) {
@@ -331,6 +443,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                 result = solveLU_Pivoted(matrix, rhsVector);
             }
         }
+
     } else if (tw.estimatedTreewidth <= SCHUR_TW_LIMIT &&
                compiledBlock_ && compiledBlock_->tnProgram &&
                compiledBlock_->tnProgram->viable &&
@@ -551,44 +664,220 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   stats.smallestPivot = smallestPivotOverall;
   stats.regularization = regulInfo;
 
+  // Gap 3: Save converged voltages for next solve's adaptive precision routing
+  // Gap 4: Record solution in neural seeder history
+  if (converged) {
+      prevVoltages_ = voltageEstimate;
+      neuralSeeder_.recordSolution(voltageEstimate, final_kcl_error, total_iterations);
+  }
+
   return {0.0, voltageEstimate, stats, netlist.globalBlock.topologyHash};
 }
 
 
+
+// =============================================================================
+// COLD-START MICRO-STEPPING (SPICE3 dt_init = tstep/100)
+// =============================================================================
+
+bool CircuitSim::coldStartSweep(TensorNetlist& netlist, double totalTime,
+                                 int nSubsteps,
+                                 std::vector<double>& finalVoltages) {
+    if (nSubsteps <= 0 || totalTime <= 0.0 || netlist.numGlobalNodes == 0)
+        return false;
+
+    // All micro-steps use Backward Euler (GEAR_1_EULER).
+    // The caller already set this before invoking coldStartSweep.
+    const double dt_sub = totalTime / static_cast<double>(nSubsteps);
+
+    // Seed the first micro-step NR estimate from the DC OP (arbiter history).
+    std::vector<double> nrEstimate = arbiter.getPrevVoltages();
+    if (nrEstimate.empty()) nrEstimate.assign(netlist.numGlobalNodes, 0.0);
+
+    for (int k = 0; k < nSubsteps; ++k) {
+        // Sync soaBlock capacitor/inductor history from AoS netlist state.
+        // This must happen at the start of each sub-step so stampAllElements
+        // uses the correct companion-model source term for this micro-step.
+        soaBlock = tensorizeNetlist(netlist);
+        for (size_t i = 0; i < netlist.globalBlock.capacitors.size() &&
+                           i < soaBlock.capacitors.v_prev.size(); ++i) {
+            const auto& hist = netlist.globalState.capacitorState[i];
+            if (!hist.v.empty()) soaBlock.capacitors.v_prev[i] = hist.v[0];
+            if (!hist.i.empty()) soaBlock.capacitors.i_prev[i] = hist.i[0];
+        }
+        for (size_t i = 0; i < netlist.globalBlock.inductors.size() &&
+                           i < soaBlock.inductors.i_prev.size(); ++i) {
+            const auto& hist = netlist.globalState.inductorState[i];
+            if (!hist.i.empty()) soaBlock.inductors.i_prev[i] = hist.i[0];
+            if (!hist.v.empty()) soaBlock.inductors.v_prev[i] = hist.v[0];
+        }
+
+        integrator->prepareStep(dt_sub);
+
+        // Inner NR loop — identical structure to the one in stepTransient.
+        bool nrConverged = false;
+        SolverResult subResult{};
+        for (int iteration = 0; iteration < MAX_NR_ITER; ++iteration) {
+            scheduler.schedule(netlist);
+            matrixBuilder.clear();
+            matrixBuilder.setDimensions(netlist.numGlobalNodes, netlist.numGlobalNodes);
+            rhsVector.assign(netlist.numGlobalNodes, 0.0);
+
+            stampAllElements(netlist, dt_sub, nrEstimate, dt_sub * (k + 1));
+            addDiagonalConditioning(netlist.numGlobalNodes);
+
+            Csr_matrix A = matrixBuilder.createCsr();
+
+            if (netlist.numGlobalNodes < 100) {
+                subResult = solveLU_Pivoted(A, rhsVector);
+            } else {
+                subResult = solvePCG(A, rhsVector, 1e-6);
+                if (!subResult.converged) {
+                    subResult = solveLU_Pivoted(A, rhsVector);
+                }
+            }
+
+            std::vector<double> v_new = subResult.solution;
+
+            double kcl_error = calculatePhysicalResiduals(netlist, v_new, dt_sub);
+            if (checkConvergence(v_new, nrEstimate, kcl_error, PhysicsConstants::KCL_TOL)) {
+                nrEstimate = v_new;
+                nrConverged = true;
+                break;
+            }
+            nrEstimate = v_new;
+        }
+
+        if (!nrConverged) {
+            // NR failed for this micro-step — abort the sweep.
+            return false;
+        }
+
+        // Update AoS capacitor history for this micro-step's converged solution.
+        // Using BE (GEAR_1_EULER) formula: i_curr = (C/dt_sub) * (v_cap_new - v_cap_prev)
+        // This matches exactly what stepTransient does in its history-update block when
+        // type == GEAR_1_EULER (line: i_curr = (C/actualTimeStep)*(v_curr - hist.v[0])).
+        for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
+            const auto& cap = netlist.globalBlock.capacitors[i];
+            auto& hist = netlist.globalState.capacitorState[i];
+
+            if (hist.v.empty()) hist.resize(3);
+
+            double v_cap_new = 0.0;
+            if (cap.nodePlate1 > 0 && cap.nodePlate1 <= (int)nrEstimate.size())
+                v_cap_new += nrEstimate[cap.nodePlate1 - 1];
+            if (cap.nodePlate2 > 0 && cap.nodePlate2 <= (int)nrEstimate.size())
+                v_cap_new -= nrEstimate[cap.nodePlate2 - 1];
+
+            double C = cap.capacitance_farads;
+            double i_curr = (C / dt_sub) * (v_cap_new - hist.v[0]);
+
+            integrator->updateHistory(hist.v, hist.i, v_cap_new, i_curr);
+        }
+        // Note: Inductor history write-back is not performed here, consistent with
+        // stepTransient which also does not write back inductorState in its main
+        // history-update block.  The soaBlock re-sync at the top of each sub-step
+        // reads the current hist.i[0] and hist.v[0] values correctly.
+    }
+
+    finalVoltages = nrEstimate;
+    return true;
+}
 
 SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
                                double currentTime) {
     if (netlist.numGlobalNodes == 0)
         return {currentTime, {}, {0, 0.0, true}, 0};
 
+    bool isFirstTransientStep = !arbiterInitialized;
+    // When coldStartSweep() succeeds it updates all capacitor history internally,
+    // so we must skip the main NR while-loop and the post-convergence history-update
+    // block below.  This flag is set to true only when the sweep converges.
+    bool isFirstTransientStepHandled = false;
+
+    std::vector<double> finalVoltages;
+    SolverResult lastResult{};  // zero-initialize: iterations=0, finalResidual=0.0, converged=false
+    bool simulationConverged = false;
+    double next_dt_suggestion = timeStep;
+
     if (!arbiterInitialized) {
       arbiter.initialize(netlist);
       arbiterInitialized = true;
-      
+
       // M4: Enforce Formal Passivity
       if (!arbiter.checkPassivity(netlist)) {
            // Halt simulation if physically impossible device parameters found
            return {currentTime, {}, {0, 0.0, false}};
       }
+
+      // Use Backward Euler for all cold-start micro-steps.  TRAPEZOIDAL's
+      // companion current I_eq = -G_eq*v_prev - i_prev is zero when both
+      // hist.v and hist.i are zero (cold start / UIC ic=0), which gives a
+      // systematically wrong first-step solution.  BE's companion model
+      // I_eq = 0 (purely a conductance C/h) is correct for a zero-IC start
+      // and doesn't depend on i_prev at all.
+      setIntegrationMethod(IntegrationType::GEAR_1_EULER);
+
+      // SPICE3-accurate cold-start: divide the first transient step into
+      // COLD_START_SUBSTEPS internal BE micro-steps (dt_init = tstep/100).
+      // Each micro-step updates the AoS capacitor history so that by the end
+      // the companion-model state matches what SPICE3 produces at t = tstep.
+      std::vector<double> sweepVoltages;
+      bool sweepOk = coldStartSweep(netlist, timeStep, COLD_START_SUBSTEPS, sweepVoltages);
+      if (sweepOk) {
+          finalVoltages = sweepVoltages;
+          simulationConverged = true;
+          // Restore TRAPEZOIDAL now — hist.i has been recorded with BE formula
+          // for all 100 micro-steps, so the next step can use the high-accuracy
+          // second-order method with a valid hist.i.
+          setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
+          isFirstTransientStepHandled = true;
+      }
+      // Fallback: if sweep failed (e.g. NR divergence on a stiff circuit),
+      // isFirstTransientStepHandled remains false and the main NR loop below
+      // executes a single BE step at timeStep — the original cold-start behavior.
     }
 
-    // Initialize SoA Block for transient steps
+    // Initialize SoA Block for transient steps.
+    // tensorizeNetlist() zero-inits v_prev/i_prev; we must carry the AoS history
+    // (updated by the previous step's history-update loop) into the SoA arrays so
+    // that stampSoABlock() uses the correct companion-model source term.
     soaBlock = tensorizeNetlist(netlist);
+    for (size_t i = 0; i < netlist.globalBlock.capacitors.size() &&
+                       i < soaBlock.capacitors.v_prev.size(); ++i) {
+        const auto& hist = netlist.globalState.capacitorState[i];
+        if (!hist.v.empty()) soaBlock.capacitors.v_prev[i] = hist.v[0];
+        if (!hist.i.empty()) soaBlock.capacitors.i_prev[i] = hist.i[0];
+    }
+    for (size_t i = 0; i < netlist.globalBlock.inductors.size() &&
+                       i < soaBlock.inductors.i_prev.size(); ++i) {
+        const auto& hist = netlist.globalState.inductorState[i];
+        if (!hist.i.empty()) soaBlock.inductors.i_prev[i] = hist.i[0];
+        if (!hist.v.empty()) soaBlock.inductors.v_prev[i] = hist.v[0];
+    }
 
     double actualTimeStep = timeStep;
     int attempt = 0;
     const int MAX_ATTEMPTS = 4;
 
-    std::vector<double> finalVoltages;
-    SolverResult lastResult;
-    bool simulationConverged = false;
-    double next_dt_suggestion = timeStep;
+    // finalVoltages, lastResult, simulationConverged, next_dt_suggestion are declared
+    // above (before the !arbiterInitialized block) so coldStartSweep can populate them.
 
+    if (!isFirstTransientStepHandled) {
     while (attempt < MAX_ATTEMPTS) {
         integrator->prepareStep(actualTimeStep);
         
         std::vector<double> nrEstimate = arbiter.getPrevVoltages();
         if (nrEstimate.empty()) nrEstimate.assign(netlist.numGlobalNodes, 0.0);
+
+        // Gap 4: Neural seeder dV/dt extrapolation for transient steps.
+        // Uses the two most recent converged solutions to predict the next state.
+        if (!prevVoltages_.empty() && prevVoltages_.size() == nrEstimate.size()) {
+            auto seed = neuralSeeder_.predict(nrEstimate, prevVoltages_, actualTimeStep);
+            if (!seed.empty()) {
+                nrEstimate = std::move(seed);
+            }
+        }
 
         // ─── TAA: History Rejection ──────────────────────────────────────
         // Reject polynomial predictors for nodes undergoing violent switching.
@@ -640,6 +929,30 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
             continue;
         }
 
+        // ─── Gap 5: LTE-Based Timestep Control ─────────────────────────────
+        // Estimate local truncation error BEFORE the arbiter's stability check.
+        // If LTE exceeds tolerance, reject the step and retry with smaller dt.
+        auto lteResult = lteController_.estimateLTE(
+            netlist, nrEstimate, actualTimeStep, integrator->getType());
+
+        if (lteResult.requiresRejection) {
+            // LTE too large — timestep was too aggressive
+            actualTimeStep = lteResult.suggestedDt;
+            attempt++;
+            continue;
+        }
+
+        // ─── Gap 5: Ringing-Aware Method Arbiter ─────────────────────────
+        // Check for trapezoidal ringing (2h-oscillations) and switch to Gear2
+        // if detected. This replaces the hard-coded suggestion == 2 path.
+        IntegrationType suggestedMethod = lteController_.selectMethod(
+            nrEstimate, integrator->getType());
+        if (suggestedMethod != integrator->getType()) {
+            setIntegrationMethod(suggestedMethod);
+            // Don't retry — the method switch affects the NEXT step, not this one
+        }
+
+        // Original arbiter stability analysis (energy monitor, Lyapunov check)
         int suggestion = arbiter.analyzeStability(netlist, nrEstimate, actualTimeStep, next_dt_suggestion);
 
         if (suggestion == 1) { 
@@ -653,19 +966,39 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
             }
         }
 
+        // Use LTE-based timestep suggestion if it's more conservative
+        double lte_dt = lteController_.suggestTimestep(
+            actualTimeStep, lteResult.maxLTE, lteTolerance_, integrator->getType());
+        if (lte_dt < next_dt_suggestion) {
+            next_dt_suggestion = lte_dt;
+        }
+
+        // ─── Gap 2: Digital Event Engine — A2D Sampling ──────────────────
+        // After analog convergence, sample voltages at A2D boundary ports
+        // and propagate digital events. This prepares D2A stamps for the
+        // next transient step.
+        if (digitalEngine_.portCount() > 0) {
+            digitalEngine_.sampleAnalog(nrEstimate, currentTime + actualTimeStep);
+            digitalEngine_.propagateEvents();
+        }
+
         finalVoltages = nrEstimate;
         simulationConverged = true;
         timeStep = next_dt_suggestion;
         break;
     }
-    
+    } // end if (!isFirstTransientStepHandled)
+
     // Hang Protection: Detect if timeStep has underflowed
     if (timeStep < 1e-18) {
         // Prevent infinite loop by returning failing step
          return {currentTime, std::vector<double>(netlist.numGlobalNodes, 0.0), {lastResult.iterations, lastResult.finalResidual, false}};
     }
 
-    if (simulationConverged) {
+    // When coldStartSweep() handled the first step, all capacitor history was
+    // updated inside the sweep loop.  Skip the history-update block to avoid
+    // double-updating the companion-model state.
+    if (simulationConverged && !isFirstTransientStepHandled) {
         for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
              const auto &cap = netlist.globalBlock.capacitors[i];
              auto &hist = netlist.globalState.capacitorState[i];
@@ -698,7 +1031,14 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
              integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
         }
 
-        
+        // Restore TRAPEZOIDAL after the first step (which used Backward Euler
+        // for cold-start accuracy).  The restore must happen AFTER the cap
+        // history update above so that hist.i is recorded with the BE formula,
+        // not the TRAPEZOIDAL formula — otherwise i_prev would be doubled.
+        if (isFirstTransientStep && integrator->getType() == IntegrationType::GEAR_1_EULER) {
+            setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
+        }
+
         // Update Power Rail History (Local Decap)
         for (size_t i = 0; i < netlist.globalBlock.powerRails.size(); ++i) {
              const auto &rail = netlist.globalBlock.powerRails[i];
@@ -770,6 +1110,10 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
 
     if (!simulationConverged)
          return {currentTime, std::vector<double>(netlist.numGlobalNodes, 0.0), {lastResult.iterations, lastResult.finalResidual, false}, netlist.globalBlock.topologyHash};
+
+    // Gap 4: Record converged transient solution for neural seeder
+    prevVoltages_ = finalVoltages;
+    neuralSeeder_.recordSolution(finalVoltages, lastResult.finalResidual, lastResult.iterations);
 
     return {
         currentTime + actualTimeStep,

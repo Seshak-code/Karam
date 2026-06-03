@@ -157,14 +157,24 @@ WebGPUSolver::~WebGPUSolver() {
     rel(stagingRhsHi);      rel(stagingRhsLo);
     rel(stagingVoltageHi);  rel(stagingVoltageLo);
 
+    // Gap 1: TN contraction buffers
+    rel(tnWorkspaceHi); rel(tnWorkspaceLo);
+    rel(tnRhsHi); rel(tnRhsLo);
+    rel(tnUniformBuffer);
+    rel(tnIndexMapLeft); rel(tnIndexMapRight);
+    rel(tnStagingMatHi); rel(tnStagingMatLo);
+    rel(tnStagingRhsHi); rel(tnStagingRhsLo);
+
     auto relBG = [](WGPUBindGroup& bg){ if(bg){ wgpuBindGroupRelease(bg); bg=nullptr; } };
     relBG(bindGroup0); relBG(bindGroup1); relBG(bindGroup2);
+    relBG(tnBindGroup0); relBG(tnBindGroup1);
 
     auto relPL = [](WGPUComputePipeline& pl){ if(pl){ wgpuComputePipelineRelease(pl); pl=nullptr; } };
     relPL(physicsPipelineDiodes);  relPL(physicsPipelineMosfets); relPL(physicsPipelineBJTs);
     relPL(assemblyPipeline);       relPL(solutionUpdatePipeline);
     relPL(residualPipeline);       relPL(convergencePipeline);
     relPL(recordWaveformPipeline);
+    relPL(tnSeedLeafPipeline); relPL(tnMergeAccumPipeline); relPL(tnSchurElimPipeline);
 
     // Only release handles we own. When constructed via the external-device
     // ctor (ownsDevice_ = false), these handles are owned by GPUContextManager.
@@ -848,6 +858,759 @@ void WebGPUSolver::recordCopyToStaging(WGPUCommandEncoder enc,
 }
 
 void WebGPUSolver::createBindGroups() {}
+
+// ============================================================================
+// Gap 1: TN Contraction Backend
+// ============================================================================
+
+// CPU-side struct mirroring WGSL ContractionUniforms (16-byte aligned)
+struct ContractionUniformsCPU {
+    uint32_t slot_left;
+    uint32_t slot_right;
+    uint32_t slot_result;
+    uint32_t rank_left;
+    uint32_t rank_right;
+    uint32_t rank_result;
+    uint32_t elim_row;
+    uint32_t do_schur;
+};
+static_assert(sizeof(ContractionUniformsCPU) == 32, "Uniform struct must be 32 bytes");
+
+struct ElimRecordUniformsCPU {
+    uint32_t record_offset;
+    uint32_t elim_var_id;
+    uint32_t num_neighbors;
+    uint32_t backsub_count;
+    uint32_t slot_result;
+    uint32_t rank_result;
+    uint32_t elim_row;
+    uint32_t gmin_value; // bitcast float -> uint32
+};
+static_assert(sizeof(ElimRecordUniformsCPU) == 32, "Uniform struct must be 32 bytes");
+
+static constexpr uint32_t TN_MAX_TILE_RANK  = 8;
+static constexpr uint32_t TN_MAX_TILE_ELEMS = TN_MAX_TILE_RANK * TN_MAX_TILE_RANK;
+
+static std::string loadTNShaderSource() {
+    const char* candidates[] = {
+        "acutesim_engine/shaders/tn_contraction.wgsl",
+        "../acutesim_engine/shaders/tn_contraction.wgsl",
+        "../../acutesim_engine/shaders/tn_contraction.wgsl",
+        "shaders/tn_contraction.wgsl",
+        nullptr
+    };
+    for (int i = 0; candidates[i] != nullptr; ++i) {
+        std::ifstream f(candidates[i]);
+        if (f.good())
+            return std::string(std::istreambuf_iterator<char>(f),
+                               std::istreambuf_iterator<char>());
+    }
+    std::cerr << "[WARN] WebGPUSolver: Could not find tn_contraction.wgsl\n";
+    return "";
+}
+
+void WebGPUSolver::createTNPipelines() {
+    if (!device) return;
+    if (tnSeedLeafPipeline) return;  // already created
+
+    std::string src = loadTNShaderSource();
+    if (src.empty()) return;
+
+    WGPUShaderModule sm = loadShader(src);
+    if (!sm) {
+        std::cerr << "[ERROR] WebGPUSolver: TN shader module failed\n";
+        return;
+    }
+
+    // Use null layout for auto-derivation from WGSL reflection.
+    // This allows wgpuComputePipelineGetBindGroupLayout() to return
+    // the auto-generated layouts matching the shader's declared bindings.
+    auto makePipeline = [&](const char* ep) -> WGPUComputePipeline {
+        WGPUComputePipelineDescriptor d = {};
+        d.label               = WGPU_SV(ep);
+        d.layout              = nullptr;  // auto-layout
+        d.compute.module      = sm;
+        d.compute.entryPoint  = WGPU_SV(ep);
+        return wgpuDeviceCreateComputePipeline(device, &d);
+    };
+
+    tnSeedLeafPipeline  = makePipeline("tn_seed_leaf");
+    tnMergeAccumPipeline = makePipeline("tn_merge_accum");
+    tnSchurElimPipeline  = makePipeline("tn_schur_elim");
+    tnSchurElimRecordPipeline = makePipeline("tn_schur_elim_record");
+    tnBackSubstitutePipeline = makePipeline("tn_back_substitute");
+
+    wgpuShaderModuleRelease(sm);
+
+    std::cout << "[INFO] WebGPUSolver: TN contraction pipelines created\n";
+}
+
+void WebGPUSolver::createTNBindGroups() {
+    if (!device || !tnMergeAccumPipeline) return;
+
+    // Release old bind groups
+    auto relBG = [](WGPUBindGroup& bg){ if(bg){ wgpuBindGroupRelease(bg); bg=nullptr; } };
+    relBG(tnBindGroup0); relBG(tnBindGroup1); relBG(tnBindGroup2);
+
+    // Get auto-derived layouts from tn_merge_accum (it declares both group 0 + group 1)
+    WGPUBindGroupLayout bgl0 = wgpuComputePipelineGetBindGroupLayout(tnMergeAccumPipeline, 0);
+    WGPUBindGroupLayout bgl1 = wgpuComputePipelineGetBindGroupLayout(tnMergeAccumPipeline, 1);
+    WGPUBindGroupLayout bgl2 = nullptr;
+    if (tnSchurElimRecordPipeline) {
+        bgl2 = wgpuComputePipelineGetBindGroupLayout(tnSchurElimRecordPipeline, 2);
+    }
+    
+    if (!bgl0 || !bgl1 || !bgl2) {
+        std::cerr << "[ERROR] WebGPUSolver: Failed to get TN bind group layouts\n";
+        if (bgl0) wgpuBindGroupLayoutRelease(bgl0);
+        if (bgl1) wgpuBindGroupLayoutRelease(bgl1);
+        if (bgl2) wgpuBindGroupLayoutRelease(bgl2);
+        return;
+    }
+
+    size_t matBytes = static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_ELEMS * sizeof(float);
+    size_t rhsBytes = static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_RANK * sizeof(float);
+    size_t mapBytes = TN_MAX_TILE_RANK * sizeof(uint32_t);
+
+    // Group 0: workspace_hi, workspace_lo, rhs_hi, rhs_lo, uniforms
+    WGPUBindGroupEntry entries0[5] = {};
+    entries0[0].binding = 0; entries0[0].buffer = tnWorkspaceHi; entries0[0].size = matBytes;
+    entries0[1].binding = 1; entries0[1].buffer = tnWorkspaceLo; entries0[1].size = matBytes;
+    entries0[2].binding = 2; entries0[2].buffer = tnRhsHi;       entries0[2].size = rhsBytes;
+    entries0[3].binding = 3; entries0[3].buffer = tnRhsLo;       entries0[3].size = rhsBytes;
+    entries0[4].binding = 4; entries0[4].buffer = tnUniformBuffer;
+    entries0[4].size = sizeof(ContractionUniformsCPU);
+
+    WGPUBindGroupDescriptor bgd0 = {};
+    bgd0.layout     = bgl0;
+    bgd0.entryCount = 5;
+    bgd0.entries    = entries0;
+    tnBindGroup0 = wgpuDeviceCreateBindGroup(device, &bgd0);
+
+    // Group 1: index_map_left, index_map_right
+    WGPUBindGroupEntry entries1[2] = {};
+    entries1[0].binding = 0; entries1[0].buffer = tnIndexMapLeft;  entries1[0].size = mapBytes;
+    entries1[1].binding = 1; entries1[1].buffer = tnIndexMapRight; entries1[1].size = mapBytes;
+
+    WGPUBindGroupDescriptor bgd1 = {};
+    bgd1.layout     = bgl1;
+    bgd1.entryCount = 2;
+    bgd1.entries    = entries1;
+    tnBindGroup1 = wgpuDeviceCreateBindGroup(device, &bgd1);
+
+    wgpuBindGroupLayoutRelease(bgl0);
+    wgpuBindGroupLayoutRelease(bgl1);
+
+    // Group 2: Elimination records and solution
+    if (bgl2 && numNodes_ > 0) {
+        size_t elimPivotBytes = static_cast<size_t>(numNodes_) * sizeof(float);
+        size_t elimRhsBytes = static_cast<size_t>(numNodes_) * sizeof(float);
+        size_t elimRowBytes = static_cast<size_t>(numNodes_) * TN_MAX_TILE_RANK * sizeof(float);
+        size_t elimVarIdsBytes = static_cast<size_t>(numNodes_) * sizeof(uint32_t);
+        size_t elimNeighborIdsBytes = static_cast<size_t>(numNodes_) * TN_MAX_TILE_RANK * sizeof(uint32_t);
+        size_t elimNeighborCountBytes = static_cast<size_t>(numNodes_) * sizeof(uint32_t);
+        size_t solutionBytes = static_cast<size_t>(numNodes_) * sizeof(float);
+
+        WGPUBindGroupEntry entries2[12] = {};
+        entries2[0].binding = 0; entries2[0].buffer = tnElimPivotHi; entries2[0].size = elimPivotBytes;
+        entries2[1].binding = 1; entries2[1].buffer = tnElimPivotLo; entries2[1].size = elimPivotBytes;
+        entries2[2].binding = 2; entries2[2].buffer = tnElimRhsHi;   entries2[2].size = elimRhsBytes;
+        entries2[3].binding = 3; entries2[3].buffer = tnElimRhsLo;   entries2[3].size = elimRhsBytes;
+        entries2[4].binding = 4; entries2[4].buffer = tnElimRowHi;   entries2[4].size = elimRowBytes;
+        entries2[5].binding = 5; entries2[5].buffer = tnElimRowLo;   entries2[5].size = elimRowBytes;
+        entries2[6].binding = 6; entries2[6].buffer = tnElimVarIds;  entries2[6].size = elimVarIdsBytes;
+        entries2[7].binding = 7; entries2[7].buffer = tnElimNeighborIds; entries2[7].size = elimNeighborIdsBytes;
+        entries2[8].binding = 8; entries2[8].buffer = tnElimNeighborCount; entries2[8].size = elimNeighborCountBytes;
+        entries2[9].binding = 9; entries2[9].buffer = tnSolutionHi;  entries2[9].size = solutionBytes;
+        entries2[10].binding = 10; entries2[10].buffer = tnSolutionLo; entries2[10].size = solutionBytes;
+        entries2[11].binding = 11; entries2[11].buffer = tnElimUniformBuffer; entries2[11].size = sizeof(ElimRecordUniformsCPU);
+
+        WGPUBindGroupDescriptor bgd2 = {};
+        bgd2.layout     = bgl2;
+        bgd2.entryCount = 12;
+        bgd2.entries    = entries2;
+        tnBindGroup2 = wgpuDeviceCreateBindGroup(device, &bgd2);
+    }
+    if (bgl2) wgpuBindGroupLayoutRelease(bgl2);
+
+    if (tnBindGroup0 && tnBindGroup1)
+        std::cout << "[INFO] WebGPUSolver: TN bind groups created\n";
+    else
+        std::cerr << "[ERROR] WebGPUSolver: TN bind group creation failed\n";
+}
+
+void WebGPUSolver::uploadTNUniforms(uint32_t slotLeft, uint32_t slotRight,
+                                     uint32_t slotResult,
+                                     uint32_t rankLeft, uint32_t rankRight,
+                                     uint32_t rankResult,
+                                     uint32_t elimRow, uint32_t doSchur) {
+    if (!queue || !tnUniformBuffer) return;
+    ContractionUniformsCPU u = {
+        slotLeft, slotRight, slotResult,
+        rankLeft, rankRight, rankResult,
+        elimRow, doSchur
+    };
+    wgpuQueueWriteBuffer(queue, tnUniformBuffer, 0, &u, sizeof(u));
+}
+
+void WebGPUSolver::uploadTNElimUniforms(uint32_t record_offset, uint32_t elim_var_id,
+                                         uint32_t num_neighbors, uint32_t backsub_count,
+                                         uint32_t slot_result, uint32_t rank_result,
+                                         uint32_t elim_row, float gmin) {
+    if (!queue || !tnElimUniformBuffer) return;
+    
+    uint32_t gmin_bits;
+    std::memcpy(&gmin_bits, &gmin, sizeof(gmin_bits));
+    
+    ElimRecordUniformsCPU u = {
+        record_offset, elim_var_id, num_neighbors, backsub_count,
+        slot_result, rank_result, elim_row, gmin_bits
+    };
+    wgpuQueueWriteBuffer(queue, tnElimUniformBuffer, 0, &u, sizeof(u));
+}
+
+void WebGPUSolver::uploadIndexMaps(const std::vector<uint32_t>& mapLeft,
+                                    const std::vector<uint32_t>& mapRight) {
+    if (!queue) return;
+    if (tnIndexMapLeft && !mapLeft.empty())
+        wgpuQueueWriteBuffer(queue, tnIndexMapLeft, 0,
+                             mapLeft.data(), mapLeft.size() * sizeof(uint32_t));
+    if (tnIndexMapRight && !mapRight.empty())
+        wgpuQueueWriteBuffer(queue, tnIndexMapRight, 0,
+                             mapRight.data(), mapRight.size() * sizeof(uint32_t));
+}
+
+void WebGPUSolver::dispatchTNKernel(WGPUComputePipeline pl, uint32_t numElems,
+                                     WGPUCommandEncoder enc,
+                                     WGPUComputePassEncoder pass) {
+    if (!pl) return;
+    wgpuComputePassEncoderSetPipeline(pass, pl);
+    uint32_t wgCount = (numElems + 63) / 64;
+    if (wgCount == 0) wgCount = 1;
+    wgpuComputePassEncoderDispatchWorkgroups(pass, wgCount, 1, 1);
+}
+
+void WebGPUSolver::uploadContractionProgram(const TNCompiledProgram& prog,
+                                             uint32_t nodeCount) {
+    if (!device || !queue) return;
+    if (prog.tree.nodes.empty() || prog.mpos.empty()) return;
+
+    createTNPipelines();
+    if (!tnSeedLeafPipeline) return;
+
+    // ── Phase 5.7.4: Use render graph for aliased slot count ─────────────
+    renderGraph_ = prog.renderGraph;
+    if (renderGraph_.valid && renderGraph_.numPhysicalSlots > 0)
+        tnNumSlots_ = renderGraph_.numPhysicalSlots;
+    else
+        tnNumSlots_ = static_cast<uint32_t>(prog.tree.nodes.size());
+    tnMaxRank_  = TN_MAX_TILE_RANK;
+
+    const WGPUBufferUsage STORAGE_RW =
+        (WGPUBufferUsage)(WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst |
+                          WGPUBufferUsage_CopySrc);
+    const WGPUBufferUsage UNIFORM_BUF =
+        (WGPUBufferUsage)(WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+
+    // Allocate (or resize) workspace buffers
+    auto relBuf = [](WGPUBuffer& b){ if(b){ wgpuBufferRelease(b); b=nullptr; } };
+    relBuf(tnWorkspaceHi); relBuf(tnWorkspaceLo);
+    relBuf(tnRhsHi); relBuf(tnRhsLo);
+    relBuf(tnUniformBuffer);
+    relBuf(tnIndexMapLeft); relBuf(tnIndexMapRight);
+
+    relBuf(tnElimPivotHi); relBuf(tnElimPivotLo);
+    relBuf(tnElimRhsHi); relBuf(tnElimRhsLo);
+    relBuf(tnElimRowHi); relBuf(tnElimRowLo);
+    relBuf(tnElimVarIds); relBuf(tnElimNeighborIds); relBuf(tnElimNeighborCount);
+    relBuf(tnSolutionHi); relBuf(tnSolutionLo);
+    relBuf(tnElimUniformBuffer);
+
+    size_t matBytes = static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_ELEMS * sizeof(float);
+    size_t rhsBytes = static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_RANK * sizeof(float);
+    size_t mapBytes = TN_MAX_TILE_RANK * sizeof(uint32_t);
+
+    tnWorkspaceHi  = makeBuffer(device, matBytes, STORAGE_RW, "tn_ws_hi");
+    tnWorkspaceLo  = makeBuffer(device, matBytes, STORAGE_RW, "tn_ws_lo");
+    tnRhsHi        = makeBuffer(device, rhsBytes, STORAGE_RW, "tn_rhs_hi");
+    tnRhsLo        = makeBuffer(device, rhsBytes, STORAGE_RW, "tn_rhs_lo");
+    tnUniformBuffer = makeBuffer(device, sizeof(ContractionUniformsCPU), UNIFORM_BUF, "tn_uniforms");
+    tnIndexMapLeft  = makeBuffer(device, mapBytes, STORAGE_RW, "tn_imap_l");
+    tnIndexMapRight = makeBuffer(device, mapBytes, STORAGE_RW, "tn_imap_r");
+
+    if (nodeCount > 0) {
+        size_t elimPivotBytes = static_cast<size_t>(nodeCount) * sizeof(float);
+        size_t elimRhsBytes = static_cast<size_t>(nodeCount) * sizeof(float);
+        size_t elimRowBytes = static_cast<size_t>(nodeCount) * TN_MAX_TILE_RANK * sizeof(float);
+        size_t elimVarIdsBytes = static_cast<size_t>(nodeCount) * sizeof(uint32_t);
+        size_t elimNeighborIdsBytes = static_cast<size_t>(nodeCount) * TN_MAX_TILE_RANK * sizeof(uint32_t);
+        size_t elimNeighborCountBytes = static_cast<size_t>(nodeCount) * sizeof(uint32_t);
+        size_t solutionBytes = static_cast<size_t>(nodeCount) * sizeof(float);
+
+        tnElimPivotHi = makeBuffer(device, elimPivotBytes, STORAGE_RW, "tn_elim_pivot_hi");
+        tnElimPivotLo = makeBuffer(device, elimPivotBytes, STORAGE_RW, "tn_elim_pivot_lo");
+        tnElimRhsHi = makeBuffer(device, elimRhsBytes, STORAGE_RW, "tn_elim_rhs_hi");
+        tnElimRhsLo = makeBuffer(device, elimRhsBytes, STORAGE_RW, "tn_elim_rhs_lo");
+        tnElimRowHi = makeBuffer(device, elimRowBytes, STORAGE_RW, "tn_elim_row_hi");
+        tnElimRowLo = makeBuffer(device, elimRowBytes, STORAGE_RW, "tn_elim_row_lo");
+        tnElimVarIds = makeBuffer(device, elimVarIdsBytes, STORAGE_RW, "tn_elim_var_ids");
+        tnElimNeighborIds = makeBuffer(device, elimNeighborIdsBytes, STORAGE_RW, "tn_elim_neighbor_ids");
+        tnElimNeighborCount = makeBuffer(device, elimNeighborCountBytes, STORAGE_RW, "tn_elim_neighbor_count");
+        tnSolutionHi = makeBuffer(device, solutionBytes, STORAGE_RW, "tn_solution_hi");
+        tnSolutionLo = makeBuffer(device, solutionBytes, STORAGE_RW, "tn_solution_lo");
+        tnElimUniformBuffer = makeBuffer(device, sizeof(ElimRecordUniformsCPU), UNIFORM_BUF, "tn_elim_uniforms");
+    }
+
+    // ── Prepare full workspace data on CPU (batched) ─────────────────────
+    // Instead of N separate wgpuQueueWriteBuffer() calls per leaf, we prepare
+    // all data in CPU arrays and upload in bulk (4 calls total).
+    std::vector<float> fullMatHi(static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_ELEMS, 0.0f);
+    std::vector<float> fullMatLo(static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_ELEMS, 0.0f);
+    std::vector<float> fullRhsHi(static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_RANK, 0.0f);
+    std::vector<float> fullRhsLo(static_cast<size_t>(tnNumSlots_) * TN_MAX_TILE_RANK, 0.0f);
+
+    // Fill leaf slot data (using aliased physical slot indices)
+    for (size_t li = 0; li < prog.tree.leafIds.size() && li < prog.mpos.size(); ++li) {
+        uint32_t nodeId = prog.tree.leafIds[li];
+        const auto& mpo = prog.mpos[li];
+        uint32_t k = mpo.rank;
+        if (k == 0 || k > TN_MAX_TILE_RANK) continue;
+
+        // Phase 5.7.4: map node ID to aliased physical slot
+        uint32_t physSlot = nodeId;
+        if (renderGraph_.valid && nodeId < renderGraph_.nodeIdToPhysical.size())
+            physSlot = renderGraph_.nodeIdToPhysical[nodeId];
+        if (physSlot >= tnNumSlots_) continue;
+
+        size_t matOff = static_cast<size_t>(physSlot) * TN_MAX_TILE_ELEMS;
+        size_t rhsOff = static_cast<size_t>(physSlot) * TN_MAX_TILE_RANK;
+
+        for (uint32_t r = 0; r < k; ++r) {
+            for (uint32_t c = 0; c < k; ++c) {
+                double val = mpo.localMatrix[r * k + c];
+                auto p = splitDouble(val);
+                fullMatHi[matOff + r * k + c] = p.first;
+                fullMatLo[matOff + r * k + c] = p.second;
+            }
+        }
+        for (uint32_t r = 0; r < k && r < mpo.localRHS.size(); ++r) {
+            auto p = splitDouble(mpo.localRHS[r]);
+            fullRhsHi[rhsOff + r] = p.first;
+            fullRhsLo[rhsOff + r] = p.second;
+        }
+    }
+
+    // ── Phase 5.7.2: Apple UMA zero-copy bulk upload ─────────────────────
+#if ACUTESIM_APPLE_UMA
+    {
+        // Create staging buffers with mappedAtCreation (CPU writes directly)
+        auto stgMatHi = AppleUMAManager::createStaging(device, matBytes);
+        auto stgMatLo = AppleUMAManager::createStaging(device, matBytes);
+        auto stgRhsHi = AppleUMAManager::createStaging(device, rhsBytes);
+        auto stgRhsLo = AppleUMAManager::createStaging(device, rhsBytes);
+
+        // Direct memcpy into mapped staging memory (no wgpuQueueWriteBuffer overhead)
+        AppleUMAManager::writeToStaging(stgMatHi, fullMatHi.data(), matBytes);
+        AppleUMAManager::writeToStaging(stgMatLo, fullMatLo.data(), matBytes);
+        AppleUMAManager::writeToStaging(stgRhsHi, fullRhsHi.data(), rhsBytes);
+        AppleUMAManager::writeToStaging(stgRhsLo, fullRhsLo.data(), rhsBytes);
+
+        // Single command encoder: 4 copy commands (near-free on UMA)
+        WGPUCommandEncoderDescriptor encDesc = {};
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+        AppleUMAManager::flush(stgMatHi, tnWorkspaceHi, enc, matBytes);
+        AppleUMAManager::flush(stgMatLo, tnWorkspaceLo, enc, matBytes);
+        AppleUMAManager::flush(stgRhsHi, tnRhsHi, enc, rhsBytes);
+        AppleUMAManager::flush(stgRhsLo, tnRhsLo, enc, rhsBytes);
+        WGPUCommandBufferDescriptor cbDesc = {};
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, &cbDesc);
+        wgpuQueueSubmit(queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+
+        AppleUMAManager::destroy(stgMatHi);
+        AppleUMAManager::destroy(stgMatLo);
+        AppleUMAManager::destroy(stgRhsHi);
+        AppleUMAManager::destroy(stgRhsLo);
+    }
+#else
+    // Non-UMA: 4 bulk wgpuQueueWriteBuffer calls (still batched vs N per-leaf)
+    wgpuQueueWriteBuffer(queue, tnWorkspaceHi, 0, fullMatHi.data(), matBytes);
+    wgpuQueueWriteBuffer(queue, tnWorkspaceLo, 0, fullMatLo.data(), matBytes);
+    wgpuQueueWriteBuffer(queue, tnRhsHi, 0, fullRhsHi.data(), rhsBytes);
+    wgpuQueueWriteBuffer(queue, tnRhsLo, 0, fullRhsLo.data(), rhsBytes);
+#endif
+
+    // Save tree reference and leaf terminal nodes for tree walk
+    lastTree_ = &prog.tree;
+    leafTerminalNodes_.clear();
+    leafTerminalNodes_.resize(prog.tree.nodes.size());
+    for (size_t i = 0; i < prog.tree.leafIds.size() && i < prog.mpos.size(); ++i) {
+        uint32_t leafId = prog.tree.leafIds[i];
+        if (leafId < leafTerminalNodes_.size())
+            leafTerminalNodes_[leafId] = prog.mpos[i].terminalNodes;
+    }
+
+    // Create staging buffers for per-node slot readback
+    relBuf(tnStagingMatHi); relBuf(tnStagingMatLo);
+    relBuf(tnStagingRhsHi); relBuf(tnStagingRhsLo);
+    const WGPUBufferUsage MAP_READ_BUF =
+        (WGPUBufferUsage)(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    tnStagingMatHi = makeBuffer(device, TN_MAX_TILE_ELEMS * sizeof(float), MAP_READ_BUF, "tn_stg_mhi");
+    tnStagingMatLo = makeBuffer(device, TN_MAX_TILE_ELEMS * sizeof(float), MAP_READ_BUF, "tn_stg_mlo");
+    tnStagingRhsHi = makeBuffer(device, TN_MAX_TILE_RANK * sizeof(float), MAP_READ_BUF, "tn_stg_rhi");
+    tnStagingRhsLo = makeBuffer(device, TN_MAX_TILE_RANK * sizeof(float), MAP_READ_BUF, "tn_stg_rlo");
+
+    // Create bind groups from auto-derived pipeline layouts
+    createTNBindGroups();
+
+    if (renderGraph_.valid) {
+        std::cout << "[INFO] WebGPUSolver: TN program uploaded ("
+                  << tnNumSlots_ << " aliased slots from "
+                  << prog.tree.nodes.size() << " nodes, "
+                  << prog.mpos.size() << " MPOs";
+        if (renderGraph_.unaliasedBytes > 0)
+            std::cout << ", VRAM " << renderGraph_.aliasedBytes / 1024 << "KB vs "
+                      << renderGraph_.unaliasedBytes / 1024 << "KB unaliased";
+        std::cout << ")\n";
+    } else {
+        std::cout << "[INFO] WebGPUSolver: TN program uploaded ("
+                  << tnNumSlots_ << " slots, " << prog.mpos.size() << " MPOs)\n";
+    }
+}
+
+// Helper: sorted union of two index sets
+static std::vector<uint32_t> tnSortedUnion(const std::vector<uint32_t>& a,
+                                            const std::vector<uint32_t>& b) {
+    std::vector<uint32_t> result;
+    result.reserve(a.size() + b.size());
+    std::set_union(a.begin(), a.end(), b.begin(), b.end(),
+                   std::back_inserter(result));
+    return result;
+}
+
+// Helper: find position of val in sorted vector (-1 if not found)
+static int tnFindPos(uint32_t val, const std::vector<uint32_t>& sorted) {
+    auto it = std::lower_bound(sorted.begin(), sorted.end(), val);
+    if (it != sorted.end() && *it == val)
+        return static_cast<int>(it - sorted.begin());
+    return -1;
+}
+
+std::vector<double> WebGPUSolver::executeContractionSweep(uint32_t nodeCount,
+                                                           double gmin) {
+    if (!device || !queue || !tnMergeAccumPipeline || tnNumSlots_ == 0 ||
+        !lastTree_ || !tnBindGroup0)
+        return {};
+
+    const ContractionTree& tree = *lastTree_;
+    if (tree.rootId == UINT32_MAX || tree.nodes.empty()) return {};
+
+    // Phase 5.7.4: helper to resolve aliased physical slot from node ID
+    auto physSlot = [&](uint32_t nodeId) -> uint32_t {
+        if (renderGraph_.valid && nodeId < renderGraph_.nodeIdToPhysical.size())
+            return renderGraph_.nodeIdToPhysical[nodeId];
+        return nodeId;  // fallback: identity mapping (no aliasing)
+    };
+
+    // ── Per-node CPU state: tracked index sets (no more elimination records)
+    struct NodeState {
+        std::vector<uint32_t> indices;
+        uint32_t dim = 0;
+    };
+    std::vector<NodeState> nodeStates(tree.nodes.size());
+
+    // Initialize leaf states from saved terminal nodes
+    for (size_t i = 0; i < tree.nodes.size(); ++i) {
+        const auto& node = tree.nodes[i];
+        if (node.leftChild == UINT32_MAX && node.rightChild == UINT32_MAX) {
+            if (node.id < leafTerminalNodes_.size()) {
+                nodeStates[i].indices = leafTerminalNodes_[node.id];
+                nodeStates[i].dim = static_cast<uint32_t>(nodeStates[i].indices.size());
+            }
+        }
+    }
+
+    uint32_t elimRecordCounter = 0; // Track global elimination record index
+
+    // ── Tree Walk: bottom-up processing ──────────────────────────────────
+    // Phase 5.7.2: thermal-aware batch sizing
+    (void)ThermalMonitor::currentState();  // poll once per sweep (cheap syscall)
+
+    for (size_t idx = 0; idx < tree.nodes.size(); ++idx) {
+        const auto& node = tree.nodes[idx];
+
+        // Skip leaf nodes (data already in GPU workspace from uploadContractionProgram)
+        if (node.leftChild == UINT32_MAX && node.rightChild == UINT32_MAX)
+            continue;
+
+        const auto& leftState  = nodeStates[node.leftChild];
+        const auto& rightState = nodeStates[node.rightChild];
+
+        // Build merged index set = sorted_union(left, right)
+        auto mergedIndices = tnSortedUnion(leftState.indices, rightState.indices);
+        uint32_t mergedRank = static_cast<uint32_t>(mergedIndices.size());
+
+        if (mergedRank == 0 || mergedRank > TN_MAX_TILE_RANK) {
+            nodeStates[idx].indices = mergedIndices;
+            nodeStates[idx].dim = mergedRank;
+            continue;
+        }
+
+        // Build index maps: child local position → merged position
+        std::vector<uint32_t> mapLeft, mapRight;
+        mapLeft.reserve(leftState.dim);
+        for (uint32_t ci : leftState.indices) {
+            int pos = tnFindPos(ci, mergedIndices);
+            mapLeft.push_back(pos >= 0 ? static_cast<uint32_t>(pos) : 0u);
+        }
+        mapRight.reserve(rightState.dim);
+        for (uint32_t ci : rightState.indices) {
+            int pos = tnFindPos(ci, mergedIndices);
+            mapRight.push_back(pos >= 0 ? static_cast<uint32_t>(pos) : 0u);
+        }
+
+        // ── GPU dispatch: tn_merge_accum ─────────────────────────────────
+        // Phase 5.7.4: use aliased physical slots for GPU addressing
+        uint32_t psLeft   = physSlot(node.leftChild);
+        uint32_t psRight  = physSlot(node.rightChild);
+        uint32_t psResult = physSlot(node.id);
+
+        uploadTNUniforms(psLeft, psRight, psResult,
+                         leftState.dim, rightState.dim, mergedRank, 0, 0);
+
+        mapLeft.resize(TN_MAX_TILE_RANK, 0);
+        mapRight.resize(TN_MAX_TILE_RANK, 0);
+        uploadIndexMaps(mapLeft, mapRight);
+
+        {
+            WGPUCommandEncoderDescriptor encDesc = {};
+            WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+            WGPUComputePassDescriptor passDesc = {};
+            WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &passDesc);
+
+            wgpuComputePassEncoderSetBindGroup(pass, 0, tnBindGroup0, 0, nullptr);
+            wgpuComputePassEncoderSetBindGroup(pass, 1, tnBindGroup1, 0, nullptr);
+
+            uint32_t maxRankSq = std::max({leftState.dim * leftState.dim,
+                                           rightState.dim * rightState.dim,
+                                           mergedRank * mergedRank});
+            dispatchTNKernel(tnMergeAccumPipeline, maxRankSq, enc, pass);
+
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+            WGPUCommandBufferDescriptor cbDesc = {};
+            WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, &cbDesc);
+            wgpuQueueSubmit(queue, 1, &cmd);
+            wgpuCommandBufferRelease(cmd);
+            wgpuCommandEncoderRelease(enc);
+        }
+
+        // ── GPU Schur elimination (zero-sync) ────────────────────────────
+        auto currentIndices = mergedIndices;
+        uint32_t currentDim = mergedRank;
+
+        for (uint32_t v : node.contractedIndices) {
+            int p = tnFindPos(v, currentIndices);
+            if (p < 0) continue;
+
+            uploadTNElimUniforms(elimRecordCounter, v, currentDim - 1, 0, psResult, currentDim, static_cast<uint32_t>(p), static_cast<float>(gmin));
+
+            {
+                WGPUCommandEncoderDescriptor encDesc = {};
+                WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+                WGPUComputePassDescriptor passDesc = {};
+                WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &passDesc);
+
+                wgpuComputePassEncoderSetBindGroup(pass, 0, tnBindGroup0, 0, nullptr);
+                wgpuComputePassEncoderSetBindGroup(pass, 2, tnBindGroup2, 0, nullptr);
+
+                dispatchTNKernel(tnSchurElimRecordPipeline, currentDim * currentDim, enc, pass);
+
+                wgpuComputePassEncoderEnd(pass);
+                wgpuComputePassEncoderRelease(pass);
+                WGPUCommandBufferDescriptor cbDesc = {};
+                WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, &cbDesc);
+                wgpuQueueSubmit(queue, 1, &cmd);
+                wgpuCommandBufferRelease(cmd);
+                wgpuCommandEncoderRelease(enc);
+            }
+
+            // Compact CPU indices for next step mapping
+            uint32_t newDim = currentDim - 1;
+            std::vector<uint32_t> newIndices;
+            for (uint32_t i = 0; i < currentDim; ++i) {
+                if (static_cast<int>(i) == p) continue;
+                newIndices.push_back(currentIndices[i]);
+            }
+            currentIndices = std::move(newIndices);
+            currentDim = newDim;
+            elimRecordCounter++;
+        }
+
+        nodeStates[idx].indices = std::move(currentIndices);
+        nodeStates[idx].dim = currentDim;
+    }
+
+    // ── Root solve: small dense system ───────────────────────────────────
+    auto& rootState = nodeStates[tree.rootId];
+    if (rootState.dim == 0) {
+        std::cerr << "[WARN] WebGPUSolver: TN root has zero dimension\n";
+        return {};
+    }
+
+    // Download root solve matrix and RHS (since root tile is tiny)
+    // We create a temporary map buffer for reading the root slot
+    std::vector<double> rootMat, rootRhs;
+    {
+        uint32_t rootSlot = physSlot(tree.rootId);
+        size_t matByteOff = static_cast<size_t>(rootSlot) * TN_MAX_TILE_ELEMS * sizeof(float);
+        size_t rhsByteOff = static_cast<size_t>(rootSlot) * TN_MAX_TILE_RANK * sizeof(float);
+        size_t matBytes   = TN_MAX_TILE_ELEMS * sizeof(float);
+        size_t rhsBytes   = TN_MAX_TILE_RANK * sizeof(float);
+
+        WGPUCommandEncoderDescriptor encDesc = {};
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, tnWorkspaceHi, matByteOff, tnStagingMatHi, 0, matBytes);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, tnWorkspaceLo, matByteOff, tnStagingMatLo, 0, matBytes);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, tnRhsHi, rhsByteOff, tnStagingRhsHi, 0, rhsBytes);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, tnRhsLo, rhsByteOff, tnStagingRhsLo, 0, rhsBytes);
+        WGPUCommandBufferDescriptor cbDesc = {};
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, &cbDesc);
+        wgpuQueueSubmit(queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+
+        struct CB { bool done; };
+        CB cb[4] = {{false},{false},{false},{false}};
+        auto mapCb = [](WGPUBufferMapAsyncStatus, void* ud){ ((CB*)ud)->done = true; };
+        wgpuBufferMapAsync(tnStagingMatHi, WGPUMapMode_Read, 0, matBytes, mapCb, &cb[0]);
+        wgpuBufferMapAsync(tnStagingMatLo, WGPUMapMode_Read, 0, matBytes, mapCb, &cb[1]);
+        wgpuBufferMapAsync(tnStagingRhsHi, WGPUMapMode_Read, 0, rhsBytes, mapCb, &cb[2]);
+        wgpuBufferMapAsync(tnStagingRhsLo, WGPUMapMode_Read, 0, rhsBytes, mapCb, &cb[3]);
+        while (!cb[0].done || !cb[1].done || !cb[2].done || !cb[3].done)
+            wgpuDeviceTick(device);
+
+        const float* pMatHi = (const float*)wgpuBufferGetConstMappedRange(tnStagingMatHi, 0, matBytes);
+        const float* pMatLo = (const float*)wgpuBufferGetConstMappedRange(tnStagingMatLo, 0, matBytes);
+        const float* pRhsHi = (const float*)wgpuBufferGetConstMappedRange(tnStagingRhsHi, 0, rhsBytes);
+        const float* pRhsLo = (const float*)wgpuBufferGetConstMappedRange(tnStagingRhsLo, 0, rhsBytes);
+
+        uint32_t rank = rootState.dim;
+        rootMat.assign(rank * rank, 0.0);
+        rootRhs.assign(rank, 0.0);
+        if (pMatHi && pMatLo) {
+            for (uint32_t r = 0; r < rank; ++r)
+                for (uint32_t c = 0; c < rank; ++c)
+                    rootMat[r * rank + c] = double(pMatHi[r * rank + c]) + double(pMatLo[r * rank + c]);
+        }
+        if (pRhsHi && pRhsLo) {
+            for (uint32_t r = 0; r < rank; ++r)
+                rootRhs[r] = double(pRhsHi[r]) + double(pRhsLo[r]);
+        }
+        wgpuBufferUnmap(tnStagingMatHi); wgpuBufferUnmap(tnStagingMatLo);
+        wgpuBufferUnmap(tnStagingRhsHi); wgpuBufferUnmap(tnStagingRhsLo);
+    }
+
+    uint32_t n = rootState.dim;
+    Csr_matrix csr;
+    csr.rows = static_cast<int>(n);
+    csr.cols = static_cast<int>(n);
+    csr.row_pointer.push_back(0);
+    for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t j = 0; j < n; ++j) {
+            double val = rootMat[i * n + j];
+            if (std::abs(val) > 1e-30) {
+                csr.values.push_back(val);
+                csr.col_indices.push_back(static_cast<int>(j));
+            }
+        }
+        csr.row_pointer.push_back(static_cast<int>(csr.values.size()));
+    }
+    csr.nnz = static_cast<int>(csr.values.size());
+
+    SolverResult rootResult = solveLU_Pivoted(csr, rootRhs);
+    if (!rootResult.converged) {
+        std::cerr << "[WARN] WebGPUSolver: Root LU solve failed\n";
+        return {};
+    }
+
+    // Upload root solution to GPU for back-substitution
+    std::vector<float> solHi(nodeCount, 0.0f);
+    std::vector<float> solLo(nodeCount, 0.0f);
+    for (uint32_t i = 0; i < rootState.dim; ++i) {
+        uint32_t var = rootState.indices[i];
+        if (var > 0 && (var - 1) < solHi.size()) {
+            auto pair = splitDouble(rootResult.solution[i]);
+            solHi[var - 1] = pair.first;
+            solLo[var - 1] = pair.second;
+        }
+    }
+    wgpuQueueWriteBuffer(queue, tnSolutionHi, 0, solHi.data(), solHi.size() * sizeof(float));
+    wgpuQueueWriteBuffer(queue, tnSolutionLo, 0, solLo.data(), solLo.size() * sizeof(float));
+
+    // ── GPU Back-substitution ────────────────────────────────────────────
+    if (elimRecordCounter > 0) {
+        uploadTNElimUniforms(0, 0, 0, elimRecordCounter, 0, 0, 0, 0.0f);
+
+        WGPUCommandEncoderDescriptor encDesc = {};
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+        WGPUComputePassDescriptor passDesc = {};
+        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &passDesc);
+
+        wgpuComputePassEncoderSetBindGroup(pass, 2, tnBindGroup2, 0, nullptr);
+
+        dispatchTNKernel(tnBackSubstitutePipeline, elimRecordCounter, enc, pass);
+
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+        WGPUCommandBufferDescriptor cbDesc = {};
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, &cbDesc);
+        wgpuQueueSubmit(queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+    }
+
+    // ── Download final solution vector ───────────────────────────────────
+    std::vector<double> solution(nodeCount, 0.0);
+    {
+        size_t solBytes = nodeCount * sizeof(float);
+        WGPUBuffer stagingSolHi = makeBuffer(device, solBytes, (WGPUBufferUsage)(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst), "stg_sol_hi");
+        WGPUBuffer stagingSolLo = makeBuffer(device, solBytes, (WGPUBufferUsage)(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst), "stg_sol_lo");
+
+        WGPUCommandEncoderDescriptor encDesc = {};
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, tnSolutionHi, 0, stagingSolHi, 0, solBytes);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, tnSolutionLo, 0, stagingSolLo, 0, solBytes);
+        WGPUCommandBufferDescriptor cbDesc = {};
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, &cbDesc);
+        wgpuQueueSubmit(queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+
+        struct CB { bool done; };
+        CB cb[2] = {{false},{false}};
+        auto mapCb = [](WGPUBufferMapAsyncStatus, void* ud){ ((CB*)ud)->done = true; };
+        wgpuBufferMapAsync(stagingSolHi, WGPUMapMode_Read, 0, solBytes, mapCb, &cb[0]);
+        wgpuBufferMapAsync(stagingSolLo, WGPUMapMode_Read, 0, solBytes, mapCb, &cb[1]);
+        while (!cb[0].done || !cb[1].done) wgpuDeviceTick(device);
+
+        const float* pHi = (const float*)wgpuBufferGetConstMappedRange(stagingSolHi, 0, solBytes);
+        const float* pLo = (const float*)wgpuBufferGetConstMappedRange(stagingSolLo, 0, solBytes);
+
+        if (pHi && pLo) {
+            for (size_t i = 0; i < nodeCount; ++i) {
+                solution[i] = double(pHi[i]) + double(pLo[i]);
+            }
+        }
+        wgpuBufferUnmap(stagingSolHi); wgpuBufferUnmap(stagingSolLo);
+        wgpuBufferRelease(stagingSolHi); wgpuBufferRelease(stagingSolLo);
+    }
+
+    std::cout << "[INFO] WebGPUSolver: GPU contraction sweep complete ("
+              << tree.nodes.size() << " nodes, " << nodeCount << " vars)\n";
+    return solution;
+}
 
 #else
 // Stub for non-GPU builds

@@ -33,8 +33,9 @@ TNCompiledProgram TNCompiler::compile(
     // ── Step 3: Build MPOs ────────────────────────────────────────────────
     program.mpos = MPOBuilder::buildMPOs(tensors, voltages, temp_K);
 
-    // ── Step 4: Build contraction tree ────────────────────────────────────
-    program.tree = ContractionTreeBuilder::build(fg, tw, program.mpos);
+    // ── Step 4: Build contraction tree (Gap 2: SM budget enforcement) ────
+    program.tree = ContractionTreeBuilder::build(fg, tw, program.mpos,
+                                                 program.tileMemoryBudget);
 
     // ── Step 5: Estimate workspace sizing (Phase 5.3.3) ──────────────────
     // Walk the contraction tree to compute the maximum intermediate tensor
@@ -61,6 +62,18 @@ TNCompiledProgram TNCompiler::compile(
 
         program.maxIntermediateDim = maxDim;
         program.estimatedWorkspaceBytes = totalBytes;
+    }
+
+    // ── Step 6: Render graph (Phase 5.7.4) ───────────────────────────────
+    // Compute slot aliasing + wavefront schedule for GPU execution.
+    // slotBytes = (maxRank^2 + maxRank) * 2 * sizeof(float) for hi/lo pairs.
+    if (!program.tree.nodes.empty()) {
+        uint64_t slotBytes = static_cast<uint64_t>(program.maxIntermediateDim)
+                           * program.maxIntermediateDim * 2 * sizeof(float)
+                           + static_cast<uint64_t>(program.maxIntermediateDim)
+                           * 2 * sizeof(float);
+        program.renderGraph = ContractionRenderGraph::analyze(
+            program.tree, slotBytes);
     }
 
     return program;

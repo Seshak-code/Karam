@@ -32,6 +32,11 @@ struct ContractionNode {
     std::vector<uint32_t> contractedIndices; // indices summed over in this contraction
     uint64_t estimatedFlops = 0;             // cost of this contraction step
     uint64_t estimatedMemory = 0;            // size of intermediate tensor
+
+    // Gap 2 (TBR): true when a merge was rejected because the merged
+    // intermediate tensor would exceed the SM shared-memory budget.
+    // The Schur solver handles cross-tile contraction for these nodes.
+    bool hasSchurBoundary = false;
 };
 
 struct ContractionTree {
@@ -55,8 +60,16 @@ public:
      * @param mpos Device MPOs (leaf data)
      * @return Contraction tree DAG with cost estimates
      */
+    /**
+     * @param tileMemoryBudget  Maximum bytes for any intermediate tensor's
+     *                          dense storage (matrix + RHS). 0 = no limit.
+     *                          Default 163840 (163KB SM shared memory).
+     *                          Merges that would exceed this are rejected and
+     *                          both children are marked hasSchurBoundary=true.
+     */
     static ContractionTree build(
         const FactorGraph& fg,
         const TreewidthAnalysis& tw,
-        const std::vector<DeviceMPO>& mpos);
+        const std::vector<DeviceMPO>& mpos,
+        uint64_t tileMemoryBudget = 163840);
 };

@@ -1,5 +1,6 @@
 #include "contraction_tree.h"
 #include <algorithm>
+#include <iostream>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,7 +12,8 @@
 ContractionTree ContractionTreeBuilder::build(
     const FactorGraph& fg,
     const TreewidthAnalysis& tw,
-    const std::vector<DeviceMPO>& mpos)
+    const std::vector<DeviceMPO>& mpos,
+    uint64_t tileMemoryBudget)
 {
     ContractionTree tree;
 
@@ -73,6 +75,32 @@ ContractionTree ContractionTreeBuilder::build(
         for (size_t j = 1; j < touching.size(); ++j) {
             uint32_t otherId = touching[j];
 
+            // Compute open indices = union of children's indices minus contracted
+            std::set<uint32_t> previewMerged;
+            for (uint32_t idx : tree.nodes[currentId].openIndices)
+                previewMerged.insert(idx);
+            for (uint32_t idx : tree.nodes[otherId].openIndices)
+                previewMerged.insert(idx);
+            previewMerged.erase(v);
+
+            // ── Gap 2 (TBR): SM budget enforcement ──────────────────────
+            // Check if the merged intermediate tensor would exceed the
+            // tile memory budget. If so, mark both children as Schur
+            // boundaries and skip the merge — the Schur solver handles
+            // the cross-tile contraction.
+            if (tileMemoryBudget > 0) {
+                uint64_t n = static_cast<uint64_t>(previewMerged.size());
+                uint64_t mergedMemBytes = (n * n + n) * sizeof(double);
+                if (mergedMemBytes > tileMemoryBudget) {
+                    tree.nodes[currentId].hasSchurBoundary = true;
+                    tree.nodes[otherId].hasSchurBoundary = true;
+                    std::cerr << "[TBR] Bond-cut: merged " << n << " vars = "
+                              << (mergedMemBytes / 1024) << "KB > budget "
+                              << (tileMemoryBudget / 1024) << "KB\n";
+                    continue;
+                }
+            }
+
             // Create new internal node
             ContractionNode internal;
             internal.id = static_cast<uint32_t>(tree.nodes.size());
@@ -80,26 +108,18 @@ ContractionTree ContractionTreeBuilder::build(
             internal.rightChild = otherId;
             internal.contractedIndices.push_back(v);
 
-            // Compute open indices = union of children's indices minus contracted
-            std::set<uint32_t> merged;
-            for (uint32_t idx : tree.nodes[currentId].openIndices)
-                merged.insert(idx);
-            for (uint32_t idx : tree.nodes[otherId].openIndices)
-                merged.insert(idx);
-            merged.erase(v);
-
-            internal.openIndices.assign(merged.begin(), merged.end());
+            internal.openIndices.assign(previewMerged.begin(), previewMerged.end());
 
             // Cost estimate: product of dimensions of all open indices
             // Each index has dimension 1 in our Jacobian representation,
             // but the FLOPs scale with the number of indices involved
-            uint64_t flops = static_cast<uint64_t>(merged.size() + 1) *
-                             static_cast<uint64_t>(merged.size() + 1);
+            uint64_t flops = static_cast<uint64_t>(previewMerged.size() + 1) *
+                             static_cast<uint64_t>(previewMerged.size() + 1);
             internal.estimatedFlops = flops;
             tree.totalFlops += flops;
 
-            uint64_t mem = static_cast<uint64_t>(merged.size()) *
-                           static_cast<uint64_t>(merged.size());
+            uint64_t mem = static_cast<uint64_t>(previewMerged.size()) *
+                           static_cast<uint64_t>(previewMerged.size());
             internal.estimatedMemory = mem;
             if (mem > peakMem) peakMem = mem;
 

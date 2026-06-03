@@ -33,6 +33,10 @@
 #include <cctype>
 #include <map>
 
+// Full SPICE3f5 parser (must be included OUTSIDE any namespace to avoid
+// double-qualification: the parser itself already declares namespace acutesim)
+#include "acutesim_engine/netlist/spice_parser.h"
+
 namespace acutesim {
 
 using namespace acutesim::compute::orchestration;
@@ -79,12 +83,10 @@ static JobID generateJobID() {
 // Delegates to the full SPICE3f5 parser (netlist/spice_parser.h).
 // Handles all standard elements: R, C, L, K, V, I, D, M, Q, J, E, G, H, F, T, X.
 // Supports .model, .subckt/.ends, .param, waveform specs (PULSE, SIN), and SI suffixes.
-#include "acutesim_engine/netlist/spice_parser.h"
-
 static TensorNetlist deserialiseRequest(const SimulationRequestDTO& req) {
     if (req.source.payload.empty()) return TensorNetlist{};
 
-    acutesim::SPICEParser parser;
+    SPICEParser parser;
     auto result = parser.parse(req.source.payload);
 
     if (!result.success) {
