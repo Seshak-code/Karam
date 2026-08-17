@@ -247,7 +247,7 @@ public:
             // Stamp Norton equivalent: I = G·Veq at node, G to diagonal
             // MNA stamp: G·(V_node - Veq) = 0
             //   → G on diagonal, -G·Veq in RHS
-            builder.addEntry(row, row, G);
+            builder.add(row, row, G);
             if (row < static_cast<int>(rhs.size())) {
                 rhs[row] += G * Veq;
             }

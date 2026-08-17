@@ -17,6 +17,9 @@
 #include "../infrastructure/netlist_compiler.h"
 #include "../math/linalg.h"          // MatrixConstructor, solveLU_Pivoted, Csr_matrix
 #include "../netlist/circuit.h" // Resistor, BJT, Mosfet, Diode, etc.
+#include "../physics/device_physics.h" // pnjlim, compute_vcrit (junction limiting)
+#include "../tensors/physics_tensors.h"   // tensorizeNetlist, TensorizedBlock
+#include "../tensors/kernel_dispatch.h"   // KernelDispatcher (SIMD kernels)
 
 // Helper for Dawn's WGPUStringView API
 #ifdef __EMSCRIPTEN__
@@ -40,6 +43,7 @@
 // ============================================================================
 static std::string loadShaderSource() {
     const char* candidates[] = {
+        "acutesim_engine/shaders/gpu_nr_loop.wgsl",
         "compute/shaders/gpu_nr_loop.wgsl",
         "../compute/shaders/gpu_nr_loop.wgsl",
         "../../compute/shaders/gpu_nr_loop.wgsl",
@@ -692,6 +696,26 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
     std::vector<double> voltages(N, 0.0);
     bool converged = false;
 
+    // Source stepping + GMIN homotopy (continuation methods for hard DC OP):
+    //  - Source stepping: ramp all independent sources 0 -> nominal. At low
+    //    scale, digital gates stay sub-threshold (well-defined state); each
+    //    converged step seeds the next. Canonical fix for inverter chains.
+    //  - GMIN homotopy inside each source step: large gmin dominates
+    //    nonlinearities, then relaxes to nominal.
+    const int SRC_STEPS = 8;
+    const int GMIN_STEPS = 6;
+    const double gmin_schedule[GMIN_STEPS] = {1e-2, 1e-3, 1e-4, 1e-5, 1e-6, gmin};
+    bool finalConverged = false;
+    double src_scale = 1.0;
+    // Per-step NR budget: maxIter is the per-homotopy-step iteration count
+    // (mirrors the CPU solver, which runs up to 100 NR iterations per GMIN
+    // step). Previously 50 total iterations were shared across 48 homotopy
+    // steps (~1 iter each), which could not converge multi-node circuits.
+    for (int src_step = 0; src_step < SRC_STEPS; ++src_step) {
+    src_scale = (src_step + 1.0) / (double)SRC_STEPS;
+    for (int gmin_step = 0; gmin_step < GMIN_STEPS; ++gmin_step) {
+    const double gmin_eff = gmin_schedule[gmin_step];
+    converged = false;
     for (int iter = 0; iter < maxIter; ++iter) {
         // Wait for previous GPU dispatch to finish (synchronous for now)
         isReadbackReady();
@@ -725,15 +749,29 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
             int np = vs.nodePositive - 1;
             int nn = vs.nodeNegative - 1;
             const double G_VS = 1e3; // Must match circuitsim.h::stampSoABlock g_int=1e3
-            if (np >= 0) { mc.add(np, np, G_VS); rhs[np] += G_VS * vs.voltage_V; }
-            if (nn >= 0) { mc.add(nn, nn, G_VS); rhs[nn] -= G_VS * vs.voltage_V; }
+            // Floating source (both nodes non-ground): full 2x2 stamp with
+            // off-diagonal coupling, exactly like the CPU path. Without the
+            // -G_VS off-diagonals, each node is independently pinned to
+            // +/-V instead of enforcing V(np)-V(nn)=V (bridge rectifier bug).
+            if (np >= 0 && nn >= 0) {
+                mc.add(np, np, G_VS); mc.add(nn, nn, G_VS);
+                mc.add(np, nn, -G_VS); mc.add(nn, np, -G_VS);
+                rhs[np] += G_VS * vs.voltage_V * src_scale;
+                rhs[nn] -= G_VS * vs.voltage_V * src_scale;
+            } else if (np >= 0) {
+                mc.add(np, np, G_VS);
+                rhs[np] += G_VS * vs.voltage_V * src_scale;
+            } else if (nn >= 0) {
+                mc.add(nn, nn, G_VS);
+                rhs[nn] -= G_VS * vs.voltage_V * src_scale;
+            }
         }
         // Stamp current sources
         for (const auto& cs : netlist.globalBlock.currentSources) {
             int np = cs.nodePositive - 1;
             int nn = cs.nodeNegative - 1;
-            if (np >= 0) rhs[np] -= cs.current_A;
-            if (nn >= 0) rhs[nn] += cs.current_A;
+            if (np >= 0) rhs[np] -= cs.current_A * src_scale;
+            if (nn >= 0) rhs[nn] += cs.current_A * src_scale;
         }
         // Stamp diodes (linearized)
         for (const auto& d : netlist.globalBlock.diodes) {
@@ -750,8 +788,83 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
             if (na >= 0) { mc.add(na, na, gd); rhs[na] -= ieq; if (nc >= 0) mc.add(na, nc, -gd); }
             if (nc >= 0) { mc.add(nc, nc, gd); rhs[nc] += ieq; if (na >= 0) mc.add(nc, na, -gd); }
         }
-        // GMIN diagonal conditioning
-        for (size_t i = 0; i < N; ++i) mc.add((int)i, (int)i, gmin);
+        // Stamp MOSFETs (Level-1, linearized - same physics as stampSoABlock
+        // via tensorizeNetlist + KernelDispatcher SIMD kernels)
+        {
+            TensorizedBlock tb = tensorizeNetlist(netlist);
+            auto& kd = acutesim::compute::KernelDispatcher::get();
+            kd.batch_mosfet_physics(tb.mosfets, voltages);
+            kd.batch_bjt_physics(tb.bjts, voltages);
+            for (size_t i = 0; i < tb.mosfets.size(); ++i) {
+                int d = tb.mosfets.drains[i] - 1;
+                int g = tb.mosfets.gates[i] - 1;
+                int s = tb.mosfets.sources[i] - 1;
+                int b = tb.mosfets.bodies[i] - 1;
+                double gm  = tb.mosfets.gm[i];
+                double gmb = tb.mosfets.gmb[i];
+                double gds = tb.mosfets.gds[i];
+                double ids = tb.mosfets.ids[i];
+                double vgs = tb.mosfets.vgs[i];
+                double vds = tb.mosfets.vds[i];
+                double vs_ = (s >= 0 && s < (int)N) ? voltages[s] : 0.0;
+                double vb_ = (b >= 0 && b < (int)N) ? voltages[b] : 0.0;
+                double vbs = vb_ - vs_;
+                double ieq = ids - (gm * vgs + gmb * vbs + gds * vds);
+                // gds: D-S conductance
+                if (d >= 0 && s >= 0) {
+                    mc.add(d, d, gds); mc.add(s, s, gds);
+                    mc.add(d, s, -gds); mc.add(s, d, -gds);
+                } else if (d >= 0) { mc.add(d, d, gds); }
+                else if (s >= 0) { mc.add(s, s, gds); }
+                // gm: VGS control
+                if (d >= 0) {
+                    if (g >= 0) mc.add(d, g, gm);
+                    if (s >= 0) mc.add(d, s, -gm);
+                }
+                if (s >= 0) {
+                    if (g >= 0) mc.add(s, g, -gm);
+                    mc.add(s, s, gm);
+                }
+                // gmb: VBS control
+                if (d >= 0) {
+                    if (b >= 0) mc.add(d, b, gmb);
+                    if (s >= 0) mc.add(d, s, -gmb);
+                }
+                if (s >= 0) {
+                    if (b >= 0) mc.add(s, b, -gmb);
+                    mc.add(s, s, gmb);
+                }
+                // RHS
+                if (d >= 0) rhs[d] -= ieq;
+                if (s >= 0) rhs[s] += ieq;
+            }
+            for (size_t i = 0; i < tb.bjts.size(); ++i) {
+                int c = tb.bjts.collectors[i] - 1;
+                int b = tb.bjts.bases[i] - 1;
+                int e = tb.bjts.emitters[i] - 1;
+                double g_cc = tb.bjts.g_cc[i]; double g_cb = tb.bjts.g_cb[i]; double g_ce = tb.bjts.g_ce[i];
+                double g_bc = tb.bjts.g_bc[i]; double g_bb = tb.bjts.g_bb[i]; double g_be = tb.bjts.g_be[i];
+                double g_ec = tb.bjts.g_ec[i]; double g_eb = tb.bjts.g_eb[i]; double g_ee = tb.bjts.g_ee[i];
+                double Ic = tb.bjts.Ic[i]; double Ib = tb.bjts.Ib[i]; double Ie = tb.bjts.Ie[i];
+                double v_c = (c >= 0 && c < (int)N) ? voltages[c] : 0.0;
+                double v_b = (b >= 0 && b < (int)N) ? voltages[b] : 0.0;
+                double v_e = (e >= 0 && e < (int)N) ? voltages[e] : 0.0;
+                auto addG = [&](int r, int c2, double v) {
+                    if (r >= 0 && c2 >= 0) mc.add(r, c2, v);
+                };
+                addG(c, c, g_cc); addG(c, b, g_cb); addG(c, e, g_ce);
+                addG(b, c, g_bc); addG(b, b, g_bb); addG(b, e, g_be);
+                addG(e, c, g_ec); addG(e, b, g_eb); addG(e, e, g_ee);
+                double Iceq = Ic - (g_cc*v_c + g_cb*v_b + g_ce*v_e);
+                double Ibeq = Ib - (g_bc*v_c + g_bb*v_b + g_be*v_e);
+                double Ieeq = Ie - (g_ec*v_c + g_eb*v_b + g_ee*v_e);
+                if (c >= 0) rhs[c] -= Iceq;
+                if (b >= 0) rhs[b] -= Ibeq;
+                if (e >= 0) rhs[e] -= Ieeq;
+            }
+        }
+        // GMIN diagonal conditioning (homotopy step)
+        for (size_t i = 0; i < N; ++i) mc.add((int)i, (int)i, gmin_eff);
 
         Csr_matrix mat = mc.createCsr();
         SolverResult res = solveLU_Pivoted(mat, rhs);
@@ -763,6 +876,67 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
         double maxDelta = 0.0;
         for (size_t i = 0; i < N; ++i)
             maxDelta = std::max(maxDelta, std::abs(res.solution[i] - voltages[i]));
+
+        // Convergence aids (mirrors CPU path): PN-junction limiting + damping.
+        // Clamp per-node voltage swing to +/-10V per iteration to prevent NR
+        // divergence on digital inverter chains (DLL stages) from cold start.
+        {
+            std::vector<double>& v_new = res.solution;
+            for (size_t i = 0; i < N; ++i) {
+                double dv = v_new[i] - voltages[i];
+                const double VLIMIT = 10.0;
+                if (dv >  VLIMIT) v_new[i] = voltages[i] + VLIMIT;
+                if (dv < -VLIMIT) v_new[i] = voltages[i] - VLIMIT;
+            }
+            // SPICE-style PN-junction limiting (pnjlim) — critical for diode/
+            // BJT circuits (bridge rectifiers) where exp() overshoot causes
+            // limit cycles. Mirrors CircuitSim::applyPnJunctionLimits.
+            for (const auto& d : netlist.globalBlock.diodes) {
+                int p = d.anode - 1, n = d.cathode - 1;
+                if (p < 0 && n < 0) continue;
+                if (p >= (int)N || n >= (int)N) continue;
+                double Vt = d.thermalVoltage_V_T_V * d.emissionCoefficient_N;
+                double vcrit = compute_vcrit(Vt, d.saturationCurrent_I_S_A);
+                double vj_old = ((p >= 0) ? voltages[p] : 0.0) - ((n >= 0) ? voltages[n] : 0.0);
+                double vj_new = ((p >= 0) ? v_new[p] : 0.0) - ((n >= 0) ? v_new[n] : 0.0);
+                double v_lim = pnjlim(vj_new, vj_old, Vt, vcrit);
+                double corr = vj_new - v_lim;
+                if (std::abs(corr) > 1e-12) {
+                    if (p >= 0 && n >= 0) { v_new[p] -= corr * 0.5; v_new[n] += corr * 0.5; }
+                    else if (p >= 0) v_new[p] -= corr;
+                    else v_new[n] += corr;
+                }
+            }
+            // BJT junction limiting (BE and BC diodes)
+            for (const auto& q : netlist.globalBlock.bjts) {
+                int c = q.nodeCollector - 1, b = q.base - 1, e = q.emitter - 1;
+                double Vt = q.thermalVoltage_V_T_V;
+                double Is = q.saturationCurrent_I_S_A;
+                double vcrit = compute_vcrit(Vt, Is);
+                // Base-emitter junction
+                if (b >= 0 && e >= 0 && b < (int)N && e < (int)N) {
+                    double vj_old = voltages[b] - voltages[e];
+                    double vj_new = v_new[b] - v_new[e];
+                    double v_lim = pnjlim(vj_new, vj_old, Vt, vcrit);
+                    double corr = vj_new - v_lim;
+                    if (std::abs(corr) > 1e-12) { v_new[b] -= corr * 0.5; v_new[e] += corr * 0.5; }
+                }
+                // Base-collector junction
+                if (b >= 0 && c >= 0 && b < (int)N && c < (int)N) {
+                    double vj_old = voltages[b] - voltages[c];
+                    double vj_new = v_new[b] - v_new[c];
+                    double v_lim = pnjlim(vj_new, vj_old, Vt, vcrit);
+                    double corr = vj_new - v_lim;
+                    if (std::abs(corr) > 1e-12) { v_new[b] -= corr * 0.5; v_new[c] += corr * 0.5; }
+                }
+            }
+            // Damping: if max delta is huge, halve the step (limit-cycle breaker)
+            if (maxDelta > 100.0) {
+                for (size_t i = 0; i < N; ++i)
+                    v_new[i] = voltages[i] + 0.5 * (v_new[i] - voltages[i]);
+            }
+        }
+
         voltages = res.solution;
 
         if (maxDelta < tol) { converged = true; break; }
@@ -770,7 +944,21 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
         // Upload updated voltages to GPU for next iteration
         uploadHiLo(queue, voltageBufferHi, voltageBufferLo, voltages);
     }
+    // CPU-parity policy: a non-converged GMIN step does NOT abort the
+    // homotopy. If the iterate is still physically reasonable (bounded), it
+    // seeds the next tighter GMIN step. Only NaN blowup aborts.
+    bool iterates_bounded = true;
+    for (size_t i = 0; i < N; ++i)
+        if (!std::isfinite(voltages[i]) || std::abs(voltages[i]) > 1e6) { iterates_bounded = false; break; }
+    if (!iterates_bounded) break; // GMIN homotopy diverged — abort
+    } // GMIN homotopy step
+    // Source stepping: continue even if intermediate GMIN stages struggled;
+    // only the final source step (full sources) determines finalConverged.
+    if (src_step == SRC_STEPS - 1) finalConverged = converged;
+    } // source stepping
 
+    lastRunConverged = finalConverged;
+    converged = finalConverged;
     if (converged)
         std::cout << "[INFO] WebGPUSolver: Converged.\n";
     else

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <deque>
 #include "../netlist/circuit.h"
+#include "../math/integration_method.h"
 
 /**
  * lte_controller.h — Local Truncation Error Controller & Method Arbiter (Gap 5)

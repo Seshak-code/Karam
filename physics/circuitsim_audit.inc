@@ -61,7 +61,7 @@
         params.BetaR = q.betaR;
         params.Vt = q.thermalVoltage_V_T_V;
         
-        BJTCurrents currents = bjt_ebers_moll(v_c, v_b, v_e, q.isNPN, params);
+        BJTCurrents<double> currents = bjt_ebers_moll(v_c, v_b, v_e, q.isNPN, params);
         
         addRes(q.nodeCollector, currents.Ic);
         addRes(q.base, currents.Ib);

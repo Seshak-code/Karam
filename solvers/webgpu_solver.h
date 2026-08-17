@@ -50,6 +50,9 @@ public:
     void uploadNetlist(const TensorNetlist& netlist);
 
     // Pipeline-overlapped NR loop (primary solver entry point — legacy CSR path)
+    // True if the last runHybridNRLoop call converged (voltage-delta criterion).
+    bool lastRunConverged = false;
+
     std::vector<double> runHybridNRLoop(
         const TensorNetlist& netlist,
         int   maxIter,

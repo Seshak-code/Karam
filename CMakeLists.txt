@@ -9,10 +9,14 @@ cmake_minimum_required(VERSION 3.20)
 # Build pattern: OBJECT → STATIC (future: SHARED/PLUGIN without recompilation)
 # ===========================================================================
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # ---------------------------------------------------------------------------
 # OBJECT target — compiled once, wrapped in STATIC (or SHARED later)
 # ---------------------------------------------------------------------------
 add_library(acutesim_engine_objects OBJECT)
+target_compile_features(acutesim_engine_objects PUBLIC cxx_std_17)
 
 # === HARDENING: Symbol Visibility Discipline ===
 target_compile_options(acutesim_engine_objects PRIVATE
@@ -41,11 +45,11 @@ target_compile_definitions(acutesim_engine_objects PRIVATE
 # ---------------------------------------------------------------------------
 target_include_directories(acutesim_engine_objects
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/engine_api>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../engine_api>
         $<INSTALL_INTERFACE:include/engine_api>
     PRIVATE
-        ${CMAKE_SOURCE_DIR}/acutesim_engine
-        ${CMAKE_SOURCE_DIR}   # for transitional includes
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..   # for transitional includes
 )
 
 # ---------------------------------------------------------------------------

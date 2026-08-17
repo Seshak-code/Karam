@@ -160,34 +160,60 @@ void batchMosfetPhysics_neon(MosfetTensor& tensor, const std::vector<double>& vo
         float64x2_t v_Vth    = vld1q_f64(&tensor.Vth[i]);
         float64x2_t v_lambda = vld1q_f64(&tensor.lambda[i]);
 
-        // vgs = v_g - v_s, vds = v_d - v_s
+        // PMOS sign vector: +1 NMOS, -1 PMOS (was ignored before - critical fix)
+        alignas(16) double buf_sign[2];
+        for (int k = 0; k < 2; ++k)
+            buf_sign[k] = tensor.isPMOS[i + k] ? -1.0 : 1.0;
+        float64x2_t v_sign = vld1q_f64(buf_sign);
+
+        // vgs = v_g - v_s, vds = v_d - v_s (raw, stored for stamping)
         float64x2_t vgs_val = vsubq_f64(v_v_g, v_v_s);
         float64x2_t vds_val = vsubq_f64(v_v_d, v_v_s);
         vst1q_f64(&tensor.vgs[i], vgs_val);
         vst1q_f64(&tensor.vds[i], vds_val);
 
+        // NMOS-equivalent voltages: vgs' = sign*vgs, vds' = sign*vds, vth' = sign*vth
+        float64x2_t vgs_eq = vmulq_f64(v_sign, vgs_val);
+        float64x2_t vds_eq = vmulq_f64(v_sign, vds_val);
+        float64x2_t vth_eq = vmulq_f64(v_sign, v_Vth);
+
         // beta = Kp * (W / L)
         float64x2_t v_beta = vmulq_f64(v_Kp, vdivq_f64(v_W, v_L));
 
-        // vov = vgs - Vth
-        float64x2_t v_vov = vsubq_f64(vgs_val, v_Vth);
+        // vov = vgs' - vth'
+        float64x2_t v_vov = vsubq_f64(vgs_eq, vth_eq);
 
-        // Saturation: ids = 0.5 * beta * vov^2 * (1 + lambda * vds)
+        // Region select (NMOS-equivalent): cutoff / linear / saturation
         float64x2_t v_half_beta = vmulq_f64(v_half, v_beta);
         float64x2_t v_vov2 = vmulq_f64(v_vov, v_vov);
-        float64x2_t v_clm = vaddq_f64(v_one, vmulq_f64(v_lambda, vds_val));
-        float64x2_t v_ids_raw = vmulq_f64(vmulq_f64(v_half_beta, v_vov2), v_clm);
+        float64x2_t v_clm = vaddq_f64(v_one, vmulq_f64(v_lambda, vds_eq));
 
-        // gm = beta * vov * (1 + lambda * vds)
-        float64x2_t v_gm_raw = vmulq_f64(vmulq_f64(v_beta, v_vov), v_clm);
+        // Saturation branch
+        float64x2_t v_ids_sat = vmulq_f64(vmulq_f64(v_half_beta, v_vov2), v_clm);
+        float64x2_t v_gm_sat  = vmulq_f64(vmulq_f64(v_beta, v_vov), v_clm);
+        float64x2_t v_gds_sat = vmulq_f64(vmulq_f64(v_half_beta, v_vov2), v_lambda);
 
-        // gds = 0.5 * beta * vov^2 * lambda
-        float64x2_t v_gds_raw = vmulq_f64(vmulq_f64(v_half_beta, v_vov2), v_lambda);
+        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)
+        float64x2_t v_ids_lin = vmulq_f64(v_beta, vsubq_f64(vmulq_f64(v_vov, vds_eq), vmulq_f64(v_half, vmulq_f64(vds_eq, vds_eq))));
+        float64x2_t v_gm_lin  = vmulq_f64(v_beta, vds_eq);
+        float64x2_t v_gds_lin = vmulq_f64(v_beta, vsubq_f64(v_vov, vds_eq));
 
-        // Clamp: ids = max(0, ids), gm/gds = max(GMIN, ...)
-        float64x2_t v_ids = vmaxq_f64(v_zero, v_ids_raw);
-        float64x2_t v_gm  = vmaxq_f64(v_GMIN, v_gm_raw);
-        float64x2_t v_gds = vmaxq_f64(v_GMIN, v_gds_raw);
+        // Per-lane region select
+        uint64x2_t m_lin = vcltq_f64(vds_eq, v_vov);   // linear if vds' < vov
+        uint64x2_t m_cut = vcleq_f64(v_vov, v_zero);   // cutoff if vov <= 0
+        float64x2_t v_ids_sel = vbslq_f64(m_lin, v_ids_lin, v_ids_sat);
+        float64x2_t v_gm_sel  = vbslq_f64(m_lin, v_gm_lin, v_gm_sat);
+        float64x2_t v_gds_sel = vbslq_f64(m_lin, v_gds_lin, v_gds_sat);
+        float64x2_t v_ids = vbslq_f64(m_cut, v_zero, v_ids_sel);
+        float64x2_t v_gm  = vbslq_f64(m_cut, v_zero, v_gm_sel);
+        float64x2_t v_gds = vbslq_f64(m_cut, v_GMIN, v_gds_sel);
+
+        // Restore PMOS current sign: ids = sign * |ids|
+        v_ids = vmulq_f64(v_sign, v_ids);
+
+        // Floor conductances at GMIN
+        v_gm  = vmaxq_f64(v_GMIN, v_gm);
+        v_gds = vmaxq_f64(v_GMIN, v_gds);
 
         vst1q_f64(&tensor.ids[i], v_ids);
         vst1q_f64(&tensor.gm[i], v_gm);
@@ -206,15 +232,30 @@ void batchMosfetPhysics_neon(MosfetTensor& tensor, const std::vector<double>& vo
         tensor.vgs[i] = v_g - v_s;
         tensor.vds[i] = v_d - v_s;
 
-        double beta = tensor.Kp[i] * (tensor.W[i] / tensor.L[i]);
-        double vov = tensor.vgs[i] - tensor.Vth[i];
-        double ids_raw = 0.5 * beta * vov * vov * (1.0 + tensor.lambda[i] * tensor.vds[i]);
-        double gm_raw = beta * vov * (1.0 + tensor.lambda[i] * tensor.vds[i]);
-        double gds_raw = 0.5 * beta * vov * vov * tensor.lambda[i];
+        // PMOS sign-flip (matches generic kernel)
+        double sign = tensor.isPMOS[i] ? -1.0 : 1.0;
+        double vgs_eq = sign * tensor.vgs[i];
+        double vds_eq = sign * tensor.vds[i];
+        double vth_eq = sign * tensor.Vth[i];
 
-        tensor.ids[i] = std::max(0.0, ids_raw);
-        tensor.gm[i] = std::max(1e-12, gm_raw);
-        tensor.gds[i] = std::max(1e-12, gds_raw);
+        double beta = tensor.Kp[i] * (tensor.W[i] / tensor.L[i]);
+        double vov = vgs_eq - vth_eq;
+        if (vov <= 0.0) {
+            tensor.ids[i] = 0.0;
+            tensor.gm[i] = 0.0;
+            tensor.gds[i] = 1e-12;
+        } else if (vds_eq < vov) {
+            tensor.ids[i] = sign * beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
+            tensor.gm[i] = beta * vds_eq;
+            tensor.gds[i] = beta * (vov - vds_eq);
+        } else {
+            double lam = tensor.lambda[i];
+            tensor.ids[i] = sign * 0.5 * beta * vov * vov * (1.0 + lam * vds_eq);
+            tensor.gm[i] = beta * vov * (1.0 + lam * vds_eq);
+            tensor.gds[i] = 0.5 * beta * vov * vov * lam;
+        }
+        if (tensor.gm[i] < 1e-12) tensor.gm[i] = 1e-12;
+        if (tensor.gds[i] < 1e-12) tensor.gds[i] = 1e-12;
     }
 }
 

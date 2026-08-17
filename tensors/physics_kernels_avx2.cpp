@@ -159,33 +159,61 @@ void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& vo
         __m256d v_Vth = _mm256_loadu_pd(&tensor.Vth[i]);
         __m256d v_lambda = _mm256_loadu_pd(&tensor.lambda[i]);
 
-        // vgs, vds
+        // PMOS sign vector: +1 NMOS, -1 PMOS (was ignored before - critical fix)
+        alignas(32) double _buf_sign[4];
+        for (int k = 0; k < 4; ++k)
+            _buf_sign[k] = tensor.isPMOS[i + k] ? -1.0 : 1.0;
+        __m256d v_sign = _mm256_load_pd(_buf_sign);
+
+        // vgs, vds (raw, stored for stamping)
         __m256d vgs_val = _mm256_sub_pd(v_v_g, v_v_s);
         __m256d vds_val = _mm256_sub_pd(v_v_d, v_v_s);
         _mm256_storeu_pd(&tensor.vgs[i], vgs_val);
         _mm256_storeu_pd(&tensor.vds[i], vds_val);
 
+        // NMOS-equivalent voltages: vgs' = sign*vgs, vds' = sign*vds, vth' = sign*vth
+        __m256d vgs_eq = _mm256_mul_pd(v_sign, vgs_val);
+        __m256d vds_eq = _mm256_mul_pd(v_sign, vds_val);
+        __m256d vth_eq = _mm256_mul_pd(v_sign, v_Vth);
+
         // beta = Kp * (W / L)
         __m256d v_beta = _mm256_mul_pd(_mm256_div_pd(v_W, v_L), v_Kp);
-        // vov = vgs - Vth
-        __m256d v_vov = _mm256_sub_pd(v_vgs, v_Vth);
+        // vov = vgs' - vth'
+        __m256d v_vov = _mm256_sub_pd(vgs_eq, vth_eq);
 
-        // Saturation: ids = 0.5 * beta * vov^2 * (1 + lambda * vds)
+        // Region select (NMOS-equivalent): cutoff / linear / saturation
         __m256d v_half_beta = _mm256_mul_pd(_mm256_set1_pd(0.5), v_beta);
         __m256d v_vov2 = _mm256_mul_pd(v_vov, v_vov);
-        __m256d v_clm = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(v_lambda, v_vds));
-        __m256d v_ids_raw = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_clm);
+        __m256d v_clm = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(v_lambda, vds_eq));
 
-        // gm = beta * vov * (1 + lambda * vds)
-        __m256d v_gm_raw = _mm256_mul_pd(_mm256_mul_pd(v_beta, v_vov), v_clm);
+        // Saturation branch
+        __m256d v_ids_sat = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_clm);
+        __m256d v_gm_sat  = _mm256_mul_pd(_mm256_mul_pd(v_beta, v_vov), v_clm);
+        __m256d v_gds_sat = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_lambda);
 
-        // gds = 0.5 * beta * vov^2 * lambda
-        __m256d v_gds_raw = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_lambda);
+        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)
+        __m256d v_ids_lin = _mm256_mul_pd(v_beta,
+            _mm256_sub_pd(_mm256_mul_pd(v_vov, vds_eq),
+                          _mm256_mul_pd(_mm256_set1_pd(0.5), _mm256_mul_pd(vds_eq, vds_eq))));
+        __m256d v_gm_lin  = _mm256_mul_pd(v_beta, vds_eq);
+        __m256d v_gds_lin = _mm256_mul_pd(v_beta, _mm256_sub_pd(v_vov, vds_eq));
 
-        // Clamp: ids = max(0, ids), gm/gds = max(GMIN, ...)
-        __m256d v_ids = _mm256_max_pd(_mm256_setzero_pd(), v_ids_raw);
-        __m256d v_gm = _mm256_max_pd(v_GMIN, v_gm_raw);
-        __m256d v_gds = _mm256_max_pd(v_GMIN, v_gds_raw);
+        // Per-lane region select via blendv
+        __m256d m_lin = _mm256_cmp_pd(vds_eq, v_vov, _CMP_LT_OQ);   // linear if vds' < vov
+        __m256d m_cut = _mm256_cmp_pd(v_vov, _mm256_setzero_pd(), _CMP_LE_OQ); // cutoff if vov <= 0
+        __m256d v_ids_sel = _mm256_blendv_pd(v_ids_sat, v_ids_lin, m_lin);
+        __m256d v_gm_sel  = _mm256_blendv_pd(v_gm_sat, v_gm_lin, m_lin);
+        __m256d v_gds_sel = _mm256_blendv_pd(v_gds_sat, v_gds_lin, m_lin);
+        __m256d v_ids = _mm256_blendv_pd(v_ids_sel, _mm256_setzero_pd(), m_cut);
+        __m256d v_gm  = _mm256_blendv_pd(v_gm_sel, _mm256_setzero_pd(), m_cut);
+        __m256d v_gds = _mm256_blendv_pd(v_gds_sel, v_GMIN, m_cut);
+
+        // Restore PMOS current sign: ids = sign * |ids|
+        v_ids = _mm256_mul_pd(v_sign, v_ids);
+
+        // Floor conductances at GMIN
+        v_gm  = _mm256_max_pd(v_GMIN, v_gm);
+        v_gds = _mm256_max_pd(v_GMIN, v_gds);
 
         _mm256_storeu_pd(&tensor.ids[i], v_ids);
         _mm256_storeu_pd(&tensor.gm[i], v_gm);
@@ -212,16 +240,29 @@ void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& vo
         tensor.vgs[i] = vgs;
         tensor.vds[i] = vds;
 
+        // PMOS sign-flip (matches generic kernel)
+        double sign = tensor.isPMOS[i] ? -1.0 : 1.0;
+        double vgs_eq = sign * vgs;
+        double vds_eq = sign * vds;
+        double vth_eq = sign * Vth;
+
         double beta = Kp * (W / L);
-        double vov = vgs - Vth;
-
-        double ids_raw = 0.5 * beta * vov * vov * (1.0 + lam * vds);
-        double gm_raw = beta * vov * (1.0 + lam * vds);
-        double gds_raw = 0.5 * beta * vov * vov * lam;
-
-        tensor.ids[i] = std::max(0.0, ids_raw);
-        tensor.gm[i] = std::max(1e-12, gm_raw);
-        tensor.gds[i] = std::max(1e-12, gds_raw);
+        double vov = vgs_eq - vth_eq;
+        if (vov <= 0.0) {
+            tensor.ids[i] = 0.0;
+            tensor.gm[i] = 0.0;
+            tensor.gds[i] = 1e-12;
+        } else if (vds_eq < vov) {
+            tensor.ids[i] = sign * beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
+            tensor.gm[i] = beta * vds_eq;
+            tensor.gds[i] = beta * (vov - vds_eq);
+        } else {
+            tensor.ids[i] = sign * 0.5 * beta * vov * vov * (1.0 + lam * vds_eq);
+            tensor.gm[i] = beta * vov * (1.0 + lam * vds_eq);
+            tensor.gds[i] = 0.5 * beta * vov * vov * lam;
+        }
+        if (tensor.gm[i] < 1e-12) tensor.gm[i] = 1e-12;
+        if (tensor.gds[i] < 1e-12) tensor.gds[i] = 1e-12;
     }
 }
 

@@ -1472,21 +1472,33 @@ public:
         addRes(q.emitter, -currents.Ie);
     }
 
-    // 3.55 MOSFET Audit
+    // 3.55 MOSFET Audit (uses .model card parameters when available — must
+    // match the solver's stamping exactly, otherwise false KCL residuals)
     for (const auto &m : netlist.globalBlock.mosfets) {
         double v_d = getV(m.drain);
         double v_g = getV(m.gate);
         double v_s = getV(m.source);
         
+        bool isPMOS = (m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos);
+        const ModelCard* card = netlist.findModelCard(m.modelName);
+        if (card) isPMOS = (card->type == "PMOS");
+        
+        double sign = isPMOS ? -1.0 : 1.0;
+        
         MosfetParams<double> p;
-        p.Kp = (m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos) ? 100e-6 : 200e-6;
-        p.Vth = (m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos) ? -0.7 : 0.7;
-        p.lambda = 0.02;
+        if (card) {
+            p.Kp     = card->get("KP", isPMOS ? 100e-6 : 200e-6);
+            // NMOS-equivalent threshold: kernels use vth_eq = sign*VTO, so the
+            // audit must too (PMOS: -1 * -0.45 = +0.45 magnitude form).
+            p.Vth    = sign * card->get("VTO", isPMOS ? -0.7 : 0.7);
+            p.lambda = card->get("LAMBDA", 0.02);
+        } else {
+            p.Kp = isPMOS ? 100e-6 : 200e-6;
+            p.Vth = isPMOS ? 0.7 : 0.7;  // magnitude form
+            p.lambda = 0.02;
+        }
         p.W = m.w;
         p.L = m.l;
-        
-        bool isPMOS = (m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos);
-        double sign = isPMOS ? -1.0 : 1.0;
         
         double ids = sign * mosfet_ids(sign * (v_g - v_s), sign * (v_d - v_s), p);
         
@@ -2957,7 +2969,7 @@ public:
 
     // ─── Gap 2: Digital Event Engine — D2A Stamping ──────────────────────
     if (digitalEngine_.hasOutputPorts()) {
-        digitalEngine_.stampD2A(matrixBuilder, currentRHS, netlist.numGlobalNodes, h);
+        digitalEngine_.stampD2A(matrixBuilder, rhsVector, netlist.numGlobalNodes, h);
     }
   }
 

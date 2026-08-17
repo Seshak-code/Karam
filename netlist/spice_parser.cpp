@@ -161,11 +161,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
         return result_;
     }
 
-    // First non-comment line is the title — skip it
-    bool firstLine = true;
-
     for (const auto& [lineNum, line] : lines) {
-        if (firstLine) { firstLine = false; continue; }
+        if (lineNum == 1) continue; // Line 1 is the SPICE title card
 
         auto tok = tokenize(line);
         if (tok.empty()) continue;
@@ -278,7 +275,9 @@ void SPICEParser::parseResistor(const std::vector<std::string>& tok, TensorBlock
     // Optional parameters
     for (size_t i = 4; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
-        if (upper.substr(0, 2) == "W=") r.width_m = parseValue(tok[i].substr(2));
+        if (upper == "W") r.width_m = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        else if (upper == "L") r.length_m = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        else if (upper.substr(0, 2) == "W=") r.width_m = parseValue(tok[i].substr(2));
         else if (upper.substr(0, 2) == "L=") r.length_m = parseValue(tok[i].substr(2));
         else if (upper.substr(0, 4) == "TC1=") r.tc1 = parseValue(tok[i].substr(4));
         else if (upper.substr(0, 4) == "TC2=") r.tc2 = parseValue(tok[i].substr(4));
@@ -297,7 +296,10 @@ void SPICEParser::parseCapacitor(const std::vector<std::string>& tok, TensorBloc
 
     for (size_t i = 4; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
-        if (upper.substr(0, 2) == "W=") c.width_m = parseValue(tok[i].substr(2));
+        if (upper == "W") c.width_m = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        else if (upper == "L") c.length_m = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        else if (upper == "M") c.m = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 1.0;
+        else if (upper.substr(0, 2) == "W=") c.width_m = parseValue(tok[i].substr(2));
         else if (upper.substr(0, 2) == "L=") c.length_m = parseValue(tok[i].substr(2));
         else if (upper.substr(0, 2) == "M=") c.m = parseValue(tok[i].substr(2));
     }
@@ -489,18 +491,35 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.body   = nodeIndex(tok[4]);
     m.modelName = tok[5];
 
+    // NOTE: tokenize() flattens '=' to a space, so "W=4u" arrives as ["W","4u"].
+    // Handle both the flattened pair form and (defensively) the "W=" prefix form.
     for (size_t i = 6; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
-        if (upper.substr(0, 2) == "W=")       m.w = parseValue(tok[i].substr(2));
-        else if (upper.substr(0, 2) == "L=")   m.l = parseValue(tok[i].substr(2));
-        else if (upper.substr(0, 3) == "AD=")  m.geo.ad = parseValue(tok[i].substr(3));
-        else if (upper.substr(0, 3) == "AS=")  m.geo.as = parseValue(tok[i].substr(3));
-        else if (upper.substr(0, 3) == "PD=")  m.geo.pd = parseValue(tok[i].substr(3));
-        else if (upper.substr(0, 3) == "PS=")  m.geo.ps = parseValue(tok[i].substr(3));
-        else if (upper.substr(0, 4) == "NRD=") m.geo.nrd = parseValue(tok[i].substr(4));
-        else if (upper.substr(0, 4) == "NRS=") m.geo.nrs = parseValue(tok[i].substr(4));
-        else if (upper.substr(0, 3) == "NF=")  m.extra.nf = static_cast<int>(parseValue(tok[i].substr(3)));
-        else if (upper.substr(0, 2) == "M=")   m.extra.mult = static_cast<int>(parseValue(tok[i].substr(2)));
+        auto nextVal = [&]() -> double {
+            return (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        };
+        if (upper == "W")                m.w = nextVal();
+        else if (upper == "L")           m.l = nextVal();
+        else if (upper == "AD")          m.geo.ad = nextVal();
+        else if (upper == "AS")          m.geo.as = nextVal();
+        else if (upper == "PD")          m.geo.pd = nextVal();
+        else if (upper == "PS")          m.geo.ps = nextVal();
+        else if (upper == "NRD")         m.geo.nrd = nextVal();
+        else if (upper == "NRS")         m.geo.nrs = nextVal();
+        else if (upper == "NF")          m.extra.nf = static_cast<int>(nextVal());
+        else if (upper == "M")           m.extra.mult = static_cast<int>(nextVal());
+        else if (upper == "W")            m.w = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        else if (upper == "L")            m.l = (i + 1 < tok.size()) ? parseValue(tok[++i]) : 0.0;
+        else if (upper.substr(0, 2) == "W=")       m.w = parseValue(tok[i].substr(2));
+        else if (upper.substr(0, 2) == "L=")       m.l = parseValue(tok[i].substr(2));
+        else if (upper.substr(0, 3) == "AD=")      m.geo.ad = parseValue(tok[i].substr(3));
+        else if (upper.substr(0, 3) == "AS=")      m.geo.as = parseValue(tok[i].substr(3));
+        else if (upper.substr(0, 3) == "PD=")      m.geo.pd = parseValue(tok[i].substr(3));
+        else if (upper.substr(0, 3) == "PS=")      m.geo.ps = parseValue(tok[i].substr(3));
+        else if (upper.substr(0, 4) == "NRD=")     m.geo.nrd = parseValue(tok[i].substr(4));
+        else if (upper.substr(0, 4) == "NRS=")     m.geo.nrs = parseValue(tok[i].substr(4));
+        else if (upper.substr(0, 3) == "NF=")      m.extra.nf = static_cast<int>(parseValue(tok[i].substr(3)));
+        else if (upper.substr(0, 2) == "M=")       m.extra.mult = static_cast<int>(parseValue(tok[i].substr(2)));
     }
     blk.mosfets.push_back(m);
 }
