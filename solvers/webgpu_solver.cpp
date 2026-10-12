@@ -18,6 +18,7 @@
 #include "../math/linalg.h"          // MatrixConstructor, solveLU_Pivoted, Csr_matrix
 #include "../netlist/circuit.h" // Resistor, BJT, Mosfet, Diode, etc.
 #include "../physics/device_physics.h" // pnjlim, compute_vcrit (junction limiting)
+#include "../physics/physics_constants.h" // DC_SHORT_G
 #include "../tensors/physics_tensors.h"   // tensorizeNetlist, TensorizedBlock
 #include "../tensors/kernel_dispatch.h"   // KernelDispatcher (SIMD kernels)
 
@@ -706,6 +707,7 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
     const int GMIN_STEPS = 6;
     const double gmin_schedule[GMIN_STEPS] = {1e-2, 1e-3, 1e-4, 1e-5, 1e-6, gmin};
     bool finalConverged = false;
+    lastRunIterations = 0;
     double src_scale = 1.0;
     // Per-step NR budget: maxIter is the per-homotopy-step iteration count
     // (mirrors the CPU solver, which runs up to 100 NR iterations per GMIN
@@ -717,6 +719,7 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
     const double gmin_eff = gmin_schedule[gmin_step];
     converged = false;
     for (int iter = 0; iter < maxIter; ++iter) {
+        ++lastRunIterations;
         // Wait for previous GPU dispatch to finish (synchronous for now)
         isReadbackReady();
 
@@ -766,6 +769,15 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
                 rhs[nn] -= G_VS * vs.voltage_V * src_scale;
             }
         }
+        // Stamp inductors as DC shorts (this loop only runs DC: h == 0)
+        if (h <= 0.0) {
+            for (const auto& l : netlist.globalBlock.inductors) {
+                int n1 = l.nodeCoil1 - 1, n2 = l.nodeCoil2 - 1;
+                const double g = PhysicsConstants::DC_SHORT_G;
+                if (n1 >= 0) { mc.add(n1, n1, g); if (n2 >= 0) mc.add(n1, n2, -g); }
+                if (n2 >= 0) { mc.add(n2, n2, g); if (n1 >= 0) mc.add(n2, n1, -g); }
+            }
+        }
         // Stamp current sources
         for (const auto& cs : netlist.globalBlock.currentSources) {
             int np = cs.nodePositive - 1;
@@ -780,7 +792,7 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
             double vc = (nc >= 0 && nc < (int)N) ? voltages[nc] : 0.0;
             double vd = va - vc;
             double nvt = d.emissionCoefficient_N * d.thermalVoltage_V_T_V;
-            double arg = std::min(vd / nvt, 30.0);
+            double arg = std::min(vd / nvt, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
             double exp_arg = std::exp(arg);
             double gd = d.saturationCurrent_I_S_A * exp_arg / nvt;
             double id = d.saturationCurrent_I_S_A * (exp_arg - 1.0);

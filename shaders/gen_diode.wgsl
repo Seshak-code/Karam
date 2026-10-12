@@ -44,11 +44,11 @@ fn batch_diode_physics(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v_d: f32 = devices.v_d[i];
     let n_vt: f32 = (N * Vt);
     let arg: f32 = (v_d / n_vt);
-    let arg_clamped: f32 = min(arg, 30.0);
+    let arg_clamped: f32 = min(arg, 50.0);
     let exp_val: f32 = exp(arg_clamped);
     let i_base: f32 = ((exp_val - 1.0) * Is);
     let g_base: f32 = ((Is / n_vt) * exp_val);
-    let delta: f32 = max(0.0, (v_d - (30.0 * n_vt)));
+    let delta: f32 = max(0.0, (v_d - (50.0 * n_vt)));
     devices.i_d[i] = ((delta * g_base) + i_base);
     let i_d: f32 = devices.i_d[i];
     devices.g_d[i] = max(GMIN, g_base);

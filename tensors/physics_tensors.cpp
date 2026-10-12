@@ -1,4 +1,5 @@
 #include "../tensors/physics_tensors.h"
+#include "../physics/physics_constants.h"
 #include "kernel_dispatch.h"
 #include "../infrastructure/model_registry.h"
 #include "../netlist/circuit.h"
@@ -33,12 +34,12 @@ void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& v
         double N = tensor.N[i];
         double Vt = tensor.Vt[i];
         double n_vt = N * Vt;
-        double Vcrit = 30.0 * n_vt;
+        double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt;
         
         double arg = tensor.v_d[i] / n_vt;
         
         // Linear continuation (branchless-style using std::min/max)
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_arg = std::exp(arg_clamped);
         
         double i_base = Is * (exp_arg - 1.0);
@@ -125,11 +126,11 @@ void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& volta
         double BetaF = tensor.BetaF[i];
         double BetaR = tensor.BetaR[i];
         
-        const double Vcrit = 30.0 * Vt;
+        const double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * Vt;
 
         auto linear_continuation_diode = [&](double v_j) -> std::pair<double, double> {
             double arg = v_j / Vt;
-            double arg_clamped = std::min(arg, 30.0);
+            double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
             
             double exp_val = std::exp(arg_clamped);
             double i_base = Is * (exp_val - 1.0);

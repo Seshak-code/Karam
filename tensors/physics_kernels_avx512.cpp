@@ -1,4 +1,5 @@
 #include "../tensors/physics_tensors.h"
+#include "../physics/physics_constants.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -33,7 +34,7 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
     const __m512d v_gmin = _mm512_set1_pd(GMIN);
     const __m512d v_zero = _mm512_setzero_pd();
     const __m512d v_one  = _mm512_set1_pd(1.0);
-    const __m512d v_30   = _mm512_set1_pd(30.0);
+    const __m512d v_argmax   = _mm512_set1_pd(PhysicsConstants::JUNCTION_EXP_ARG_MAX);
     
     size_t i = 0;
     // Process 8 diodes at a time
@@ -77,14 +78,14 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         // n_vt = N * Vt
         __m512d v_nvt = _mm512_mul_pd(v_N, v_Vt);
         
-        // Vcrit = 30.0 * n_vt
-        __m512d v_vcrit = _mm512_mul_pd(v_30, v_nvt);
+        // Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt
+        __m512d v_vcrit = _mm512_mul_pd(v_argmax, v_nvt);
         
         // arg = v_d / n_vt
         __m512d v_arg = _mm512_div_pd(v_d, v_nvt);
         
-        // arg_clamped = min(arg, 30.0)
-        __m512d v_arg_clamped = _mm512_min_pd(v_arg, v_30);
+        // arg_clamped = min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX)
+        __m512d v_arg_clamped = _mm512_min_pd(v_arg, v_argmax);
         
         // exp_arg = exp(arg_clamped)
         __m512d v_exp = _mm512_exp_pd_fallback(v_arg_clamped);
@@ -123,10 +124,10 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         double N = tensor.N[i];
         double Vt = tensor.Vt[i];
         double n_vt = N * Vt;
-        double Vcrit = 30.0 * n_vt;
+        double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt;
         
         double arg = tensor.v_d[i] / n_vt;
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_arg = std::exp(arg_clamped);
         
         double i_base = Is * (exp_arg - 1.0);

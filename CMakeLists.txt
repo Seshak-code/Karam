@@ -24,9 +24,11 @@ target_compile_options(acutesim_engine_objects PRIVATE
     -fvisibility-inlines-hidden
 )
 
+# No -ffast-math: it implies -ffinite-math-only, which deletes every
+# isnan/isfinite guard in the solver (NaN results were reported as converged),
+# and it breaks the project's cross-platform determinism rule (see CLAUDE.md).
 if(NOT EMSCRIPTEN)
     target_compile_options(acutesim_engine_objects PRIVATE
-        -ffast-math
         -march=native     # Enables AVX-512 / NEON auto-detection at runtime
     )
 endif()

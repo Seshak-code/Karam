@@ -75,6 +75,27 @@ constexpr double ABSTOL = 1e-12; // Amperes
 /** KCL residual tolerance */
 constexpr double KCL_TOL = 1e-12; // Amperes
 
+/** Relative KCL tolerance (componentwise backward error): node i's residual
+ *  only counts beyond KCL_RELTOL * (|A||v|)_i. Stiff stamps (a 999k-gain E
+ *  source is 1e10 S; a 1 kV Norton source is 1e6 A of cancelling terms) leave
+ *  floating-point residuals far above KCL_TOL that no iteration can remove.
+ *  At ordinary nodes the allowance is ~1e-13 A, so nothing loosens there. */
+constexpr double KCL_RELTOL = 1e-10;
+
+/** Conductance used to short an inductor at DC. Same 1 mOhm as the Norton
+ *  voltage-source stamp, so stamps and KCL audits stay consistent.
+ *  ponytail: not an ideal short (I*1mOhm error); exact fix is an MNA branch
+ *  current row, which the voltage-domain-only matrix doesn't have yet. */
+constexpr double DC_SHORT_G = 1e3; // Siemens
+
+/** Junction exponent cap: above Vj = JUNCTION_EXP_ARG_MAX * N*Vt every diode/BJT
+ *  kernel continues linearly instead of exponentially (overflow guard only).
+ *  Was 30: with SPICE's BJT IS=1e-16 the junction went linear at 1.07 mA,
+ *  giving Vbe = 1.18 V at 18 mA (true exponential: 0.83 V). At 50 the knee is
+ *  >= 5 kA even for IS = 1e-18, exp() is 13 orders below double overflow, and
+ *  pnjlim (which bypasses limiting above this cap) bounds NR overshoot. */
+constexpr double JUNCTION_EXP_ARG_MAX = 50.0;
+
 /** PCG solver tolerance */
 constexpr double PCG_TOL = 1e-10;
 

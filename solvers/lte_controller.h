@@ -80,13 +80,34 @@ public:
 
         if (dt <= 0.0) return result;
 
-        // Method-dependent LTE coefficient:
-        //   Trapezoidal: LTE ≈ h²/12 · |d²v/dt²|  → coeff = 12
-        //   Gear2:       LTE ≈ 2h²/9 · |d²v/dt²|  → coeff = 4.5
-        double coeff = 12.0;
-        if (method == IntegrationType::GEAR_2) {
-            coeff = 4.5;
-        }
+        // LTE from divided differences over the ACTUAL step sizes. The old
+        // (v_n - 2v_{n-1} + v_{n-2}) form assumed equal steps; right after the
+        // tstep/100 cold-start sweep it degenerated to a first difference
+        // (~dV), rejected every step, and hung the transient.
+        //   BE:    LTE = h^2/2  * |v2|,  v2 ~ 2 f[t0,t1,t2]
+        //   Trap:  LTE = h^3/12 * |v3|,  v3 ~ 6 f[t0,t1,t2,t3]
+        //   Gear2: LTE = 2h^3/9 * |v3|
+        const bool firstOrder = (method == IntegrationType::GEAR_1_EULER);
+        const size_t needSteps = firstOrder ? 1 : 2;
+        if (stepHistory_.size() < needSteps) return result;  // not enough history yet
+
+        const double t0 = 0.0, t1 = -dt;
+        const double t2 = t1 - stepHistory_[0];
+        const double t3 = (stepHistory_.size() > 1) ? t2 - stepHistory_[1] : t2;
+
+        // y0 = value now, h[0..2] = previous accepted values (most recent first)
+        auto lteOf = [&](double y0, const std::vector<double>& h) -> double {
+            if (h.size() < needSteps + 1) return 0.0;
+            double d01 = (y0 - h[0]) / (t0 - t1);
+            double d12 = (h[0] - h[1]) / (t1 - t2);
+            double d012 = (d01 - d12) / (t0 - t2);
+            if (firstOrder) return dt * dt * std::abs(d012);
+            double d23 = (h[1] - h[2]) / (t2 - t3);
+            double d123 = (d12 - d23) / (t1 - t3);
+            double d0123 = (d012 - d123) / (t0 - t3);
+            double coeff = (method == IntegrationType::GEAR_2) ? (4.0 / 3.0) : 0.5;
+            return coeff * dt * dt * dt * std::abs(d0123);
+        };
 
         auto getV = [&](int nodeIdx) -> double {
             if (nodeIdx <= 0 || nodeIdx > (int)v_curr.size()) return 0.0;
@@ -97,28 +118,8 @@ public:
         for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
             const auto& cap = netlist.globalBlock.capacitors[i];
             if (i >= netlist.globalState.capacitorState.size()) continue;
-            const auto& hist = netlist.globalState.capacitorState[i];
-
-            if (hist.v.size() < 2) continue;  // need at least 2 history points
-
-            // Current capacitor voltage
-            double v_n = getV(cap.nodePlate1) - getV(cap.nodePlate2);
-            double v_n1 = hist.v[0];     // previous step
-            double v_n2 = (hist.v.size() > 1) ? hist.v[1] : v_n1;
-
-            // 2nd-order difference: approximates dt² · d²v/dt²
-            double d2v = v_n - 2.0 * v_n1 + v_n2;
-
-            // LTE = |d2v| / coeff, scaled by charge: Q_lte = C · V_lte
-            // SPICE uses charge-based LTE (CHGTOL) for capacitors:
-            //   LTE_charge = C · |d2v| / coeff
-            // We normalize to voltage for consistent comparison:
-            double lte_v = std::abs(d2v) / coeff;
-
-            // TRTOL scaling: SPICE3 uses TRTOL * CHGTOL as the tolerance
-            // We use trtol * tolerance as the effective threshold
-            double effective_tol = trtol_ * tolerance_;
-
+            double lte_v = lteOf(getV(cap.nodePlate1) - getV(cap.nodePlate2),
+                                 netlist.globalState.capacitorState[i].v);
             if (lte_v > result.maxLTE) {
                 result.maxLTE = lte_v;
                 result.worstElementIndex = static_cast<int>(i);
@@ -126,34 +127,19 @@ public:
             }
         }
 
-        // Inductor LTE estimation
+        // Inductor LTE estimation (on branch voltage: the solver does not write
+        // back inductor current history, so hist.i is not usable)
         for (size_t i = 0; i < netlist.globalBlock.inductors.size(); ++i) {
             const auto& ind = netlist.globalBlock.inductors[i];
             if (i >= netlist.globalState.inductorState.size()) continue;
-            const auto& hist = netlist.globalState.inductorState[i];
-
-            if (hist.i.size() < 2) continue;
-
-            // Current inductor current (from voltage across it)
-            double v_L = getV(ind.nodeCoil1) - getV(ind.nodeCoil2);
-            double i_n = hist.i.empty() ? 0.0 : hist.i[0];
-            // Approximate current from companion model:
-            // For BE: i = i_prev + (v_L / L) * dt
-            double i_curr = i_n + (v_L / std::max(ind.inductance_henries, 1e-15)) * dt;
-
-            double i_n1 = hist.i[0];
-            double i_n2 = (hist.i.size() > 1) ? hist.i[1] : i_n1;
-
-            double d2i = i_curr - 2.0 * i_n1 + i_n2;
-            double lte_i = std::abs(d2i) / coeff;
-
-            if (lte_i > result.maxLTE) {
-                result.maxLTE = lte_i;
+            double lte_v = lteOf(getV(ind.nodeCoil1) - getV(ind.nodeCoil2),
+                                 netlist.globalState.inductorState[i].v);
+            if (lte_v > result.maxLTE) {
+                result.maxLTE = lte_v;
                 result.worstElementIndex = static_cast<int>(i);
                 result.worstIsCapacitor = false;
             }
         }
-
         // Compute safety factor and timestep suggestion
         double effective_tol = trtol_ * tolerance_;
         if (result.maxLTE > 0.0) {
@@ -161,9 +147,9 @@ public:
             result.requiresRejection = (result.safetyFactor < 1.0);
 
             // Optimal timestep: dt_new = dt * (tol/LTE)^(1/(p+1))
-            // p = order = 2 for both Trap and Gear2, so exponent = 1/3
+            // p = 1 for BE (exponent 1/2), 2 for Trap/Gear2 (exponent 1/3)
             // Apply safety margin of 0.8 to avoid re-rejection
-            double ratio = std::pow(result.safetyFactor, 1.0 / 3.0);
+            double ratio = std::pow(result.safetyFactor, firstOrder ? 0.5 : 1.0 / 3.0);
             ratio = std::min(ratio, 2.0);   // cap growth at 2× per step
             ratio = std::max(ratio, 0.1);   // prevent collapse to zero
             result.suggestedDt = dt * ratio * 0.8;
@@ -270,7 +256,14 @@ public:
     /**
      * Reset controller state (call on topology change).
      */
+    /** Record an ACCEPTED step size (call once per history update). */
+    void recordStep(double h) {
+        stepHistory_.push_front(h);
+        if (stepHistory_.size() > 3) stepHistory_.pop_back();
+    }
+
     void reset() {
+        stepHistory_.clear();
         voltageHistory_.clear();
         stableStepCount_ = 0;
     }
@@ -286,5 +279,6 @@ private:
 
     // Ringing detection state
     std::deque<std::vector<double>> voltageHistory_;  // last 4 voltage snapshots
+    std::deque<double> stepHistory_;  // last accepted step sizes, most recent first
     int stableStepCount_ = 0;  // consecutive non-ringing steps while on Gear2
 };

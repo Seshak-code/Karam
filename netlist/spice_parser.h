@@ -46,6 +46,7 @@ struct SPICEParseResult {
     double        tranStop = 0.0;
     double        tranStep = 0.0;
     double        tranStart = 0.0;
+    bool          tranUIC = false;   // .tran ... UIC: skip the DC operating point
 };
 
 class SPICEParser {
@@ -57,7 +58,10 @@ public:
 
 private:
     // ── Value and Token Helpers ────────────────────────────────────────
-    static double parseValue(const std::string& s);
+    double parseValue(const std::string& s) const;  // throws on non-numbers; resolves .param
+    bool isValue(const std::string& s) const;
+    static void requireFields(const std::vector<std::string>& tok, size_t n);
+    void rejectArea(const std::vector<std::string>& tok, size_t from) const;
     static std::string toUpper(const std::string& s);
     static std::vector<std::string> tokenize(const std::string& line);
 
@@ -82,9 +86,6 @@ private:
     void parseJFET       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
-    void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
-    void parseCCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
-    void parseTLine      (const std::vector<std::string>& tok, TensorBlock& blk);
 
     // ── Directive Parsers ─────────────────────────────────────────────
     void parseModelCard  (const std::vector<std::string>& tok);
@@ -93,14 +94,13 @@ private:
     void parseParam      (const std::vector<std::string>& tok);
 
     // ── Source Waveform Helpers ────────────────────────────────────────
-    static void parsePulse(const std::vector<std::string>& tok, size_t startIdx,
-                           VoltageSource& vs);
-    static void parseSine (const std::vector<std::string>& tok, size_t startIdx,
-                           VoltageSource& vs);
-    static void parsePulseI(const std::vector<std::string>& tok, size_t startIdx,
-                            CurrentSource& cs);
-    static void parseSineI (const std::vector<std::string>& tok, size_t startIdx,
-                            CurrentSource& cs);
+    // Shared by V and I sources (identical waveform fields)
+    template <class Src>
+    void parseSourceSpec(const std::vector<std::string>& tok, Src& s, double& dc) const;
+    template <class Src>
+    void parsePulse(const std::vector<std::string>& tok, size_t startIdx, Src& s) const;
+    template <class Src>
+    void parseSine (const std::vector<std::string>& tok, size_t startIdx, Src& s) const;
 
     // ── State ─────────────────────────────────────────────────────────
     std::map<std::string, int> nodeMap_;

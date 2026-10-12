@@ -52,7 +52,7 @@ kernel:
   - assign: arg
     expr: "v_d / n_vt"
   - assign: arg_clamped
-    expr: "min(arg, 30.0)"
+    expr: "min(arg, 50.0)"
 
   # Step 3: Exponential evaluation
   - assign: exp_val
@@ -66,7 +66,7 @@ kernel:
 
   # Step 5: Linear continuation for large forward bias
   - assign: delta
-    expr: "max(0.0, v_d - 30.0 * n_vt)"
+    expr: "max(0.0, v_d - 50.0 * n_vt)"
   - assign: i_d
     expr: "i_base + delta * g_base"
   - assign: g_d

@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <set>
 #include <cassert>
@@ -143,7 +144,7 @@ struct MutualInductor {
 struct VoltageSource {
     int nodePositive;
     int nodeNegative;
-    double voltage_V;        // DC/Offset Voltage
+    double voltage_V = 0.0;  // DC value (parser: t=0 waveform value if no DC given)
     std::string type = "";   // "PULSE", "SINE", "DC", etc.
 
     // Waveform Parameters (SPICE-like)
@@ -178,7 +179,7 @@ struct VoltageSource {
 struct CurrentSource {
     int nodePositive;
     int nodeNegative;
-    double current_A;        // DC Current
+    double current_A = 0.0;  // DC value (parser: t=0 waveform value if no DC given)
     std::string type = "";   // "PULSE", "SINE", "DC"
 
     // Waveform Parameters (Mirror of VoltageSource)
@@ -202,6 +203,37 @@ struct CurrentSource {
 
     std::string expression;  // Symbolic override for DC/main value
 };
+
+/*
+ * Instantaneous value of an independent V or I source at time t (transient).
+ * The single definition shared by the parser (t=0 DC value), both stamping
+ * paths and the KCL audit, so they can never disagree on a source's value.
+ * ponytail: no breakpoint control — a timestep may straddle a PULSE edge and
+ * only LTE rejection reacts; SPICE-style breakpoints are the upgrade path.
+ */
+template <class Src>
+inline double waveformValue(const Src& s, double dcValue, double t) {
+    if (s.type == "PULSE") {
+        double tt = t - s.pulse_td;
+        if (tt <= 0.0) return s.pulse_v1;
+        tt = std::fmod(tt, s.pulse_per > 0.0 ? s.pulse_per : 1e99);
+        if (tt < s.pulse_tr) return s.pulse_v1 + (s.pulse_v2 - s.pulse_v1) * (tt / s.pulse_tr);
+        tt -= s.pulse_tr;
+        if (tt < s.pulse_pw) return s.pulse_v2;
+        tt -= s.pulse_pw;
+        if (tt < s.pulse_tf) return s.pulse_v2 + (s.pulse_v1 - s.pulse_v2) * (tt / s.pulse_tf);
+        return s.pulse_v1;
+    }
+    if (s.type == "SINE") {
+        const double kPi = 3.141592653589793;
+        double phase = s.sine_phase * (kPi / 180.0);
+        double tt = t - s.sine_td;
+        if (tt <= 0.0) return s.sine_vo + s.sine_va * std::sin(phase);
+        return s.sine_vo + s.sine_va * std::exp(-tt * s.sine_theta) *
+                               std::sin(2.0 * kPi * s.sine_freq * tt + phase);
+    }
+    return dcValue;
+}
 
 // ============================================================================
 // DEPENDENT SOURCES (Bench + Block internal modes)
@@ -393,15 +425,17 @@ struct Diode {
     std::string instanceName;         // e.g. "D1"
     int anode;                        // P-type side (+)
     int cathode;                      // N-type side (-)
-    double saturationCurrent_I_S_A;       // I_S [A]
-    double emissionCoefficient_N;         // N (dimensionless)
-    double thermalVoltage_V_T_V;          // V_T [V]
-    
+    // Defaults match SPICE3 D-model defaults and addDiode(); left uninitialised
+    // these were read as garbage by every parser-created diode (NaN results).
+    double saturationCurrent_I_S_A = 1e-14;  // I_S [A]
+    double emissionCoefficient_N = 1.0;      // N (dimensionless)
+    double thermalVoltage_V_T_V = 0.02585;   // V_T [V]
+
     // Thermal (Optional, default 300.15K)
     double temperature_K = 300.15;
 
     // Generic PDK Support
-    std::string modelName = "diode_generic"; 
+    std::string modelName = "diode_generic";
     double area_m2 = 1e-12;       // Junction Area
     double perimeter_m = 4e-6;    // Junction Perimeter
 

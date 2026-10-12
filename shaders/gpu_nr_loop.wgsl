@@ -63,17 +63,18 @@ fn f64_select(false_val: f64, true_val: f64, cond: bool) -> f64 {
 // --- Proper f64_exp: fully predicated, no early-return branches ---
 // Algorithm (Virtual VLIW — all paths computed, select() picks result):
 //   A. Underflow path  (x.hi <= -87):   result = 0
-//   B. Linear path     (x.hi >= 30):    result = exp(30)*(1 + (x-30))
-//   C. Horner path     (-87 < x < 30):  range-reduce + degree-6 polynomial
+//   B. Linear path     (x.hi >= 50):    result = exp(50)*(1 + (x-50))
+//   C. Horner path     (-87 < x < 50):  range-reduce + degree-6 polynomial
+// MAX_ARG must match PhysicsConstants::JUNCTION_EXP_ARG_MAX (physics_constants.h).
 // All three are always computed; select() chooses the correct one.
 // This eliminates warp divergence vs the original early-return form.
 fn f64_exp(x: f64) -> f64 {
-    let MAX_ARG: f32 = 30.0;
-    let EXP30: f32 = 1.06864745815e13; // exp(30) in f32
+    let MAX_ARG: f32 = 50.0;
+    let EXP_MAX: f32 = 5.184705528587072e21; // exp(50) in f32
 
     // Path B: linear continuation for large forward bias (mirrors CPU pnjlim)
-    // exp(x) ≈ exp(30) + exp(30)*(x - 30) = exp(30)*(1 + (x-30))
-    let slope    = f64(EXP30, 0.0);
+    // exp(x) ≈ exp(50) + exp(50)*(x - 50) = exp(50)*(1 + (x-50))
+    let slope    = f64(EXP_MAX, 0.0);
     let dx       = f64_sub(x, f64(MAX_ARG, 0.0));
     let result_b = f64_add(slope, f64_mul(slope, dx));
 

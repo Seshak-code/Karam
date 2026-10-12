@@ -3,6 +3,7 @@
 // AArch64 NEON has native float64x2_t support.
 
 #include "../tensors/physics_tensors.h"
+#include "../physics/physics_constants.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -34,7 +35,7 @@ void batchDiodePhysics_neon(DiodeTensor& tensor, const std::vector<double>& volt
     const size_t n = tensor.size();
 
     const float64x2_t vc_1  = vdupq_n_f64(1.0);
-    const float64x2_t vc_30 = vdupq_n_f64(30.0);
+    const float64x2_t vc_argmax = vdupq_n_f64(PhysicsConstants::JUNCTION_EXP_ARG_MAX);
     const float64x2_t vc_0  = vdupq_n_f64(0.0);
 
     const double* __restrict__ v_ptr = voltages.data();
@@ -75,8 +76,8 @@ void batchDiodePhysics_neon(DiodeTensor& tensor, const std::vector<double>& volt
         // arg = v_d / n_vt
         float64x2_t v_arg = vdivq_f64(v_v_d, v_n_vt);
 
-        // arg_clamped = min(arg, 30.0)
-        float64x2_t v_arg_clamped = vminq_f64(v_arg, vc_30);
+        // arg_clamped = min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX)
+        float64x2_t v_arg_clamped = vminq_f64(v_arg, vc_argmax);
 
         // exp_val = exp(arg_clamped)
         float64x2_t v_exp_val = vexp_f64(v_arg_clamped);
@@ -87,8 +88,8 @@ void batchDiodePhysics_neon(DiodeTensor& tensor, const std::vector<double>& volt
         // g_base = (Is / n_vt) * exp_val
         float64x2_t v_g_base = vmulq_f64(vdivq_f64(v_Is, v_n_vt), v_exp_val);
 
-        // delta = max(0.0, v_d - 30.0 * n_vt)
-        float64x2_t v_vcrit = vmulq_f64(vc_30, v_n_vt);
+        // delta = max(0.0, v_d - PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt)
+        float64x2_t v_vcrit = vmulq_f64(vc_argmax, v_n_vt);
         float64x2_t v_delta = vmaxq_f64(vc_0, vsubq_f64(v_v_d, v_vcrit));
 
         // i_d = i_base + delta * g_base
@@ -110,11 +111,11 @@ void batchDiodePhysics_neon(DiodeTensor& tensor, const std::vector<double>& volt
         tensor.v_d[i] = v_a - v_c;
         double n_vt = tensor.N[i] * tensor.Vt[i];
         double arg = tensor.v_d[i] / n_vt;
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_val = std::exp(arg_clamped);
         double i_base = tensor.Is[i] * (exp_val - 1.0);
         double g_base = (tensor.Is[i] / n_vt) * exp_val;
-        double delta = std::max(0.0, tensor.v_d[i] - 30.0 * n_vt);
+        double delta = std::max(0.0, tensor.v_d[i] - PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt);
         tensor.i_d[i] = i_base + delta * g_base;
         tensor.g_d[i] = std::max(tensor.GMIN[i], g_base);
     }
@@ -269,7 +270,7 @@ void batchBJTPhysics_neon(BJTTensor& tensor, const std::vector<double>& voltages
     const float64x2_t v_GMIN = vdupq_n_f64(GMIN);
     const float64x2_t v_zero = vdupq_n_f64(0.0);
     const float64x2_t v_one  = vdupq_n_f64(1.0);
-    const float64x2_t v_30   = vdupq_n_f64(30.0);
+    const float64x2_t v_argmax   = vdupq_n_f64(PhysicsConstants::JUNCTION_EXP_ARG_MAX);
 
     const double* __restrict__ v_ptr = voltages.data();
     const int v_size = (int)voltages.size();
@@ -309,12 +310,12 @@ void batchBJTPhysics_neon(BJTTensor& tensor, const std::vector<double>& voltages
         float64x2_t v_BetaF = vld1q_f64(&tensor.BetaF[i]);
         float64x2_t v_BetaR = vld1q_f64(&tensor.BetaR[i]);
 
-        // Vcrit = 30.0 * Vt
-        float64x2_t v_vcrit = vmulq_f64(v_30, v_Vt);
+        // Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * Vt
+        float64x2_t v_vcrit = vmulq_f64(v_argmax, v_Vt);
 
         // --- Forward junction (BE) ---
         float64x2_t v_arg_f = vdivq_f64(v_v_be, v_Vt);
-        float64x2_t v_arg_f_clamped = vminq_f64(v_arg_f, v_30);
+        float64x2_t v_arg_f_clamped = vminq_f64(v_arg_f, v_argmax);
         float64x2_t v_exp_f = vexp_f64(v_arg_f_clamped);
         float64x2_t v_if_base = vmulq_f64(v_Is, vsubq_f64(v_exp_f, v_one));
         float64x2_t v_gf_base = vmulq_f64(vdivq_f64(v_Is, v_Vt), v_exp_f);
@@ -324,7 +325,7 @@ void batchBJTPhysics_neon(BJTTensor& tensor, const std::vector<double>& voltages
 
         // --- Reverse junction (BC) ---
         float64x2_t v_arg_r = vdivq_f64(v_v_bc, v_Vt);
-        float64x2_t v_arg_r_clamped = vminq_f64(v_arg_r, v_30);
+        float64x2_t v_arg_r_clamped = vminq_f64(v_arg_r, v_argmax);
         float64x2_t v_exp_r = vexp_f64(v_arg_r_clamped);
         float64x2_t v_ir_base = vmulq_f64(v_Is, vsubq_f64(v_exp_r, v_one));
         float64x2_t v_gr_base = vmulq_f64(vdivq_f64(v_Is, v_Vt), v_exp_r);
@@ -385,10 +386,10 @@ void batchBJTPhysics_neon(BJTTensor& tensor, const std::vector<double>& voltages
         double Vt = tensor.Vt[i];
         double BetaF = tensor.BetaF[i];
         double BetaR = tensor.BetaR[i];
-        double Vcrit = 30.0 * Vt;
+        double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * Vt;
 
         auto diode = [&](double vj) -> std::pair<double, double> {
-            double arg = std::min(vj / Vt, 30.0);
+            double arg = std::min(vj / Vt, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
             double ev = std::exp(arg);
             double ib = Is * (ev - 1.0);
             double gb = std::max(GMIN, (Is / Vt) * ev);

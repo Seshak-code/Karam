@@ -4,6 +4,7 @@
 // FMA: disabled (deterministic)
 
 #include "../tensors/physics_tensors.h"  // Tensor structs
+#include "../physics/physics_constants.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -41,7 +42,7 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
 
     // Pre-broadcast constants
     const __m256d vc_1 = _mm256_set1_pd(1.0);
-    const __m256d vc_30 = _mm256_set1_pd(30.0);
+    const __m256d vc_argmax = _mm256_set1_pd(PhysicsConstants::JUNCTION_EXP_ARG_MAX);
 
     size_t i = 0;
     // --- SIMD Loop: 4 devices per iteration ---
@@ -76,11 +77,11 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
         _mm256_storeu_pd(&tensor.v_d[i], v_v_d);
         __m256d v_n_vt = _mm256_mul_pd(v_N, v_Vt);
         __m256d v_arg = _mm256_div_pd(v_v_d, v_n_vt);
-        __m256d v_arg_clamped = _mm256_min_pd(v_arg, vc_30);
+        __m256d v_arg_clamped = _mm256_min_pd(v_arg, vc_argmax);
         __m256d v_exp_val = _mm256_exp_pd_fallback(v_arg_clamped);
         __m256d v_i_base = _mm256_mul_pd(_mm256_sub_pd(v_exp_val, vc_1), v_Is);
         __m256d v_g_base = _mm256_mul_pd(_mm256_div_pd(v_Is, v_n_vt), v_exp_val);
-        __m256d v_delta = _mm256_max_pd(_mm256_setzero_pd(), _mm256_sub_pd(v_v_d, _mm256_mul_pd(vc_30, v_n_vt)));
+        __m256d v_delta = _mm256_max_pd(_mm256_setzero_pd(), _mm256_sub_pd(v_v_d, _mm256_mul_pd(vc_argmax, v_n_vt)));
         __m256d v_i_d = _mm256_add_pd(_mm256_mul_pd(v_delta, v_g_base), v_i_base);
         _mm256_storeu_pd(&tensor.i_d[i], v_i_d);
         __m256d v_g_d = _mm256_max_pd(v_GMIN, v_g_base);
@@ -103,11 +104,11 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
         double v_d = tensor.v_d[i];
         double n_vt = (N * Vt);
         double arg = (v_d / n_vt);
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_val = std::exp(arg_clamped);
         double i_base = ((exp_val - 1.0) * Is);
         double g_base = ((Is / n_vt) * exp_val);
-        double delta = std::max(0.0, (v_d - (30.0 * n_vt)));
+        double delta = std::max(0.0, (v_d - (PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt)));
         tensor.i_d[i] = ((delta * g_base) + i_base);
         double i_d = tensor.i_d[i];
         tensor.g_d[i] = std::max(GMIN, g_base);

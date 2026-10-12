@@ -1,5 +1,6 @@
 #pragma once
 #include "gui_boundary_guard.h"
+#include "physics_constants.h"
 #include <cmath>
 #include <algorithm>
 
@@ -70,7 +71,7 @@ inline T diode_current(T vd, const DiodeParams<P>& p)
  * Handles linear continuation for convergence.
  */
 template <typename T, typename P>
-inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double max_arg = 30.0) 
+inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double max_arg = PhysicsConstants::JUNCTION_EXP_ARG_MAX) 
 {
     // NASA Optimization: Keep params as scalars where possible
     auto n_vt = p.N * p.Vt;
@@ -106,7 +107,7 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
  * Safe version for NR iteration. Clamps exponent to prevent inf/nan.
  */
 template <typename T, typename P>
-inline T diode_current_clamped(T vd, const DiodeParams<P>& p, double max_arg = 30.0) 
+inline T diode_current_clamped(T vd, const DiodeParams<P>& p, double max_arg = PhysicsConstants::JUNCTION_EXP_ARG_MAX) 
 {
     // Delegate to unified model
     return diode_model_pair(vd, p, max_arg).first;
@@ -133,8 +134,10 @@ template <typename T>
 inline T pnjlim(T vnew, T vold, T vt, T vcrit) {
     T vlim = vnew;
     
-    // Bypass limiting if we are in the linear continuation region (defined as > 30*Vt in physics)
-    if (vold > T(30.0) * vt && vnew > T(30.0) * vt) {
+    // Bypass limiting in the linear continuation region (above the model's
+    // exponent cap) — must track JUNCTION_EXP_ARG_MAX or junctions between
+    // the two thresholds go unlimited.
+    if (vold > T(PhysicsConstants::JUNCTION_EXP_ARG_MAX) * vt && vnew > T(PhysicsConstants::JUNCTION_EXP_ARG_MAX) * vt) {
         return vnew;
     }
     

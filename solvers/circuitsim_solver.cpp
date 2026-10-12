@@ -206,17 +206,26 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       std::vector<double> sol = gpuSolver.runHybridNRLoop(
           netlist, GPU_MAX_ITER, GPU_TOL, GPU_GMIN, /*time=*/0.0, /*h=*/0.0);
       if (!sol.empty() && gpuSolver.lastRunConverged) {
-        // Real KCL residual on the GPU-produced solution (same metric as CPU)
+        // The GPU loop only checks voltage deltas on the devices it stamps
+        // (no E/F/G/H, JFETs, subcircuit instances, ...), so a circuit it
+        // half-ignores can "converge". Accept only if the solution passes the
+        // CPU's own acceptance test against the FULL-netlist KCL audit.
+        scheduler.schedule(netlist); // audit walks subcircuit instances via jobs
         double kcl_err = calculatePhysicalResiduals(netlist, sol);
-        return {0.0,
-                sol,
-                {GPU_MAX_ITER, kcl_err, true},
-                netlist.globalBlock.topologyHash};
+        if (checkConvergence(sol, sol, kcl_err, PhysicsConstants::KCL_TOL)) {
+          return {0.0,
+                  sol,
+                  {gpuSolver.lastRunIterations, kcl_err, true},
+                  netlist.globalBlock.topologyHash};
+        }
+        std::cerr << "[WARN] WebGPUSolver result failed KCL audit (max residual="
+                  << kcl_err << " A), falling back to CPU.\n";
+      } else {
+        std::cerr << "[WARN] WebGPUSolver did not converge (lastRunConverged="
+                  << (gpuSolver.lastRunConverged ? "true" : "false")
+                  << ", sol.empty=" << (sol.empty() ? "true" : "false")
+                  << "), falling back to CPU.\n";
       }
-      std::cerr << "[WARN] WebGPUSolver did not converge (lastRunConverged="
-                << (gpuSolver.lastRunConverged ? "true" : "false")
-                << ", sol.empty=" << (sol.empty() ? "true" : "false")
-                << "), falling back to CPU.\n";
     } else {
       std::cerr << "[WARN] WebGPUSolver init failed, falling back to CPU.\n";
     }
@@ -457,10 +466,17 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
             // Execute GPU contraction sweep
             std::vector<double> gpuSol = gpuContractor.executeContractionSweep(
                 netlist.numGlobalNodes, gmin_factor);
-            if (!gpuSol.empty()) {
+            if (gpuSol.size() == static_cast<size_t>(matrix.rows)) {
+              // Real ||Ax - b|| against the CPU-assembled system (was hard-coded
+              // 0.0, which disabled the poor-residual fallback below).
+              std::vector<double> Ax(gpuSol.size(), 0.0);
+              matrixMultiplication(matrix, gpuSol.data(), Ax.data());
+              double r2 = 0.0;
+              for (size_t i = 0; i < Ax.size(); ++i)
+                r2 += (Ax[i] - rhsVector[i]) * (Ax[i] - rhsVector[i]);
               result.solution = gpuSol;
-              result.converged = true;
-              result.finalResidual = 0.0;
+              result.converged = std::isfinite(r2);
+              result.finalResidual = std::sqrt(r2);
             }
             // Fallback: if GPU path returned empty, fall through to CPU below
             if (!result.converged) {
@@ -563,7 +579,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                             netlist.environment.ambient_temp_K);
 
       // Check 1 + 2: Voltage Convergence AND Physical KCL Accuracy
-      double kcl_error = calculatePhysicalResiduals(netlist, v_new);
+      double kcl_error = kclExcess(netlist, v_new, matrix);
 
       // Limit Cycle Breaker: Damping
       // If residual is not improving, dampen the step to force a different path
@@ -574,7 +590,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
           v_new[i] = voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
         }
         // Re-evaluate residual after damping
-        kcl_error = calculatePhysicalResiduals(netlist, v_new);
+        kcl_error = kclExcess(netlist, v_new, matrix);
 
         // If still bad, dampen again (aggressive backoff)
         if (kcl_error >= final_kcl_error) {
@@ -582,7 +598,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
             v_new[i] =
                 voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
           }
-          kcl_error = calculatePhysicalResiduals(netlist, v_new);
+          kcl_error = kclExcess(netlist, v_new, matrix);
         }
       }
       // Record convergence step for diagnostics
@@ -784,6 +800,8 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
       const auto &hist = netlist.globalState.capacitorState[i];
       if (!hist.v.empty())
         soaBlock.capacitors.v_prev[i] = hist.v[0];
+      if (hist.v.size() > 1)
+        soaBlock.capacitors.v_prev2[i] = hist.v[1];
       if (!hist.i.empty())
         soaBlock.capacitors.i_prev[i] = hist.i[0];
     }
@@ -825,7 +843,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
 
       std::vector<double> v_new = subResult.solution;
 
-      double kcl_error = calculatePhysicalResiduals(netlist, v_new, dt_sub);
+      double kcl_error = kclExcess(netlist, v_new, A, dt_sub, dt_sub * (k + 1));
       if (checkConvergence(v_new, nrEstimate, kcl_error,
                            PhysicsConstants::KCL_TOL)) {
         nrEstimate = v_new;
@@ -863,6 +881,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
 
       integrator->updateHistory(hist.v, hist.i, v_cap_new, i_curr);
     }
+    lteController_.recordStep(dt_sub);
     // Note: Inductor history write-back is not performed here, consistent with
     // stepTransient which also does not write back inductorState in its main
     // history-update block.  The soaBlock re-sync at the top of each sub-step
@@ -894,6 +913,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   if (!arbiterInitialized) {
     arbiter.initialize(netlist);
     arbiterInitialized = true;
+    lteController_.reset();
 
     // M4: Enforce Formal Passivity
     if (!arbiter.checkPassivity(netlist)) {
@@ -941,6 +961,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
     const auto &hist = netlist.globalState.capacitorState[i];
     if (!hist.v.empty())
       soaBlock.capacitors.v_prev[i] = hist.v[0];
+    if (hist.v.size() > 1)
+      soaBlock.capacitors.v_prev2[i] = hist.v[1];
     if (!hist.i.empty())
       soaBlock.capacitors.i_prev[i] = hist.i[0];
   }
@@ -1020,7 +1042,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
         std::vector<double> v_new = lastResult.solution;
 
         double kcl_error =
-            calculatePhysicalResiduals(netlist, v_new, actualTimeStep);
+            kclExcess(netlist, v_new, A, actualTimeStep, currentTime + actualTimeStep);
         if (checkConvergence(v_new, nrEstimate, kcl_error,
                              PhysicsConstants::KCL_TOL)) {
           nrEstimate = v_new;
@@ -1146,6 +1168,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       }
       integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
     }
+
+    lteController_.recordStep(actualTimeStep);
 
     // Restore TRAPEZOIDAL after the first step (which used Backward Euler
     // for cold-start accuracy).  The restore must happen AFTER the cap

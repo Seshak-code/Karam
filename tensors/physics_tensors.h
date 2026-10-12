@@ -281,6 +281,7 @@ struct CapacitorTensor {
     std::vector<int> plates2;
     std::vector<double> C;         // Capacitance [F]
     std::vector<double> v_prev;    // Voltage at t-1
+    std::vector<double> v_prev2;   // Voltage at t-2 (Gear2)
     std::vector<double> i_prev;    // Current at t-1
     
     size_t size() const { return plates1.size(); }
@@ -290,12 +291,13 @@ struct CapacitorTensor {
         plates2.push_back(p2);
         C.push_back(c);
         v_prev.push_back(0.0);
+        v_prev2.push_back(0.0);
         i_prev.push_back(0.0);
     }
     
     void clear() {
         plates1.clear(); plates2.clear(); C.clear();
-        v_prev.clear(); i_prev.clear();
+        v_prev.clear(); v_prev2.clear(); i_prev.clear();
     }
 };
 

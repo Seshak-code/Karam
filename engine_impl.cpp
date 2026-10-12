@@ -81,19 +81,22 @@ static JobID generateJobID() {
 
 // ── Internal Netlist Deserializer ─────────────────────────────────────────
 // Delegates to the full SPICE3f5 parser (netlist/spice_parser.h).
-// Handles all standard elements: R, C, L, K, V, I, D, M, Q, J, E, G, H, F, T, X.
+// Handles R, C, L, K, V, I, D, M, Q, J, E, G, X; rejects unsupported cards.
 // Supports .model, .subckt/.ends, .param, waveform specs (PULSE, SIN), and SI suffixes.
-static TensorNetlist deserialiseRequest(const SimulationRequestDTO& req) {
-    if (req.source.payload.empty()) return TensorNetlist{};
-
+// Returns false (filling `failure`) on a parse error. It used to be logged and the
+// partial (or empty) netlist solved anyway, reporting "converged".
+static bool deserialiseRequest(const SimulationRequestDTO& req, TensorNetlist& out,
+                               SimulationResponseDTO& failure, bool* tranUIC = nullptr) {
     SPICEParser parser;
     auto result = parser.parse(req.source.payload);
-
     if (!result.success) {
-        std::cerr << "[AcuteSim] SPICE parse error: " << result.errorMessage << "\n";
+        failure.converged   = false;
+        failure.errorDetail = "SPICE parse error: " + result.errorMessage;
+        return false;
     }
-
-    return std::move(result.netlist);
+    if (tranUIC) *tranUIC = result.tranUIC;
+    out = std::move(result.netlist);
+    return true;
 }
 
 // ============================================================================
@@ -144,13 +147,9 @@ SimulationResponseDTO SessionImpl::runDC(const SimulationRequestDTO& req,
 
 SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestDTO& req,
                                                           const EngineCallbacks& cb) {
-    TensorNetlist netlist = deserialiseRequest(req);
-    if (netlist.numGlobalNodes == 0 && req.source.payload.empty()) {
-        SimulationResponseDTO r;
-        r.converged = false;
-        r.errorDetail = "Empty or invalid netlist.";
-        return r;
-    }
+    TensorNetlist netlist;
+    SimulationResponseDTO failure;
+    if (!deserialiseRequest(req, netlist, failure)) return failure;
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
@@ -176,7 +175,9 @@ SimulationResponseDTO SessionImpl::runAC(const SimulationRequestDTO& req,
 
 SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestDTO& req,
                                                           const EngineCallbacks& cb) {
-    TensorNetlist netlist = deserialiseRequest(req);
+    TensorNetlist netlist;
+    SimulationResponseDTO failure;
+    if (!deserialiseRequest(req, netlist, failure)) return failure;
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
 
@@ -207,15 +208,22 @@ SimulationResponseDTO SessionImpl::runTransient(const SimulationRequestDTO& req,
 SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationRequestDTO& req,
                                                             const EngineCallbacks& cb,
                                                             ResultChunkCallback streamCb) {
-    TensorNetlist netlist = deserialiseRequest(req);
+    TensorNetlist netlist;
+    SimulationResponseDTO failure;
+    bool uic = false;
+    if (!deserialiseRequest(req, netlist, failure, &uic)) return failure;
     const double  stopTime = req.transient.stopTimeS;
     const double  dt       = req.transient.stepSizeS;
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
 
-    // DC bias
-    SolverStep dcStep = sim.solveDC(netlist);
+    // DC bias. With UIC, SPICE skips it; required here too, because e.g. an
+    // op-amp integrator has no DC feedback path (the "operating point" is the
+    // open-loop rail, ~1e6 V) and the transient would never get to run.
+    // ponytail: the DC solution is only a gate — the transient still starts
+    // from zero state even without UIC; seeding history from it is the upgrade.
+    SolverStep dcStep = uic ? SolverStep{0.0, {}, {0, 0.0, true}, 0} : sim.solveDC(netlist);
     if (!dcStep.stats.converged) {
         SimulationResponseDTO r;
         r.converged   = false;
@@ -224,31 +232,53 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     }
 
     SimulationResponseDTO result;
+    if (!(dt > 0.0) || !(stopTime > 0.0)) {
+        result.converged   = false;
+        result.errorDetail = "Transient needs step > 0 and stop time > 0.";
+        return result;
+    }
     result.converged = true;
     double currentTime = 0.0;
     uint64_t stepIdx   = 0;
 
-    while (currentTime < stopTime) {
+    // A failed step returns converged=false at the SAME time; the old loop only
+    // checked for non-empty voltages, so it spun forever. Now: shrink h and
+    // retry, give up with an error below dtMin, regrow toward the user step.
+    const double dtMin = dt * 1e-9;
+    const double endTol = dt * 1e-9;  // absorb FP drift at the final step
+    double h = dt;
+    while (stopTime - currentTime > endTol) {
         if (status_.load() == JobStatus::Cancelled) {
             result.converged  = false;
             result.errorDetail = "Cancelled.";
             break;
         }
 
-        SolverStep step = sim.stepTransient(netlist, dt, currentTime);
-        if (!step.nodeVoltages.empty()) {
-            currentTime = step.time;
-            WaveformDataPoint pt;
-            pt.timeS        = currentTime;
-            pt.nodeVoltages = step.nodeVoltages;
-            result.waveformPoints.push_back(pt);
-
-            if (streamCb) streamCb(pt, stepIdx);
-            cb.onTimeStep(currentTime, stopTime);
-        } else {
-            result.converged  = false;
-            break;
+        double hTry = std::min(h, stopTime - currentTime);
+        SolverStep step = sim.stepTransient(netlist, hTry, currentTime);
+        if (!step.stats.converged || !(step.time > currentTime)) {
+            h = hTry * 0.25;
+            if (h < dtMin) {
+                std::ostringstream msg;  // default float format: 1e-14, not 0.000000
+                msg << "Transient step failed to converge at t=" << currentTime
+                    << " s (timestep below " << dtMin << " s).";
+                result.converged   = false;
+                result.errorDetail = msg.str();
+                break;
+            }
+            continue;
         }
+
+        double taken = step.time - currentTime;
+        currentTime = step.time;
+        WaveformDataPoint pt;
+        pt.timeS        = currentTime;
+        pt.nodeVoltages = step.nodeVoltages;
+        result.waveformPoints.push_back(pt);
+
+        if (streamCb) streamCb(pt, stepIdx);
+        cb.onTimeStep(currentTime, stopTime);
+        h = std::min(dt, taken * 2.0);
         ++stepIdx;
     }
 
