@@ -10,6 +10,8 @@
  * Phase 1 Hardening: Refactored for NASA-style safety.
  */
 
+#include <sstream>
+
 #include "../infrastructure/adaptive_precision.h"
 #include "../infrastructure/compiled_block.h"
 #include "../infrastructure/mpo_builder.h"
@@ -278,21 +280,18 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       // Sparse Merge (D5): Use cached pattern for O(N) assembly on iterations >
       // 0
       Csr_matrix matrix;
-      bool patternValid =
-          cachedPattern_ &&
-          cachedPatternHash_ == netlist.globalBlock.topologyHash;
+      bool patternValid = false;
+      if (cachedPattern_ && cachedPattern_->rows == nTot)
+        matrix = matrixBuilder.assembleFast(*cachedPattern_, &patternValid);
       if (!patternValid) {
         cachedPattern_ =
             std::make_unique<CachedCsrPattern>(matrixBuilder.buildPattern());
-        cachedPatternHash_ = netlist.globalBlock.topologyHash;
         matrix = matrixBuilder.createCsr();
 
         // Topology changed: drop history tied to the old unknown vector
         prevVoltages_.clear();
         // Gap 4: Reset seeder history on topology change
         neuralSeeder_.reset();
-      } else {
-        matrix = matrixBuilder.assembleFast(*cachedPattern_);
       }
 
       // Tensor-contraction direct solver for every circuit (the legacy
@@ -619,6 +618,115 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
   }
 }
 
+// t = 0 reactive state from x (DC operating point, or the UIC node voltages):
+// capacitors hold their voltage at zero current, inductors their current at
+// zero voltage, so the first step starts in equilibrium. With UIC an element's
+// own IC= wins (SPICE3: unspecified nodes are 0 V, inductor currents 0 A).
+void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<double> &x,
+                                     bool uic) {
+  auto getV = [&](int n) { return (n > 0 && n <= (int)x.size()) ? x[n - 1] : 0.0; };
+  int total = 0;
+  const auto branchList = branchSlots(netlist, total);  // same block order as below
+  size_t slot = 0;
+  auto seed = [&](const TensorBlock &blk, BlockState &st, const std::function<int(int)> &mapNode) {
+    const int indBase = slot < branchList.size() ? branchList[slot++].ind : -1;
+    for (size_t a = 0; a < blk.inductors.size() && a < st.inductorState.size(); ++a) {
+      const auto &L = blk.inductors[a];
+      const int b = indBase + (int)a;
+      const double i0 = uic ? (L.icGiven ? L.ic_A : 0.0)
+                            : (indBase >= 0 && b < (int)x.size() ? x[b] : 0.0);
+      st.inductorState[a].v.assign(3, 0.0);
+      st.inductorState[a].i.assign(3, i0);
+    }
+    for (size_t i = 0; i < blk.capacitors.size() && i < st.capacitorState.size(); ++i) {
+      const auto &c = blk.capacitors[i];
+      const double v0 = (uic && c.icGiven) ? c.ic_V
+                                           : getV(mapNode(c.nodePlate1)) - getV(mapNode(c.nodePlate2));
+      st.capacitorState[i].v.assign(3, v0);
+      st.capacitorState[i].i.assign(3, 0.0);
+    }
+  };
+  seed(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
+  for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
+    const auto &inst = netlist.instances[k];
+    auto it = netlist.blockDefinitions.find(inst.blockName);
+    if (it == netlist.blockDefinitions.end()) continue;
+    seed(it->second, netlist.instanceStates[k], [&](int n) {
+      return (n <= 0 || n > (int)inst.nodeMapping.size()) ? 0 : inst.nodeMapping[n - 1];
+    });
+  }
+}
+
+std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double stop, bool uic,
+                                     const std::function<bool(const SolverStep &)> &onPoint) {
+  if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step > 0 and stop time > 0.";
+
+  const int nTot = systemSize(netlist);
+  std::vector<double> x0(nTot, 0.0);
+  if (uic) {
+    for (const auto &[n, v] : netlist.nodeICs)
+      if (n > 0 && n <= netlist.numGlobalNodes) x0[n - 1] = v;
+  } else {
+    // DC bias. SPICE3 forces .ic nodes during it through 1e10 S to the value
+    // (Norton: 1e-10 ohm to ground plus v*1e10 A in). UIC skips it, which an
+    // op-amp integrator without DC feedback needs (its OP is the open-loop rail).
+    TensorNetlist forced;
+    if (!netlist.nodeICs.empty()) {
+      forced = netlist;
+      for (const auto &[n, v] : netlist.nodeICs) {
+        forced.addResistor(n, 0, 1e-10);
+        forced.addCurrentSource(0, n, v * 1e10);
+      }
+    }
+    SolverStep dc = solveDC(netlist.nodeICs.empty() ? netlist : forced);
+    if (!dc.stats.converged)
+      return "DC bias failed." + (dc.stats.error_detail.empty() ? "" : " " + dc.stats.error_detail);
+    x0 = lastSolution_;
+    x0.resize(nTot, 0.0);
+  }
+  seedReactiveHistory(netlist, x0, uic);
+  lastSolution_ = x0;  // seeds the first Newton iteration
+
+  // Waveform sources whose corners the steps must land on (SPICE breakpoints).
+  // ponytail: scans every waveform source per step; a merged corner queue is
+  // the upgrade if designs carry thousands of PULSE sources.
+  std::vector<std::function<double(double)>> corners;
+  auto addCorners = [&](const TensorBlock &b) {
+    for (const auto &v : b.voltageSources)
+      if (v.type == "PULSE" || v.type == "SINE") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
+    for (const auto &i : b.currentSources)
+      if (i.type == "PULSE" || i.type == "SINE") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
+  };
+  addCorners(netlist.globalBlock);
+  for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);
+
+  // A failed step returns converged=false at the SAME time: shrink h and
+  // retry, give up below dtMin, regrow toward the user step.
+  const double dtMin = step * 1e-9;
+  const double endTol = step * 1e-9;  // absorb FP drift at the final step
+  double h = step, t = 0.0;
+  while (stop - t > endTol) {
+    double hTry = std::min(h, stop - t);
+    for (const auto &next : corners) hTry = std::min(hTry, next(t + endTol) - t);
+    SolverStep s = stepTransient(netlist, hTry, t);
+    if (!s.stats.converged || !(s.time > t)) {
+      h = hTry * 0.25;
+      if (h < dtMin) {
+        std::ostringstream msg;  // default float format: 1e-14, not 0.000000
+        msg << "Transient step failed to converge at t=" << t << " s (timestep below " << dtMin
+            << " s).";
+        return msg.str();
+      }
+      continue;
+    }
+    const double taken = s.time - t;
+    t = s.time;
+    if (!onPoint(s)) return "Cancelled.";
+    h = std::min(step, taken * 2.0);
+  }
+  return "";
+}
+
 bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
                                 int nSubsteps,
                                 std::vector<double> &finalVoltages) {
@@ -831,15 +939,11 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
         continue;
       }
 
-      // ─── Gap 5: Ringing-Aware Method Arbiter ─────────────────────────
-      // Check for trapezoidal ringing (2h-oscillations) and switch to Gear2
-      // if detected. This replaces the hard-coded suggestion == 2 path.
-      IntegrationType suggestedMethod =
-          lteController_.selectMethod(nrEstimate, integrator->getType());
-      if (suggestedMethod != integrator->getType()) {
-        setIntegrationMethod(suggestedMethod);
-        // Don't retry — the method switch affects the NEXT step, not this one
-      }
+      // ponytail: no automatic TRAP -> GEAR_2 switch on "ringing" (here or for
+      // arbiter suggestion 2 below). Every GEAR_2 formula (stamps, audit, history,
+      // inductor rows) has constant-step BDF2 coefficients, and the switch came
+      // when h was changing: each switch injected a jump (~40 mV in
+      // hier_rc_ladder_pulse). Variable-step BDF2 coefficients are the upgrade.
 
       // Original arbiter stability analysis (energy monitor, Lyapunov check)
       // The arbiter tracks node voltages only (it re-initialises on a size change)
@@ -852,11 +956,6 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
         actualTimeStep *= 0.5;
         attempt++;
         continue;
-      } else if (suggestion == 2) {
-        if (integrator->getType() == IntegrationType::TRAPEZOIDAL) {
-          setIntegrationMethod(IntegrationType::GEAR_2);
-          continue;
-        }
       }
 
       // Use LTE-based timestep suggestion if it's more conservative

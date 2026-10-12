@@ -113,16 +113,18 @@ static SimulationResponseDTO fourierHandler(
 
     std::vector<double> timeVec;
     std::vector<double> waveform;
-    double dt = 1e-5;
-    double t  = 0.0;
-    while (t < stopTime) {
-        SolverStep step = sim.stepTransient(runNetlist, dt, t);
-        t = step.time;
-        timeVec.push_back(t);
-        double v = (probeNode - 1 < (int)step.nodeVoltages.size())
-                   ? step.nodeVoltages[probeNode - 1] : 0.0;
-        waveform.push_back(v);
-        if (!step.stats.converged) break;
+    const std::string err = sim.runTransient(runNetlist, 1e-5, stopTime, req.transient.uic,
+        [&](const SolverStep& step) {
+            timeVec.push_back(step.time);
+            waveform.push_back(probeNode - 1 < (int)step.nodeVoltages.size()
+                               ? step.nodeVoltages[probeNode - 1] : 0.0);
+            return true;
+        });
+    if (!err.empty()) {
+        SimulationResponseDTO errOut;
+        errOut.success     = false;
+        errOut.errorDetail = err;
+        return errOut;
     }
 
     return runFourierAnalysis(runNetlist, timeVec, waveform, req);

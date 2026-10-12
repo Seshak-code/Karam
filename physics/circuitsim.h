@@ -429,9 +429,9 @@ public:
   std::unique_ptr<IIntegrationMethod> integrator;
   ExecutionMode execMode = ExecutionMode::LEGACY_AOS;
 
-  // CSR pattern cache (Sparse Merge — Phase D5): frozen per topology change
+  // CSR pattern cache (Sparse Merge — Phase D5): rebuilt when a stamp falls
+  // outside it (the topology hash ignores sources and node numbering)
   std::unique_ptr<CachedCsrPattern> cachedPattern_;
-  uint64_t cachedPatternHash_ = 0;  // topology hash when pattern was last built
 
   // Default linear solver: tensor-contraction plan, rebuilt only when the
   // Jacobian's sparsity pattern (circuit topology) changes.
@@ -1181,6 +1181,14 @@ public:
 
   SolverStep solveDC(TensorNetlist &netlist);
   SolverStep stepTransient(TensorNetlist &netlist, double timeStep, double currentTime);
+
+  // The one transient loop (session, GUI driver, Fourier). t = 0 state: the DC
+  // operating point with .ic nodes forced, or with `uic` the .ic / IC= values.
+  // Steps to `stop` at `step`; a failed step retries at h/4 (down to step*1e-9)
+  // and regrows. `onPoint` gets each accepted step and returns false to cancel.
+  // Returns an empty string on success, else the error.
+  std::string runTransient(TensorNetlist &netlist, double step, double stop, bool uic,
+                           const std::function<bool(const SolverStep &)> &onPoint);
   
   // ── New API: Solver operates on pre-compiled block only ─────────────
   SolverStep solveDC(const CompiledTensorBlock& block);
@@ -1295,6 +1303,7 @@ private:
   /** Capacitor + inductor history after an accepted step (global + instances),
    *  using the same companion formulas as the stamps and the KCL audit. */
   void updateReactiveHistory(TensorNetlist& netlist, const std::vector<double>& v, double h);
+  void seedReactiveHistory(TensorNetlist& netlist, const std::vector<double>& x, bool uic);
 
   /** Last full solution x (node voltages + branch currents). */
   std::vector<double> lastSolution_;

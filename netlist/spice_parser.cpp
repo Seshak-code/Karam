@@ -173,6 +173,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     nextNode_ = 1;
     inSubckt_ = false;
     topInstances_.clear();
+    pendingICs_.clear();
     subcktChildren_.clear();
     modelCards_.clear();
     params_.clear();
@@ -228,6 +229,17 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                     }
                     for (const auto& t : tok)
                         if (toUpper(t) == "UIC") result_.tranUIC = true;
+                }
+                else if (keyword == ".IC") {
+                    // .ic V(node)=value ...  → tokens: V node value
+                    if (inSubckt_) throw std::runtime_error(".ic inside .subckt is not supported");
+                    if (tok.size() < 4 || (tok.size() - 1) % 3 != 0)
+                        throw std::runtime_error(".ic expects V(node)=value entries");
+                    for (size_t i = 1; i + 2 < tok.size(); i += 3) {
+                        if (toUpper(tok[i]) != "V")
+                            throw std::runtime_error(".ic supports V(node)=value only");
+                        pendingICs_.push_back({toUpper(tok[i + 1]), parseValue(tok[i + 2]), lineNum});
+                    }
                 }
                 else if (keyword == ".AC")  result_.hasAC = true;
                 else if (keyword == ".DC")  result_.hasDC = true;
@@ -287,6 +299,14 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     for (const auto& [name, idx] : nodeMap_) {
         if (idx > result_.netlist.numGlobalNodes)
             result_.netlist.numGlobalNodes = idx;
+    }
+
+    // .ic may name a node defined later in the file
+    for (const auto& ic : pendingICs_) {
+        auto it = nodeMap_.find(ic.node);
+        if (it == nodeMap_.end())
+            return fail(ic.line, ".ic names unknown node '" + ic.node + "'");
+        result_.netlist.nodeICs.push_back({it->second, ic.value});
     }
 
     // Expand X cards (recursively) now that every .subckt is defined
@@ -376,13 +396,13 @@ void SPICEParser::parseCapacitor(const std::vector<std::string>& tok, TensorBloc
     c.nodePlate2 = nodeIndex(tok[2]);
     c.capacitance_farads = parseValue(tok[3]);
 
-    // tokenize() turns "KEY=val" into ["KEY", "val"]. IC= is accepted and
-    // ignored: transient always starts from zero state (UIC with IC=0).
+    // tokenize() turns "KEY=val" into ["KEY", "val"]. IC= applies with UIC.
     for (size_t i = 4; i + 1 < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (upper == "W")      c.width_m  = parseValue(tok[++i]);
         else if (upper == "L") c.length_m = parseValue(tok[++i]);
         else if (upper == "M") c.m        = parseValue(tok[++i]);
+        else if (upper == "IC") { c.ic_V = parseValue(tok[++i]); c.icGiven = true; }
     }
     blk.capacitors.push_back(c);
 }
@@ -394,6 +414,13 @@ void SPICEParser::parseInductor(const std::vector<std::string>& tok, TensorBlock
     ind.nodeCoil1 = nodeIndex(tok[1]);
     ind.nodeCoil2 = nodeIndex(tok[2]);
     ind.inductance_henries = parseValue(tok[3]);
+    // IC= (initial current) applies with UIC; anything else used to be ignored silently
+    for (size_t i = 4; i < tok.size(); ++i) {
+        if (toUpper(tok[i]) != "IC" || i + 1 >= tok.size())
+            throw std::runtime_error(tok[0] + ": unsupported inductor parameter '" + tok[i] + "'");
+        ind.ic_A = parseValue(tok[++i]);
+        ind.icGiven = true;
+    }
 
     // Track inductor by name for K-statement resolution
     inductorIndex_[toUpper(tok[0])] = static_cast<int>(blk.inductors.size());

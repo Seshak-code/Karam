@@ -437,8 +437,10 @@ public:
    * Avoids sort+dedup; produces a CSR matrix with the same sparsity as 'pattern'
    * but with freshly accumulated values from the current stamp buffers.
    * Result is bit-identical to createCsr() for the same stamp sequence.
+   * A stamp outside the pattern is dropped; `complete` (if given) reports it.
    */
-  Csr_matrix assembleFast(const CachedCsrPattern& pattern) {
+  Csr_matrix assembleFast(const CachedCsrPattern& pattern, bool* complete = nullptr) {
+      if (complete) *complete = true;
       // Zero-init values
       Csr_matrix matrix;
       matrix.rows        = pattern.rows;
@@ -458,6 +460,8 @@ public:
               int idx = pattern.indexOf(rows[k], cols[k]);
               if (idx >= 0) {
                   matrix.values[static_cast<size_t>(idx)] += vals[k];
+              } else if (complete) {
+                  *complete = false;
               }
           }
       }

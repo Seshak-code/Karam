@@ -3,6 +3,7 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <set>
 #include <cassert>
@@ -91,6 +92,9 @@ struct Capacitor {
     
     double tolerance_percent = 0.0;
     std::string expression;         // Symbolic override for capacitance
+
+    bool   icGiven = false;           // IC= (initial voltage), used only with UIC
+    double ic_V    = 0.0;
 };
 
 /*
@@ -117,6 +121,9 @@ struct Inductor {
     int turns = 0;                // Number of turns
 
     std::string expression;       // Symbolic override for inductance
+
+    bool   icGiven = false;       // IC= (initial current), used only with UIC
+    double ic_A    = 0.0;
 };
 
 /*
@@ -209,8 +216,7 @@ struct CurrentSource {
  * Instantaneous value of an independent V or I source at time t (transient).
  * The single definition shared by the parser (t=0 DC value), both stamping
  * paths and the KCL audit, so they can never disagree on a source's value.
- * ponytail: no breakpoint control — a timestep may straddle a PULSE edge and
- * only LTE rejection reacts; SPICE-style breakpoints are the upgrade path.
+ * The transient lands on its corners via nextBreakpoint() below.
  */
 template <class Src>
 inline double waveformValue(const Src& s, double dcValue, double t) {
@@ -234,6 +240,28 @@ inline double waveformValue(const Src& s, double dcValue, double t) {
                                std::sin(2.0 * kPi * s.sine_freq * tt + phase);
     }
     return dcValue;
+}
+
+/*
+ * First corner of waveformValue() strictly after t (PULSE edges, SIN start);
+ * +inf if none. Corners are where the waveform's derivative jumps: a step that
+ * straddles one integrates a kink as if it were smooth.
+ */
+template <class Src>
+inline double nextBreakpoint(const Src& s, double t) {
+    const double inf = std::numeric_limits<double>::infinity();
+    if (s.type == "SINE") return t < s.sine_td ? s.sine_td : inf;
+    if (s.type != "PULSE") return inf;
+    const double c[4] = {0.0, s.pulse_tr, s.pulse_tr + s.pulse_pw, s.pulse_tr + s.pulse_pw + s.pulse_tf};
+    const double per = s.pulse_per > 0.0 ? s.pulse_per : inf;
+    // this period, then the next (k * per would be 0 * inf = NaN for a single pulse)
+    double k = t < s.pulse_td ? 0.0 : std::floor((t - s.pulse_td) / per);
+    for (int p = 0; p < 2; ++p, ++k) {
+        const double base = s.pulse_td + (k == 0.0 ? 0.0 : k * per);
+        for (double ci : c)
+            if (base + ci > t) return base + ci;
+    }
+    return inf;
 }
 
 // ============================================================================
@@ -1113,6 +1141,10 @@ public:
 
     // SPICE .MODEL card library
     std::map<std::string, ModelCard> modelCards;
+
+    // .ic V(node)=value: forced during the transient's DC bias, or the initial
+    // node voltages with UIC
+    std::vector<std::pair<int, double>> nodeICs;
 
     void addModelCard(const ModelCard& card) {
         modelCards[card.name] = card;

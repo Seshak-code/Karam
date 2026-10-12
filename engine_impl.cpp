@@ -218,69 +218,22 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
 
-    // DC bias. With UIC, SPICE skips it; required here too, because e.g. an
-    // op-amp integrator has no DC feedback path (the "operating point" is the
-    // open-loop rail, ~1e6 V) and the transient would never get to run.
-    // ponytail: the DC solution is only a gate — the transient still starts
-    // from zero state even without UIC; seeding history from it is the upgrade.
-    SolverStep dcStep = uic ? SolverStep{0.0, {}, {0, 0.0, true}, 0} : sim.solveDC(netlist);
-    if (!dcStep.stats.converged) {
-        SimulationResponseDTO r;
-        r.converged   = false;
-        r.errorDetail = "DC bias failed.";
-        return r;
-    }
-
     SimulationResponseDTO result;
-    if (!(dt > 0.0) || !(stopTime > 0.0)) {
-        result.converged   = false;
-        result.errorDetail = "Transient needs step > 0 and stop time > 0.";
-        return result;
-    }
-    result.converged = true;
-    double currentTime = 0.0;
-    uint64_t stepIdx   = 0;
-
-    // A failed step returns converged=false at the SAME time; the old loop only
-    // checked for non-empty voltages, so it spun forever. Now: shrink h and
-    // retry, give up with an error below dtMin, regrow toward the user step.
-    const double dtMin = dt * 1e-9;
-    const double endTol = dt * 1e-9;  // absorb FP drift at the final step
-    double h = dt;
-    while (stopTime - currentTime > endTol) {
-        if (status_.load() == JobStatus::Cancelled) {
-            result.converged  = false;
-            result.errorDetail = "Cancelled.";
-            break;
-        }
-
-        double hTry = std::min(h, stopTime - currentTime);
-        SolverStep step = sim.stepTransient(netlist, hTry, currentTime);
-        if (!step.stats.converged || !(step.time > currentTime)) {
-            h = hTry * 0.25;
-            if (h < dtMin) {
-                std::ostringstream msg;  // default float format: 1e-14, not 0.000000
-                msg << "Transient step failed to converge at t=" << currentTime
-                    << " s (timestep below " << dtMin << " s).";
-                result.converged   = false;
-                result.errorDetail = msg.str();
-                break;
-            }
-            continue;
-        }
-
-        double taken = step.time - currentTime;
-        currentTime = step.time;
-        WaveformDataPoint pt;
-        pt.timeS        = currentTime;
-        pt.nodeVoltages = step.nodeVoltages;
-        result.waveformPoints.push_back(pt);
-
-        if (streamCb) streamCb(pt, stepIdx);
-        cb.onTimeStep(currentTime, stopTime);
-        h = std::min(dt, taken * 2.0);
-        ++stepIdx;
-    }
+    uint64_t stepIdx = 0;
+    const std::string err = sim.runTransient(
+        netlist, dt, stopTime, uic || req.transient.uic, [&](const SolverStep& step) {
+            if (status_.load() == JobStatus::Cancelled) return false;
+            WaveformDataPoint pt;
+            pt.timeS        = step.time;
+            pt.nodeVoltages = step.nodeVoltages;
+            result.waveformPoints.push_back(pt);
+            if (streamCb) streamCb(pt, stepIdx);
+            cb.onTimeStep(step.time, stopTime);
+            ++stepIdx;
+            return true;
+        });
+    result.converged   = err.empty();
+    result.errorDetail = err;
 
     result.iterations = static_cast<int>(stepIdx);
     result.analysisType = AnalysisTypeDTO::TRANSIENT;

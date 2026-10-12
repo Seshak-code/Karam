@@ -192,77 +192,6 @@ public:
     }
 
     /**
-     * Method Arbiter: detect trapezoidal ringing and select integration method.
-     *
-     * Trapezoidal integration is 2nd-order accurate but can produce artificial
-     * ringing (2h-oscillations) on stiff circuits. Gear2 (BDF2) is also 2nd-order
-     * but is L-stable (damps all parasitic oscillations).
-     *
-     * Detection: If any node exhibits 3+ consecutive sign reversals in dv/dt,
-     * switch to Gear2. Return to Trapezoidal after 4 consecutive stable steps.
-     *
-     * @param v_curr   Current voltages
-     * @param current  Current integration method
-     * @return Recommended integration method
-     */
-    IntegrationType selectMethod(
-        const std::vector<double>& v_curr,
-        IntegrationType current)
-    {
-        // Update history
-        voltageHistory_.push_back(v_curr);
-        if (voltageHistory_.size() > 4) {
-            voltageHistory_.pop_front();
-        }
-
-        if (voltageHistory_.size() < 3) return current;
-
-        size_t N = v_curr.size();
-        bool ringingDetected = false;
-
-        // Check each node for sign reversals in dv/dt
-        for (size_t n = 0; n < N; ++n) {
-            int signChanges = 0;
-            for (size_t s = 2; s < voltageHistory_.size(); ++s) {
-                if (n >= voltageHistory_[s].size() ||
-                    n >= voltageHistory_[s-1].size() ||
-                    n >= voltageHistory_[s-2].size()) continue;
-
-                double dv_curr = voltageHistory_[s][n] - voltageHistory_[s-1][n];
-                double dv_prev = voltageHistory_[s-1][n] - voltageHistory_[s-2][n];
-
-                // Sign reversal with significant magnitude
-                if (dv_curr * dv_prev < 0.0 &&
-                    std::abs(dv_curr) > 1e-10 &&
-                    std::abs(dv_prev) > 1e-10) {
-                    signChanges++;
-                }
-            }
-            if (signChanges >= 2) {
-                ringingDetected = true;
-                break;
-            }
-        }
-
-        if (ringingDetected) {
-            stableStepCount_ = 0;
-            return IntegrationType::GEAR_2;
-        }
-
-        // If currently on Gear2, count stable steps before returning to Trap
-        if (current == IntegrationType::GEAR_2) {
-            stableStepCount_++;
-            if (stableStepCount_ >= 4) {
-                stableStepCount_ = 0;
-                return IntegrationType::TRAPEZOIDAL;
-            }
-            return IntegrationType::GEAR_2;
-        }
-
-        return current;
-    }
-
-    /**
      * Reset controller state (call on topology change).
      */
     /** Record an ACCEPTED step size (call once per history update). */
@@ -273,8 +202,6 @@ public:
 
     void reset() {
         stepHistory_.clear();
-        voltageHistory_.clear();
-        stableStepCount_ = 0;
     }
 
     // Configuration
@@ -286,8 +213,5 @@ private:
     double tolerance_;     // absolute LTE tolerance (default 1e-4)
     double trtol_;         // SPICE TRTOL multiplier (default 7.0)
 
-    // Ringing detection state
-    std::deque<std::vector<double>> voltageHistory_;  // last 4 voltage snapshots
     std::deque<double> stepHistory_;  // last accepted step sizes, most recent first
-    int stableStepCount_ = 0;  // consecutive non-ringing steps while on Gear2
 };

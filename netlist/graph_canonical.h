@@ -125,88 +125,71 @@ inline std::map<int, int> computeNodeDegrees(const std::vector<CanonicalEdge>& e
  * 
  * Algorithm:
  *   1. Start with node 0 (ground) as the first node.
- *   2. Sort remaining nodes by (degree, then by neighbor hash).
- *   3. Assign new labels in BFS order from ground.
- * 
- * This ensures that isomorphic graphs receive the same labeling.
+ *   2. Assign labels in BFS order from ground, visiting neighbours by
+ *      (degree, original index); unreachable nodes follow in that order.
+ *
+ * ponytail: ties are broken by original index, so this is not a true
+ * canonical form: isomorphic graphs can hash differently, and differently
+ * numbered isomorphic graphs can hash the same. Never use the hash as a key
+ * for anything indexed by node number.
  */
-inline std::map<int, int> canonicalRelabel(std::vector<CanonicalEdge>& edges) {
-    if (edges.empty()) return {};
-    
-    // Build adjacency list
-    std::map<int, std::set<int>> adj;
-    std::set<int> allNodes;
-    for (const auto& e : edges) {
-        adj[e.nodeMin].insert(e.nodeMax);
-        adj[e.nodeMax].insert(e.nodeMin);
-        allNodes.insert(e.nodeMin);
-        allNodes.insert(e.nodeMax);
+inline void canonicalRelabel(std::vector<CanonicalEdge>& edges) {
+    if (edges.empty()) return;
+
+    // Dense ids: position in the sorted unique node list (so id order == node order).
+    std::vector<int> nodes;
+    nodes.reserve(edges.size() * 2);
+    for (const auto& e : edges) { nodes.push_back(e.nodeMin); nodes.push_back(e.nodeMax); }
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    const int n = static_cast<int>(nodes.size());
+    auto id = [&](int node) {
+        return static_cast<int>(std::lower_bound(nodes.begin(), nodes.end(), node) - nodes.begin());
+    };
+
+    // Degree counts every edge endpoint (parallel edges count twice).
+    std::vector<int> a(edges.size()), b(edges.size()), deg(n, 0);
+    for (size_t k = 0; k < edges.size(); ++k) {
+        a[k] = id(edges[k].nodeMin); b[k] = id(edges[k].nodeMax);
+        ++deg[a[k]]; ++deg[b[k]];
     }
-    
-    // Compute initial node signatures (degree-based)
-    std::map<int, int> degrees = computeNodeDegrees(edges);
-    
-    // Sort nodes by degree (ascending), then by original index for ties
-    std::vector<int> sortedNodes(allNodes.begin(), allNodes.end());
-    std::sort(sortedNodes.begin(), sortedNodes.end(), [&](int a, int b) {
-        if (degrees[a] != degrees[b]) return degrees[a] < degrees[b];
-        return a < b;
-    });
-    
-    // BFS from ground (node 0) to assign canonical labels
-    std::map<int, int> newLabel;
-    int label = 0;
-    
-    // Ground is always 0
-    if (allNodes.count(0)) {
-        newLabel[0] = label++;
+    auto byDegree = [&](int x, int y) { return deg[x] != deg[y] ? deg[x] < deg[y] : x < y; };
+
+    // CSR adjacency; each row sorted by (degree, node) with duplicates removed.
+    std::vector<int> start(n + 1, 0), adj(edges.size() * 2);
+    for (size_t k = 0; k < edges.size(); ++k) { ++start[a[k] + 1]; ++start[b[k] + 1]; }
+    for (int i = 0; i < n; ++i) start[i + 1] += start[i];
+    std::vector<int> fill(start.begin(), start.end() - 1);
+    for (size_t k = 0; k < edges.size(); ++k) { adj[fill[a[k]]++] = b[k]; adj[fill[b[k]]++] = a[k]; }
+    std::vector<int> end(n);
+    for (int i = 0; i < n; ++i) {
+        std::sort(adj.begin() + start[i], adj.begin() + start[i + 1], byDegree);
+        end[i] = static_cast<int>(std::unique(adj.begin() + start[i], adj.begin() + start[i + 1]) - adj.begin());
     }
-    
-    // BFS queue
-    std::vector<int> queue;
-    if (allNodes.count(0)) {
-        queue.push_back(0);
+
+    // BFS from ground (node 0); visit neighbours in (degree, node) order.
+    std::vector<int> label(n, -1), queue;
+    queue.reserve(n);
+    int next = 0;
+    if (std::binary_search(nodes.begin(), nodes.end(), 0)) {
+        label[id(0)] = next++;
+        queue.push_back(id(0));
     }
-    
-    std::set<int> visited;
-    if (allNodes.count(0)) visited.insert(0);
-    
-    while (!queue.empty()) {
-        int current = queue.front();
-        queue.erase(queue.begin());
-        
-        // Get neighbors sorted by degree
-        std::vector<int> neighbors(adj[current].begin(), adj[current].end());
-        std::sort(neighbors.begin(), neighbors.end(), [&](int a, int b) {
-            if (degrees[a] != degrees[b]) return degrees[a] < degrees[b];
-            return a < b;
-        });
-        
-        for (int neighbor : neighbors) {
-            if (visited.find(neighbor) == visited.end()) {
-                visited.insert(neighbor);
-                newLabel[neighbor] = label++;
-                queue.push_back(neighbor);
-            }
-        }
+    for (size_t head = 0; head < queue.size(); ++head)
+        for (int p = start[queue[head]]; p < end[queue[head]]; ++p)
+            if (label[adj[p]] < 0) { label[adj[p]] = next++; queue.push_back(adj[p]); }
+
+    // Nodes not reachable from ground: label in (degree, node) order.
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), byDegree);
+    for (int i : order)
+        if (label[i] < 0) label[i] = next++;
+
+    for (size_t k = 0; k < edges.size(); ++k) {
+        edges[k].nodeMin = std::min(label[a[k]], label[b[k]]);
+        edges[k].nodeMax = std::max(label[a[k]], label[b[k]]);
     }
-    
-    // Handle disconnected nodes (not reachable from ground)
-    for (int node : sortedNodes) {
-        if (newLabel.find(node) == newLabel.end()) {
-            newLabel[node] = label++;
-        }
-    }
-    
-    // Apply new labels to edges
-    for (auto& e : edges) {
-        int newMin = newLabel[e.nodeMin];
-        int newMax = newLabel[e.nodeMax];
-        e.nodeMin = std::min(newMin, newMax);
-        e.nodeMax = std::max(newMin, newMax);
-    }
-    
-    return newLabel;
 }
 
 // ============================================================================
@@ -223,7 +206,7 @@ inline std::map<int, int> canonicalRelabel(std::vector<CanonicalEdge>& edges) {
  */
 inline uint64_t computeTopologyHash(std::vector<CanonicalEdge> edges, int groundNode = 0) {
     // Step 1: Normalize ground to node 0
-    normalizeGround(edges, groundNode);
+    if (groundNode != 0) normalizeGround(edges, groundNode);
     
     // Step 2: Canonical relabeling (BFS from ground)
     canonicalRelabel(edges);

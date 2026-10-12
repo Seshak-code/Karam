@@ -121,6 +121,8 @@ private:
     int              nextLocalNode_ = 1;
     struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; };
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
+    struct PendingIC { std::string node; double value; int line; };
+    std::vector<PendingIC> pendingICs_;           // resolved once every node is known
     std::map<std::string, std::vector<PendingInstance>> subcktChildren_;  // nodes are body-local
     std::map<std::string, int> savedInductorIndex_; // top-level K lookup, saved inside a body
     void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth);
