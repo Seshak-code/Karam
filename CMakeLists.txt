@@ -171,3 +171,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cli/engine_cli_main.cpp)
     add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
     target_link_libraries(acutesim_engine_cli PRIVATE acutesim_sim_layer acutesim_orchestration acutesim_engine)
 endif()
+
+# ---------------------------------------------------------------------------
+# Waveform dump tool — machine-readable output for tests/ngspice_diff
+# Output: "CONVERGED <0|1>", "ERROR <text>", then "<time> <v1> <v2> ..." rows
+# (node order = first appearance in the netlist, subcircuit bodies excluded)
+# ---------------------------------------------------------------------------
+add_executable(acutesim_engine_dump cli/engine_dump_main.cpp)
+target_include_directories(acutesim_engine_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(acutesim_engine_dump PRIVATE acutesim_engine)
