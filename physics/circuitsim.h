@@ -3,6 +3,7 @@
 #include "../netlist/circuit.h"
 #include "../math/linalg.h"
 #include "../math/sparse_lu.h"
+#include "../math/contraction_solver.h"
 #include "../infrastructure/compiled_block.h"
 #include <algorithm>
 #include <cassert>
@@ -431,6 +432,15 @@ public:
   // CSR pattern cache (Sparse Merge — Phase D5): frozen per topology change
   std::unique_ptr<CachedCsrPattern> cachedPattern_;
   uint64_t cachedPatternHash_ = 0;  // topology hash when pattern was last built
+
+  // Default linear solver: tensor-contraction plan, rebuilt only when the
+  // Jacobian's sparsity pattern (circuit topology) changes.
+  std::unique_ptr<ContractionPlan> contractionPlan_;
+  SolverResult solveLinear(const Csr_matrix& A, const std::vector<double>& b) {
+    if (!contractionPlan_ || !contractionPlan_->matches(A))
+      contractionPlan_ = std::make_unique<ContractionPlan>(planContraction(A));
+    return solveContraction(A, b, *contractionPlan_);
+  }
 
   // Phase B: Cached symbolic factorization for sparse LU solver.
   // Recomputed when topology hash changes (alongside cachedPattern_).

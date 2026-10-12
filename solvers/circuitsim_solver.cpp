@@ -280,7 +280,13 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   double gmin_factor = 1.0;
   const int GMIN_STEPS = 19; // 1e-3 to 1e-12 in half-decade steps
 
-  for (int gmin_step = 0; gmin_step < GMIN_STEPS; ++gmin_step) {
+  // SPICE order: plain Newton at nominal GMIN first; the GMIN ladder runs only
+  // if that fails. (The ladder used to run unconditionally: ~19 full solves
+  // even for a linear circuit, which dominated large-circuit DC time.)
+  const std::vector<double> seededGuess = voltageEstimate;
+  std::vector<int> gminSchedule{GMIN_STEPS - 1};
+  for (size_t si = 0; si < gminSchedule.size(); ++si) {
+    const int gmin_step = gminSchedule[si];
     // Scale GMIN: start at 1e-3, reduce by sqrt(10) each step to 1e-12
     gmin_factor = std::pow(10.0, -(3.0 + gmin_step * 0.5));
     if (gmin_factor < 1e-12)
@@ -350,12 +356,13 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
           compiledBlock_ ? compiledBlock_->tnAnalysis : TreewidthAnalysis{};
 
       if (!tw.isAnalyzed || netlist.numGlobalNodes < 20) {
-        // Small circuits or no treewidth data: dense LU (current path)
+        // Default: tensor-contraction direct solver (scales; dense LU was O(N^3))
+        result = solveLinear(matrix, rhsVector);
         if (iteration == 0 && gmin_step == 0) {
-          std::cerr << "[TN-ROUTE] DENSE_LU (nodes=" << netlist.numGlobalNodes
-                    << ", tw_analyzed=" << tw.isAnalyzed << ")\n";
+          std::cerr << "[TN-ROUTE] CONTRACTION (nodes=" << netlist.numGlobalNodes
+                    << ", fronts=" << contractionPlan_->fronts.size()
+                    << ", levels=" << contractionPlan_->levels.size() << ")\n";
         }
-        result = solveLU_Pivoted(matrix, rhsVector);
       } else if (tw.estimatedTreewidth <= SPARSE_LU_TW_LIMIT &&
                  cachedSymbolic_) {
         // Low-treewidth circuits: sparse LU with Min-Fill ordering
@@ -367,7 +374,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         // Fallback safety: if sparse solver produces a bad residual, retry
         // dense
         if (result.converged && result.finalResidual > 1e-6) {
-          SolverResult denseResult = solveLU_Pivoted(matrix, rhsVector);
+          SolverResult denseResult = solveLinear(matrix, rhsVector);
           if (denseResult.converged &&
               denseResult.finalResidual < result.finalResidual) {
             result = denseResult;
@@ -505,7 +512,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
             result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
           }
           if (!result.converged || result.finalResidual > 1e-6) {
-            result = solveLU_Pivoted(matrix, rhsVector);
+            result = solveLinear(matrix, rhsVector);
           }
         }
 
@@ -529,7 +536,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
             result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
           }
           if (!result.converged || result.finalResidual > 1e-6) {
-            result = solveLU_Pivoted(matrix, rhsVector);
+            result = solveLinear(matrix, rhsVector);
           }
         }
       } else {
@@ -538,10 +545,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
           std::cerr << "[TN-ROUTE] PCG (nodes=" << netlist.numGlobalNodes
                     << ", tw=" << tw.estimatedTreewidth << ")\n";
         }
-        result = solvePCG(matrix, rhsVector, 1e-6, PCG_MAX_ITER);
-        if (!result.converged) {
-          result = solveLU_Pivoted(matrix, rhsVector);
-        }
+        result = solveLinear(matrix, rhsVector);
       }
       // Phase 2.9: Capture pivot diagnostics from LU
       if (result.smallestPivot < smallestPivotOverall) {
@@ -669,6 +673,14 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     if (gmin_step == GMIN_STEPS - 1 && gmin_converged) {
       converged = true;
       break;
+    }
+
+    // Direct attempt failed: restart from the seed and walk the full ladder
+    if (si == 0) {
+      voltageEstimate = seededGuess;
+      stagnationDetected = divergenceDetected = false;
+      for (int g = 0; g < GMIN_STEPS; ++g) gminSchedule.push_back(g);
+      continue;
     }
 
     // If we failed to converge a single GMIN step, check if we're making
@@ -877,14 +889,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
 
       Csr_matrix A = matrixBuilder.createCsr();
 
-      if (netlist.numGlobalNodes < 100) {
-        subResult = solveLU_Pivoted(A, rhsVector);
-      } else {
-        subResult = solvePCG(A, rhsVector, 1e-6);
-        if (!subResult.converged) {
-          subResult = solveLU_Pivoted(A, rhsVector);
-        }
-      }
+      subResult = solveLinear(A, rhsVector);
 
       std::vector<double> v_new = subResult.solution;
 
@@ -1028,19 +1033,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
         // --- Solver Strategy Optimization ---
         // LU is O(N^3) but robust for non-symmetric active circuits.
         // PCG is O(N*sqrt(K)) but requires SPD (Resistor/Capacitor meshes).
-        if (netlist.numGlobalNodes < 100) {
-          // Small VLSI blocks: Use Direct LU with partial pivoting for absolute
-          // robustness
-          lastResult = solveLU_Pivoted(A, rhsVector);
-        } else {
-          // Large Parasitic Meshes: Try Iterative first
-          lastResult = solvePCG(A, rhsVector, 1e-6);
-          if (!lastResult.converged) {
-            // Emergency Fallback: If PCG fails (highly non-symmetric), drop
-            // into LU
-            lastResult = solveLU_Pivoted(A, rhsVector);
-          }
-        }
+        lastResult = solveLinear(A, rhsVector);
 
         std::vector<double> v_new = lastResult.solution;
 

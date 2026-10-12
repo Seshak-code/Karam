@@ -98,6 +98,7 @@ target_sources(acutesim_engine_objects PRIVATE
 
     # === Math ===
     ${CMAKE_CURRENT_SOURCE_DIR}/math/sparse_lu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp
 
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp

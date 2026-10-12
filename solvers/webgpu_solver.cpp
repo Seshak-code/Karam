@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include "../infrastructure/netlist_compiler.h"
 #include "../math/linalg.h"          // MatrixConstructor, solveLU_Pivoted, Csr_matrix
+#include "../math/contraction_solver.h" // default linear solver
 #include "../netlist/circuit.h" // Resistor, BJT, Mosfet, Diode, etc.
 #include "../physics/device_physics.h" // pnjlim, compute_vcrit (junction limiting)
 #include "../physics/physics_constants.h" // DC_SHORT_G
@@ -532,8 +533,10 @@ void WebGPUSolver::buildStampMaps(const TensorNetlist& netlist) {
 void WebGPUSolver::uploadNetlist(const TensorNetlist& netlist) {
     if (!queue) return;
 
-    auto compiled = NetlistCompiler::compile(netlist);
-    const TensorizedBlock& block = compiled->tensors;
+    // Only the SoA tensors are needed here. NetlistCompiler::compile() also ran
+    // the Min-Fill treewidth analysis (~quadratic), which took 100+ s at 10^4
+    // nodes before the GPU solve even started.
+    const TensorizedBlock block = tensorizeNetlist(netlist);
 
     if (numDiodes_ > 0) {
         std::vector<DiodeDeviceCPU> devs(numDiodes_);
@@ -703,6 +706,7 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
     //    converged step seeds the next. Canonical fix for inverter chains.
     //  - GMIN homotopy inside each source step: large gmin dominates
     //    nonlinearities, then relaxes to nominal.
+    ContractionPlan plan;  // tensor-contraction plan, rebuilt only if the pattern changes
     const int SRC_STEPS = 8;
     const int GMIN_STEPS = 6;
     const double gmin_schedule[GMIN_STEPS] = {1e-2, 1e-3, 1e-4, 1e-5, 1e-6, gmin};
@@ -879,7 +883,8 @@ std::vector<double> WebGPUSolver::runHybridNRLoop(
         for (size_t i = 0; i < N; ++i) mc.add((int)i, (int)i, gmin_eff);
 
         Csr_matrix mat = mc.createCsr();
-        SolverResult res = solveLU_Pivoted(mat, rhs);
+        if (!plan.matches(mat)) plan = planContraction(mat);
+        SolverResult res = solveContraction(mat, rhs, plan);
         if (!res.converged) {
             std::cerr << "[WARN] WebGPUSolver: LU failed at iter " << iter << "\n";
             break;
