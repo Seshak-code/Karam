@@ -2,7 +2,7 @@
 // compute/solvers/register_analyses.cpp — Explicit registration entrypoint
 // ============================================================================
 // Call registerAllAnalyses() to populate AnalysisRegistry with fully
-// functional TF / PZ / FOURIER handlers that go through the solver.
+// functional TF / FOURIER handlers that go through the solver.
 //
 // Each handler:
 //   1. Applies corner parameters to the netlist.
@@ -15,7 +15,6 @@
 #include "acutesim_engine/solvers/register_analyses.h"
 #include "acutesim_engine/solvers/analysis_registry.h"
 #include "acutesim_engine/solvers/tf_analysis.h"
-#include "acutesim_engine/solvers/pz_analysis.h"
 #include "acutesim_engine/solvers/fourier_analysis.h"
 
 // Full physics headers for handler implementations
@@ -63,21 +62,7 @@ static SimulationResponseDTO tfHandler(
     SolverStep dc;
     if (!applyCornerAndDC(sim, runNetlist, req, dc, errOut)) return errOut;
     errOut.topologyHash = req.topologyHash;
-    return runTFAnalysis(runNetlist, dc.nodeVoltages, req);
-}
-
-// ── Pole-Zero ────────────────────────────────────────────────────────────────
-static SimulationResponseDTO pzHandler(
-    const SimulationRequestDTO& req,
-    const TensorNetlist& netlist,
-    CircuitSim& sim)
-{
-    TensorNetlist runNetlist = netlist;
-    SimulationResponseDTO errOut;
-    SolverStep dc;
-    if (!applyCornerAndDC(sim, runNetlist, req, dc, errOut)) return errOut;
-    errOut.topologyHash = req.topologyHash;
-    return runPZAnalysis(runNetlist, dc.nodeVoltages, req);
+    return runTFAnalysis(sim, runNetlist, req);
 }
 
 // ── Fourier ──────────────────────────────────────────────────────────────────
@@ -135,7 +120,6 @@ void registerAllAnalyses() {
     auto& reg = AnalysisRegistry::instance();
     // Idempotent — overwrites any previous stub; safe to call multiple times.
     reg.registerHandler(AnalysisTypeDTO::TRANSFER_FUNCTION, tfHandler);
-    reg.registerHandler(AnalysisTypeDTO::POLE_ZERO,         pzHandler);
     reg.registerHandler(AnalysisTypeDTO::FOURIER,           fourierHandler);
 }
 

@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <functional>
 
 namespace acutesim {
@@ -41,12 +42,19 @@ struct SPICEParseResult {
     // Analysis directives discovered
     bool          hasOP = false;
     bool          hasTRAN = false;
-    bool          hasAC = false;
-    bool          hasDC = false;
     double        tranStop = 0.0;
     double        tranStep = 0.0;
     double        tranStart = 0.0;
     bool          tranUIC = false;   // .tran ... UIC: skip the DC operating point
+    std::string   dcSource;          // .dc SRC start stop step ("" = no sweep)
+    double        dcStart = 0.0, dcStop = 0.0, dcStep = 0.0;
+    std::string   noiseSource;       // .noise v(out[,ref]) src sweep n fstart fstop
+    std::string   noiseSweep;
+    int           noiseOut = 0, noiseRef = 0, noisePoints = 0;
+    double        noiseStart = 0.0, noiseStop = 0.0;
+    std::string   acSweep;           // .ac dec|oct|lin n fstart fstop
+    int           acPoints = 0;
+    double        acStart = 0.0, acStop = 0.0;
 };
 
 class SPICEParser {
@@ -61,6 +69,7 @@ private:
     double parseValue(const std::string& s) const;  // throws on non-numbers; resolves .param
     bool isValue(const std::string& s) const;
     static void requireFields(const std::vector<std::string>& tok, size_t n);
+    static void requireLinearForm(const std::vector<std::string>& tok, size_t n);
     void rejectArea(const std::vector<std::string>& tok, size_t from) const;
     static std::string toUpper(const std::string& s);
     static std::vector<std::string> tokenize(const std::string& line);
@@ -123,6 +132,9 @@ private:
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
     struct PendingIC { std::string node; double value; int line; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
+    std::string noiseOut_, noiseRef_;              // .noise node names, resolved likewise
+    std::set<std::string> globals_;                // .global node names
+    std::map<std::string, std::map<int, std::string>> subcktGlobals_;  // subckt -> local index -> name
     std::map<std::string, std::vector<PendingInstance>> subcktChildren_;  // nodes are body-local
     std::map<std::string, int> savedInductorIndex_; // top-level K lookup, saved inside a body
     void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth);

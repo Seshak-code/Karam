@@ -12,19 +12,13 @@
 
 #include <sstream>
 
-#include "../infrastructure/adaptive_precision.h"
-#include "../infrastructure/compiled_block.h"
-#include "../infrastructure/mpo_builder.h"
 #include "../infrastructure/safe_utils.h"
 #include "../physics/circuitsim.h"
 #include "../physics/device_physics.h"
 #include "../physics/physics_constants.h"
-#include "../solvers/contraction_executor.h"
 #include "../solvers/convergence_engine.h"
-#include "../solvers/schur_solver.h"
 #include "acutesim_engine/netlist/netlist_export.h"
 #if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
-#include "../solvers/webgpu_solver.h"
 #include "acutesim_engine/gpu_context_manager.h"
 #endif
 
@@ -659,7 +653,8 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
 
 std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double stop, bool uic,
                                      const std::function<bool(const SolverStep &)> &onPoint) {
-  if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step > 0 and stop time > 0.";
+  if (step == 0.0) step = stop / 50.0;  // .tran 0 tstop: ngspice's default TMAX
+  if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step >= 0 and stop time > 0.";
 
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
@@ -704,11 +699,19 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   // retry, give up below dtMin, regrow toward the user step.
   const double dtMin = step * 1e-9;
   const double endTol = step * 1e-9;  // absorb FP drift at the final step
+  // The step after a corner uses backward Euler (SPICE: order 1 after a
+  // breakpoint): trapezoidal rings +-dv across a derivative jump (an L driven
+  // by a ramp that stops) and LTE rejection then shrinks h until it gives up.
   double h = step, t = 0.0;
+  bool landedOnCorner = false;
   while (stop - t > endTol) {
     double hTry = std::min(h, stop - t);
-    for (const auto &next : corners) hTry = std::min(hTry, next(t + endTol) - t);
+    bool toCorner = false;
+    for (const auto &next : corners)
+      if (next(t + endTol) - t <= hTry) { hTry = next(t + endTol) - t; toCorner = true; }
+    if (landedOnCorner) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
     SolverStep s = stepTransient(netlist, hTry, t);
+    if (landedOnCorner) setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
     if (!s.stats.converged || !(s.time > t)) {
       h = hTry * 0.25;
       if (h < dtMin) {
@@ -720,11 +723,210 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
       continue;
     }
     const double taken = s.time - t;
+    landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
     if (!onPoint(s)) return "Cancelled.";
     h = std::min(step, taken * 2.0);
   }
   return "";
+}
+
+bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
+  sys = {};
+  sys.n = systemSize(netlist);
+  if ((int)lastSolution_.size() != sys.n) return false;
+  // G: the DC Newton Jacobian at the operating point (same stamps as solveDC),
+  // without the node-to-ground gmin: like ngspice, a 1e-12 S leak on every node
+  // would load 1e10-ohm references by 1 % (aac_09 transformer secondaries).
+  matrixBuilder.clear();
+  matrixBuilder.setDimensions(sys.n, sys.n);
+  rhsVector.assign(sys.n, 0.0);
+  stampAllElements(netlist, 0.0, lastSolution_, 0.0);
+  sys.G = matrixBuilder.createCsr();
+  auto addC = [&](int r, int c, double v) {
+    if (r >= 0 && c >= 0) { sys.cr.push_back(r); sys.cc.push_back(c); sys.cv.push_back(v); }
+  };
+  int total = 0;
+  for (const auto &sl : branchSlots(netlist, total)) {
+    auto node = [&](int local) { return sl.map(local) - 1; };  // ground -> -1
+    for (const auto &c : sl.blk->capacitors) {
+      const int a = node(c.nodePlate1), b = node(c.nodePlate2);
+      const double C = c.capacitance_farads;
+      addC(a, a, C); addC(b, b, C); addC(a, b, -C); addC(b, a, -C);
+    }
+    const auto flux = fluxLinks(*sl.blk);  // inductor row: v1 - v2 - jw*sum L_aj i_j = 0
+    for (size_t a = 0; a < flux.size(); ++a)
+      for (auto [j, Laj] : flux[a]) addC(sl.ind + (int)a, sl.ind + j, -Laj);
+  }
+  return true;
+}
+
+Csr_matrix CircuitSim::acMatrix(const ACSystem &s, double w, bool transpose) {
+  const int n = s.n;
+  MatrixConstructor M;
+  M.setDimensions(2 * n, 2 * n);
+  auto put = [&](int r, int c, double v) { transpose ? M.add(c, r, v) : M.add(r, c, v); };
+  for (int r = 0; r < n; ++r)
+    for (int p = s.G.row_pointer[r]; p < s.G.row_pointer[r + 1]; ++p) {
+      put(r, s.G.col_indices[p], s.G.values[p]);
+      put(r + n, s.G.col_indices[p] + n, s.G.values[p]);
+    }
+  for (size_t t = 0; t < s.cv.size(); ++t) {
+    put(s.cr[t], s.cc[t] + n, -w * s.cv[t]);
+    put(s.cr[t] + n, s.cc[t], w * s.cv[t]);
+  }
+  return M.createCsr();
+}
+
+std::vector<std::complex<double>> CircuitSim::acExcitation(const TensorNetlist &nl,
+                                                           const std::string &unit) const {
+  int total = 0;
+  const auto blocks = branchSlots(nl, total);
+  std::vector<std::complex<double>> e(total);
+  bool found = unit.empty();
+  auto phasor = [&](const std::string &name, double mag, double phaseDeg) -> std::complex<double> {
+    if (!unit.empty()) return name == unit ? (found = true, 1.0) : 0.0;
+    return std::polar(mag, phaseDeg * M_PI / 180.0);
+  };
+  for (const auto &sl : blocks) {
+    for (size_t i = 0; i < sl.blk->voltageSources.size(); ++i) {
+      const auto &v = sl.blk->voltageSources[i];
+      e[sl.vs + i] += phasor(v.name, v.ac_mag, v.ac_phase);
+    }
+    for (const auto &cs : sl.blk->currentSources) {  // leaves n+ externally (as in DC)
+      const auto p = phasor(cs.name, cs.ac_mag, cs.ac_phase);
+      const int a = sl.map(cs.nodePositive) - 1, b = sl.map(cs.nodeNegative) - 1;
+      if (a >= 0) e[a] -= p;
+      if (b >= 0) e[b] += p;
+    }
+  }
+  return found ? e : std::vector<std::complex<double>>{};
+}
+
+std::vector<std::vector<std::complex<double>>>
+CircuitSim::solveAC(TensorNetlist &netlist, const std::vector<double> &freqs) {
+  ACSystem sys;
+  if (!acSystem(netlist, sys)) return {};
+  const int n = sys.n;
+  const auto e = acExcitation(netlist);
+  std::vector<double> b(2 * n);
+  for (int i = 0; i < n; ++i) { b[i] = e[i].real(); b[i + n] = e[i].imag(); }
+  std::vector<std::vector<std::complex<double>>> out;
+  for (double f : freqs) {
+    const SolverResult s = solveLinear(acMatrix(sys, 2.0 * M_PI * f, false), b);
+    std::vector<std::complex<double>> x(n);
+    for (int i = 0; i < n && i + n < (int)s.solution.size(); ++i) x[i] = {s.solution[i], s.solution[i + n]};
+    out.push_back(std::move(x));
+  }
+  return out;
+}
+
+CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std::vector<double> &freqs,
+                                               int outNode, int refNode, const std::string &inputSource) {
+  NoiseResult r;
+  ACSystem sys;
+  if (!acSystem(netlist, sys)) { r.error = "noise needs a converged DC operating point"; return r; }
+  const int n = sys.n;
+  const auto ein = acExcitation(netlist, inputSource);
+  if (ein.empty()) { r.error = "noise input source '" + inputSource + "' not found"; return r; }
+  if (outNode < 1 || outNode > netlist.numGlobalNodes || refNode < 0 || refNode > netlist.numGlobalNodes) {
+    r.error = "noise output node out of range";
+    return r;
+  }
+
+  // Generators: current noise of `psd` [A^2/Hz] between global nodes a, b (0 = ground)
+  struct Gen { int a, b; double psd; };
+  std::vector<Gen> gens;
+  const double kT4 = 4.0 * PhysicsConstants::K_BOLTZMANN * netlist.environment.ambient_temp_K;
+  const double q2 = 2.0 * PhysicsConstants::Q_ELECTRON;
+  auto V = [&](int g) { return g > 0 ? lastSolution_[g - 1] : 0.0; };
+  int total = 0;
+  for (const auto &sl : branchSlots(netlist, total)) {
+    const auto &blk = *sl.blk;
+    for (const auto &rr : blk.resistors)
+      gens.push_back({sl.map(rr.nodeTerminal1), sl.map(rr.nodeTerminal2), kT4 / rr.resistance_ohms});
+    for (const auto &d : blk.diodes) {
+      const int a = sl.map(d.anode), k = sl.map(d.cathode);
+      const DiodeParams<double> p = {d.saturationCurrent_I_S_A, d.emissionCoefficient_N, d.thermalVoltage_V_T_V};
+      gens.push_back({a, k, q2 * std::abs(diode_current_clamped(V(a) - V(k), p))});
+    }
+    for (const auto &qb : blk.bjts) {
+      const int c = sl.map(qb.nodeCollector), b = sl.map(qb.base), e = sl.map(qb.emitter);
+      const auto I = bjt_ebers_moll(V(c), V(b), V(e), qb.isNPN, bjtKernelParams(netlist, qb));
+      gens.push_back({c, e, q2 * std::abs(I.Ic)});
+      gens.push_back({b, e, q2 * std::abs(I.Ib)});
+    }
+    for (const auto &m : blk.mosfets) {
+      const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source);
+      double sign;
+      const auto p = mosfetKernelParams(netlist, m, sign);
+      const double gm = mosfet_ids(Dual<double>(sign * (V(g) - V(s)), 1.0),
+                                   Dual<double>(sign * (V(d) - V(s)), 0.0), p).grad;
+      gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
+    }
+    for (const auto &j : blk.jfets) {
+      const int d = sl.map(j.drain), g = sl.map(j.gate), s = sl.map(j.source);
+      const double sign = j.isNChannel ? 1.0 : -1.0;
+      JFETParams<double> p;
+      p.Beta = j.beta; p.Vto = j.Vto; p.Lambda = j.lambda;
+      const double gm = jfet_ids(Dual<double>(sign * (V(g) - V(s)), 1.0),
+                                 Dual<double>(sign * (V(d) - V(s)), 0.0), p).grad;
+      gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
+    }
+  }
+
+  // ngspice Nintegrate: integral of a density varying as a power of f between points
+  constexpr double kMinLog = 1e-38;
+  auto nint = [&](double dens, double lnD, double lnLast, double lnF, double lnF0, double dF) {
+    double ex = (lnD - lnLast) / (lnF - lnF0);
+    if (std::abs(ex) < kMinLog) return dens * dF;
+    const double a = std::exp(lnD - ex * lnF);
+    ex += 1.0;
+    if (std::abs(ex) < kMinLog) return a * (lnF - lnF0);
+    return a * (std::exp(ex * lnF) - std::exp(ex * lnF0)) / ex;
+  };
+
+  std::vector<double> bin(2 * n, 0.0), bout(2 * n, 0.0), lnLast(gens.size());
+  for (int i = 0; i < n; ++i) { bin[i] = ein[i].real(); bin[i + n] = ein[i].imag(); }
+  bout[outNode - 1] = 1.0;
+  if (refNode > 0) bout[refNode - 1] = -1.0;
+  std::unique_ptr<ContractionPlan> adjointPlan;  // R^T has its own pattern
+  double onTot = 0.0, inTot = 0.0, lnF0 = 0.0, f0 = 0.0;
+  for (size_t k = 0; k < freqs.size(); ++k) {
+    const double f = freqs[k], w = 2.0 * M_PI * f;
+    const SolverResult fw = solveLinear(acMatrix(sys, w, false), bin);
+    const Csr_matrix RT = acMatrix(sys, w, true);
+    if (!adjointPlan) adjointPlan = std::make_unique<ContractionPlan>(planContraction(RT));
+    const SolverResult z = solveContraction(RT, bout, *adjointPlan);
+    if ((int)fw.solution.size() != 2 * n || (int)z.solution.size() != 2 * n) {
+      r.error = "noise: linear solve failed at f=" + std::to_string(f);
+      return r;
+    }
+    auto cx = [&](const std::vector<double> &x, int g) {
+      return g > 0 ? std::complex<double>(x[g - 1], x[g - 1 + n]) : 0.0;
+    };
+    const std::complex<double> H = cx(fw.solution, outNode) - cx(fw.solution, refNode);
+    const double gainInv = 1.0 / std::max(std::norm(H), kMinLog), lnGainInv = std::log(gainInv);
+    const double lnF = std::log(std::max(f, kMinLog));
+    double S = 0.0;
+    for (size_t g = 0; g < gens.size(); ++g) {
+      const double dens = std::norm(cx(z.solution, gens[g].a) - cx(z.solution, gens[g].b)) * gens[g].psd;
+      const double lnD = std::log(std::max(dens, kMinLog));
+      if (k > 0) {
+        onTot += nint(dens, lnD, lnLast[g], lnF, lnF0, f - f0);
+        inTot += nint(dens * gainInv, lnD + lnGainInv, lnLast[g] + lnGainInv, lnF, lnF0, f - f0);
+      }
+      lnLast[g] = lnD;
+      S += dens;
+    }
+    r.onoise.push_back(std::sqrt(S));
+    r.inoise.push_back(std::sqrt(S * gainInv));
+    lnF0 = lnF;
+    f0 = f;
+  }
+  r.onoiseTotal = std::sqrt(onTot);
+  r.inoiseTotal = std::sqrt(inTot);
+  return r;
 }
 
 bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
@@ -1057,45 +1259,3 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       netlist.globalBlock.topologyHash};
 }
 
-// =============================================================================
-// COMPILED BLOCK API — Public entry points
-// =============================================================================
-// These overloads accept the pre-compiled, immutable CompiledTensorBlock.
-// They pre-load the SoA tensors and then delegate to the internal
-// TensorNetlist-based methods via the embedded structural_ copy.
-
-SolverStep CircuitSim::solveDC(const CompiledTensorBlock &block) {
-  // Pre-load the SoA tensors so tensorizeNetlist() inside is a no-op
-  soaBlock = block.tensors;
-
-  // Phase B: Make the compiled block available for treewidth-guided routing.
-  // Use a non-owning shared_ptr (aliasing constructor) since the block
-  // outlives this call — the caller holds ownership.
-  compiledBlock_ = std::shared_ptr<const CompiledTensorBlock>(
-      std::shared_ptr<const CompiledTensorBlock>{}, &block);
-
-  // Delegate to internal TensorNetlist-based solver
-  // A mutable copy is needed because the solver writes to instance states
-  TensorNetlist nl = block.structural_;
-  auto result = solveDC(nl);
-
-  compiledBlock_.reset(); // Release non-owning reference
-  return result;
-}
-
-SolverStep CircuitSim::stepTransient(const CompiledTensorBlock &block,
-                                     double timeStep, double currentTime) {
-  // Pre-load the SoA tensors
-  soaBlock = block.tensors;
-
-  // Phase B: Make the compiled block available for treewidth-guided routing.
-  compiledBlock_ = std::shared_ptr<const CompiledTensorBlock>(
-      std::shared_ptr<const CompiledTensorBlock>{}, &block);
-
-  // Delegate to internal TensorNetlist-based solver
-  TensorNetlist nl = block.structural_;
-  auto result = stepTransient(nl, timeStep, currentTime);
-
-  compiledBlock_.reset();
-  return result;
-}

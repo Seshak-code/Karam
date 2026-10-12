@@ -1,7 +1,9 @@
-// acutesim_engine_dump <netlist> <cpu|gpu> <dc|tran|ac> [step stop]
+// acutesim_engine_dump <netlist> <cpu|gpu> <dc|tran|ac|noise> [step stop]
 // Machine-readable waveform dump for differential testing (tests/ngspice_diff).
 // Prints: "CONVERGED <0|1>", "ERROR <text>", then one line per waveform point:
 //   <time> <v1> <v2> ...   (engine-internal node order)
+//   ac: <freq> <re1> <im1> <re2> <im2> ...
+//   noise: <freq> <onoise> <inoise> ... then "TOTAL <onoise_total> <inoise_total>"
 #include "engine_api/isimulation_engine.h"
 #include "engine_api/simulation_session.h"
 #include "engine_api/simulation_dto.h"
@@ -34,13 +36,22 @@ int main(int argc, char** argv) {
         r = session->runTransient(req, cb, nullptr);
     } else if (mode == "ac") {
         r = session->runAC(req, cb);
+    } else if (mode == "noise") {
+        r = session->runNoise(req, cb);
     } else {
         r = session->runDC(req, cb);
     }
     std::printf("CONVERGED %d\nERROR %s\n", r.converged ? 1 : 0, r.errorDetail.c_str());
+    const auto& nz = r.extended.noise;
+    for (size_t k = 0; k < nz.frequencies.size(); ++k)
+        std::printf("%.9g %.9g %.9g\n", nz.frequencies[k], nz.onoise[k], nz.inoise[k]);
+    if (r.extended.hasNoise) std::printf("TOTAL %.9g %.9g\n", nz.onoiseTotal, nz.inoiseTotal);
     for (const auto& p : r.waveformPoints) {
         std::printf("%.9g", p.timeS);
-        for (double v : p.nodeVoltages) std::printf(" %.9g", v);
+        for (size_t i = 0; i < p.nodeVoltages.size(); ++i) {
+            std::printf(" %.9g", p.nodeVoltages[i]);
+            if (i < p.nodeVoltagesImag.size()) std::printf(" %.9g", p.nodeVoltagesImag[i]);
+        }
         std::printf("\n");
     }
     return 0;

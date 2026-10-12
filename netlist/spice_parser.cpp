@@ -60,6 +60,10 @@ double SPICEParser::parseValue(const std::string& raw) const {
 
     if (end < s.size()) {
         std::string suffix = s.substr(end);
+        // a scale factor plus unit letters only: "0.5*R1" used to read as 0.5
+        for (char ch : suffix)
+            if (!std::isalpha(static_cast<unsigned char>(ch)))
+                throw std::runtime_error("'" + raw + "' is not a number or a known .param");
         std::string sfxUpper = toUpper(suffix);
 
         if (sfxUpper.rfind("MEG", 0) == 0) v *= 1e6;
@@ -111,6 +115,7 @@ int SPICEParser::nodeIndex(const std::string& name) {
     auto& next = inSubckt_ ? nextLocalNode_ : nextNode_;
     auto it = map.find(upper);
     if (it != map.end()) return it->second;
+    if (inSubckt_ && globals_.count(upper)) subcktGlobals_[subcktName_][next] = upper;  // see expandInstance
     map[upper] = next;
     return next++;
 }
@@ -174,6 +179,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     inSubckt_ = false;
     topInstances_.clear();
     pendingICs_.clear();
+    globals_.clear();
+    subcktGlobals_.clear();
+    noiseOut_.clear();
+    noiseRef_.clear();
     subcktChildren_.clear();
     modelCards_.clear();
     params_.clear();
@@ -197,6 +206,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     for (const auto& [lineNum, line] : lines) {
         if (lineNum == 1) continue;
         auto tok = tokenize(line);
+        if (!tok.empty() && toUpper(tok[0]) == ".GLOBAL")  // global in every .subckt, wherever declared
+            for (size_t i = 1; i < tok.size(); ++i) globals_.insert(toUpper(tok[i]));
         if (tok.empty() || toUpper(tok[0]) != ".PARAM") continue;
         try { parseParam(tok); }
         catch (const std::exception& e) { return fail(lineNum, e.what()); }
@@ -241,10 +252,52 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                         pendingICs_.push_back({toUpper(tok[i + 1]), parseValue(tok[i + 2]), lineNum});
                     }
                 }
-                else if (keyword == ".AC")  result_.hasAC = true;
-                else if (keyword == ".DC")  result_.hasDC = true;
+                else if (keyword == ".NOISE") {
+                    // .noise v(out[,ref]) src dec|oct|lin n fstart fstop [pts_per_summary]
+                    size_t sw = 4;
+                    while (sw < tok.size() && toUpper(tok[sw]) != "DEC" && toUpper(tok[sw]) != "OCT" &&
+                           toUpper(tok[sw]) != "LIN") ++sw;
+                    if (toUpper(tok[1]) != "V" || (sw != 4 && sw != 5) || sw + 3 >= tok.size())
+                        throw std::runtime_error(".noise expects v(out[,ref]) src dec|oct|lin n fstart fstop");
+                    noiseOut_ = toUpper(tok[2]);
+                    noiseRef_ = sw == 5 ? toUpper(tok[3]) : "0";
+                    result_.noiseSource = toUpper(tok[sw - 1]);
+                    result_.noiseSweep  = toUpper(tok[sw]) == "DEC" ? "dec" : toUpper(tok[sw]) == "OCT" ? "oct" : "lin";
+                    result_.noisePoints = static_cast<int>(parseValue(tok[sw + 1]));
+                    result_.noiseStart  = parseValue(tok[sw + 2]);
+                    result_.noiseStop   = parseValue(tok[sw + 3]);
+                }
+                else if (keyword == ".AC") {
+                    // .ac dec|oct|lin n fstart fstop
+                    const std::string sw = tok.size() == 5 ? toUpper(tok[1]) : "";
+                    if (sw != "DEC" && sw != "OCT" && sw != "LIN")
+                        throw std::runtime_error(".ac expects dec|oct|lin n fstart fstop");
+                    result_.acSweep = sw == "DEC" ? "dec" : sw == "OCT" ? "oct" : "lin";
+                    result_.acPoints = static_cast<int>(parseValue(tok[2]));
+                    result_.acStart = parseValue(tok[3]);
+                    result_.acStop  = parseValue(tok[4]);
+                }
+                else if (keyword == ".DC") {
+                    // .dc SRC start stop step (one V or I source)
+                    if (tok.size() != 5)
+                        throw std::runtime_error(".dc supports one source sweep (.dc SRC start stop step)");
+                    const char c = static_cast<char>(std::toupper(static_cast<unsigned char>(tok[1][0])));
+                    if (c != 'V' && c != 'I')
+                        throw std::runtime_error(".dc sweeps a V or I source only, not '" + tok[1] + "'");
+                    result_.dcSource = toUpper(tok[1]);
+                    result_.dcStart  = parseValue(tok[2]);
+                    result_.dcStop   = parseValue(tok[3]);
+                    result_.dcStep   = parseValue(tok[4]);
+                }
                 else if (keyword == ".END") break;
-                // .INCLUDE, .LIB, .OPTION, .GLOBAL — silently skip for now
+                // Output-only (.four only prints a Fourier table) and first-pass cards; anything else changes the
+                // circuit or analysis (.step, .temp, .nodeset, .include, ...) and used to be
+                // ignored silently.
+                else if (keyword != ".GLOBAL" && keyword != ".PRINT" && keyword != ".PLOT" &&
+                         keyword != ".SAVE" && keyword != ".PROBE" && keyword != ".MEAS" &&
+                         keyword != ".MEASURE" && keyword != ".OPTION" && keyword != ".OPTIONS" &&
+                         keyword != ".WIDTH" && keyword != ".TITLE" && keyword != ".FOUR")
+                    throw std::runtime_error(tok[0] + " is not supported yet");
                 continue;
             }
 
@@ -301,6 +354,19 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             result_.netlist.numGlobalNodes = idx;
     }
 
+    // .noise output nodes, resolved once every node is known
+    if (!noiseOut_.empty()) {
+        auto node = [&](const std::string& nm) {
+            if (nm == "0" || nm == "GND") return 0;
+            auto it = nodeMap_.find(nm);
+            return it == nodeMap_.end() ? -1 : it->second;
+        };
+        result_.noiseOut = node(noiseOut_);
+        result_.noiseRef = node(noiseRef_);
+        if (result_.noiseOut <= 0 || result_.noiseRef < 0)
+            return fail(lines.back().first, ".noise names an unknown output node");
+    }
+
     // .ic may name a node defined later in the file
     for (const auto& ic : pendingICs_) {
         auto it = nodeMap_.find(ic.node);
@@ -319,22 +385,39 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     // after the instance; resolving at the instance made a late PNP an NPN).
     // A card's missing parameters take SPICE defaults; a device with no card
     // keeps the engine defaults. PULSE TR/TF of 0 take TSTEP, as in SPICE.
+    // An undefined model is an error (it used to fall back to engine defaults silently)
     auto card = [&](const std::string& model) -> const ModelCard* {
         auto it = modelCards_.find(toUpper(model));
-        return it == modelCards_.end() ? nullptr : &it->second;
+        if (it == modelCards_.end()) throw std::runtime_error("model '" + model + "' is not defined");
+        return &it->second;
+    };
+    // A parameter the engine does not model is an error, never silently dropped.
+    // 0 is accepted for any key (SPICE: off / infinite), AF only without KF.
+    // ponytail: a 0 that is not "off" (e.g. TNOM=0) is still accepted.
+    auto supported = [&](const ModelCard* c, std::initializer_list<const char*> used) {
+        for (const auto& [k, v] : c->params) {
+            bool ok = v == 0.0 || (k == "LEVEL" && v == 1.0) || (k == "AF" && c->get("KF", 0.0) == 0.0);
+            for (const char* u : used) ok = ok || k == u;
+            if (!ok) throw std::runtime_error("model " + c->name + ": parameter " + k + " is not supported yet");
+        }
     };
     auto resolveBlock = [&](TensorBlock& blk) {
+        for (const auto& m : blk.mosfets)
+            if (const ModelCard* c = card(m.modelName)) supported(c, {"KP", "VTO", "LAMBDA"});
         for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
+            supported(c, {"IS", "N"});
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
             d.emissionCoefficient_N   = c->get("N", 1.0);
         }
         for (auto& q : blk.bjts) if (const ModelCard* c = card(q.modelName)) {
+            supported(c, {"IS", "BF", "BR"});
             q.isNPN = (c->type != "PNP");
             q.saturationCurrent_I_S_A = c->get("IS", 1e-16);
             q.betaF = c->get("BF", 100.0);
             q.betaR = c->get("BR", 1.0);
         }
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
+            supported(c, {"BETA", "VTO", "LAMBDA"});
             j.isNChannel = (c->type == "NJF" || c->type == "NJFET");
             j.beta   = c->get("BETA", 1e-4);
             j.Vto    = c->get("VTO", -2.0);
@@ -350,8 +433,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             for (auto& i : blk.currentSources) edges(i);
         }
     };
-    resolveBlock(result_.netlist.globalBlock);
-    for (auto& [name, blk] : result_.netlist.blockDefinitions) resolveBlock(blk);
+    try {
+        resolveBlock(result_.netlist.globalBlock);
+        for (auto& [name, blk] : result_.netlist.blockDefinitions) resolveBlock(blk);
+    } catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
 
     // Merge model cards into netlist
     for (auto& [name, card] : modelCards_) {
@@ -376,14 +461,22 @@ void SPICEParser::parseResistor(const std::vector<std::string>& tok, TensorBlock
     r.nodeTerminal1 = nodeIndex(tok[1]);
     r.nodeTerminal2 = nodeIndex(tok[2]);
     r.resistance_ohms = parseValue(tok[3]);
+    if (r.resistance_ohms == 0.0) {  // an exact short: a 0 V branch (negative R is legal SPICE)
+        blk.voltageSources.push_back({r.nodeTerminal1, r.nodeTerminal2, 0.0});
+        return;
+    }
 
     // tokenize() turns "KEY=val" into ["KEY", "val"]
-    for (size_t i = 4; i + 1 < tok.size(); ++i) {
+    for (size_t i = 4; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
+        if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")        r.width_m  = parseValue(tok[++i]);
         else if (upper == "L")   r.length_m = parseValue(tok[++i]);
-        else if (upper == "TC1") r.tc1      = parseValue(tok[++i]);
-        else if (upper == "TC2") r.tc2      = parseValue(tok[++i]);
+        else if (upper == "TC1" || upper == "TC2") {
+            if (parseValue(tok[++i]) != 0.0)  // no stamp applies them
+                throw std::runtime_error(tok[0] + ": TC1/TC2 temperature coefficients are not supported yet");
+        }
+        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
     blk.resistors.push_back(r);
 }
@@ -397,12 +490,14 @@ void SPICEParser::parseCapacitor(const std::vector<std::string>& tok, TensorBloc
     c.capacitance_farads = parseValue(tok[3]);
 
     // tokenize() turns "KEY=val" into ["KEY", "val"]. IC= applies with UIC.
-    for (size_t i = 4; i + 1 < tok.size(); ++i) {
+    for (size_t i = 4; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
+        if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")      c.width_m  = parseValue(tok[++i]);
         else if (upper == "L") c.length_m = parseValue(tok[++i]);
         else if (upper == "M") c.m        = parseValue(tok[++i]);
         else if (upper == "IC") { c.ic_V = parseValue(tok[++i]); c.icGiven = true; }
+        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
     blk.capacitors.push_back(c);
 }
@@ -429,7 +524,8 @@ void SPICEParser::parseInductor(const std::vector<std::string>& tok, TensorBlock
 }
 
 void SPICEParser::parseMutualInd(const std::vector<std::string>& tok, TensorBlock& blk) {
-    requireFields(tok, 4);
+    if (tok.size() != 4)  // a core model or a third inductor used to be dropped silently
+        throw std::runtime_error(tok[0] + ": only K <L1> <L2> <k> (linear, two inductors) is supported");
     MutualInductor mi;
     auto it1 = inductorIndex_.find(toUpper(tok[1]));
     auto it2 = inductorIndex_.find(toUpper(tok[2]));
@@ -466,6 +562,7 @@ void SPICEParser::parseSourceSpec(const std::vector<std::string>& tok, Src& s, d
             else ++i;
         } else if (kw == "AC") {
             ++i;
+            s.ac_mag = 1.0;  // SPICE: bare "AC" means unit magnitude
             if (i < tok.size() && isValue(tok[i])) s.ac_mag = parseValue(tok[i++]);
             if (i < tok.size() && isValue(tok[i])) s.ac_phase = parseValue(tok[i++]);
         } else if (kw == "PULSE") {
@@ -510,6 +607,7 @@ void SPICEParser::parseSine(const std::vector<std::string>& tok, size_t idx, Src
 void SPICEParser::parseCurrSrc(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 3);
     CurrentSource cs;
+    cs.name = toUpper(tok[0]);
     cs.nodePositive = nodeIndex(tok[1]);
     cs.nodeNegative = nodeIndex(tok[2]);
     parseSourceSpec(tok, cs, cs.current_A);
@@ -593,8 +691,21 @@ void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& bl
 }
 
 // E<name> <n+> <n-> <nc+> <nc-> <gain>
+// E/G/F/H: only the linear form. POLY / TABLE / VALUE / VOL / CUR / LAPLACE ...
+// used to be read as node names (E2 2 0 VOL=2*V(1) -> nodes "VOL", "2*V").
+void SPICEParser::requireLinearForm(const std::vector<std::string>& tok, size_t n) {
+    for (size_t i = 3; i < tok.size(); ++i) {
+        const std::string k = toUpper(tok[i]);
+        if (k == "POLY" || k == "TABLE" || k == "VALUE" || k == "VOL" || k == "CUR" || k == "LAPLACE" ||
+            k == "FREQ" || k == "CHEBYSHEV")
+            throw std::runtime_error(tok[0] + ": " + k + " form is not supported yet");
+    }
+    if (tok.size() != n)
+        throw std::runtime_error(tok[0] + ": expected " + std::to_string(n - 1) + " fields (linear form)");
+}
+
 void SPICEParser::parseVCVS(const std::vector<std::string>& tok, TensorBlock& blk) {
-    requireFields(tok, 6);
+    requireLinearForm(tok, 6);
     VCVS e;
     e.outPos  = nodeIndex(tok[1]);
     e.outNeg  = nodeIndex(tok[2]);
@@ -606,7 +717,7 @@ void SPICEParser::parseVCVS(const std::vector<std::string>& tok, TensorBlock& bl
 
 // G<name> <n+> <n-> <nc+> <nc-> <gm>
 void SPICEParser::parseVCCS(const std::vector<std::string>& tok, TensorBlock& blk) {
-    requireFields(tok, 6);
+    requireLinearForm(tok, 6);
     VCCS g;
     g.outPos  = nodeIndex(tok[1]);
     g.outNeg  = nodeIndex(tok[2]);
@@ -667,7 +778,7 @@ void SPICEParser::parseSubcktBegin(const std::vector<std::string>& tok) {
 
 // H<name> <n+> <n-> <Vctrl> <transresistance>
 void SPICEParser::parseCCVS(const std::vector<std::string>& tok, TensorBlock& blk) {
-    requireFields(tok, 5);
+    requireLinearForm(tok, 5);
     CCVS h{};
     h.outPos = nodeIndex(tok[1]);
     h.outNeg = nodeIndex(tok[2]);
@@ -679,7 +790,7 @@ void SPICEParser::parseCCVS(const std::vector<std::string>& tok, TensorBlock& bl
 
 // F<name> <n+> <n-> <Vctrl> <gain>
 void SPICEParser::parseCCCS(const std::vector<std::string>& tok, TensorBlock& blk) {
-    requireFields(tok, 5);
+    requireLinearForm(tok, 5);
     CCCS f{};
     f.outPos = nodeIndex(tok[1]);
     f.outNeg = nodeIndex(tok[2]);
@@ -726,7 +837,14 @@ void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<in
                                  " pins but the instance connects " + std::to_string(portNodes.size()));
 
     std::vector<int> map(portNodes);  // local node l -> global map[l-1]
-    for (int l = (int)map.size() + 1; l <= blk.numInternalNodes; ++l) map.push_back(nextNode_++);
+    const auto& globals = subcktGlobals_[pi.subckt];  // internal locals named in .global
+    for (int l = (int)map.size() + 1; l <= blk.numInternalNodes; ++l) {
+        auto g = globals.find(l);
+        if (g == globals.end()) { map.push_back(nextNode_++); continue; }
+        auto [node, isNew] = nodeMap_.emplace(g->second, nextNode_);
+        if (isNew) ++nextNode_;
+        map.push_back(node->second);
+    }
     result_.netlist.addInstance(pi.subckt, map);
 
     for (const auto& child : subcktChildren_[pi.subckt]) {

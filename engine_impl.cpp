@@ -85,18 +85,12 @@ static JobID generateJobID() {
 // Supports .model, .subckt/.ends, .param, waveform specs (PULSE, SIN), and SI suffixes.
 // Returns false (filling `failure`) on a parse error. It used to be logged and the
 // partial (or empty) netlist solved anyway, reporting "converged".
-static bool deserialiseRequest(const SimulationRequestDTO& req, TensorNetlist& out,
-                               SimulationResponseDTO& failure, bool* tranUIC = nullptr) {
-    SPICEParser parser;
-    auto result = parser.parse(req.source.payload);
-    if (!result.success) {
-        failure.converged   = false;
-        failure.errorDetail = "SPICE parse error: " + result.errorMessage;
-        return false;
-    }
-    if (tranUIC) *tranUIC = result.tranUIC;
-    out = std::move(result.netlist);
-    return true;
+static bool deserialiseRequest(const SimulationRequestDTO& req, SPICEParseResult& out,
+                               SimulationResponseDTO& failure) {
+    out = SPICEParser().parse(req.source.payload);
+    if (out.success) return true;
+    failure.errorDetail = "SPICE parse error: " + out.errorMessage;
+    return false;
 }
 
 // ============================================================================
@@ -141,15 +135,57 @@ SimulationResponseDTO SessionImpl::runDC(const SimulationRequestDTO& req,
     result.solveTimeMs = std::chrono::duration<double, std::milli>(elapsed).count();
     result.jobId = jobId_;
 
+    result.success = result.converged;  // driver-path consumers read success
     status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
     return result;
 }
 
+// .dc: the swept source's DC value at start + i*step (no drift), one solve per
+// point on the same CircuitSim so each point is seeded by the last (continuation).
+// Each point is a waveform point whose timeS holds the swept value.
+static SimulationResponseDTO dcSweep(CircuitSim& sim, TensorNetlist& netlist, const DCConfigDTO& sw,
+                                     const EngineCallbacks& cb, const std::function<bool()>& cancelled) {
+    SimulationResponseDTO r;
+    r.analysisType = AnalysisTypeDTO::DC;
+    std::string name = sw.sweepVariable;
+    for (auto& ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    double* value = nullptr;
+    for (auto& v : netlist.globalBlock.voltageSources)
+        if (v.name == name) { value = &v.voltage_V; v.type.clear(); }  // DC value only
+    for (auto& i : netlist.globalBlock.currentSources)
+        if (i.name == name) { value = &i.current_A; i.type.clear(); }
+    const double span = sw.step != 0.0 ? (sw.stop - sw.start) / sw.step : -1.0;
+    if (!value || !(span >= -1e-9)) {
+        r.errorDetail = !value ? ".dc source '" + sw.sweepVariable + "' not found at top level"
+                               : ".dc step must be non-zero and point from start to stop";
+        return r;
+    }
+    const long n = static_cast<long>(std::floor(span + 1e-9));
+    r.converged = true;
+    for (long k = 0; k <= n && !cancelled(); ++k) {
+        *value = sw.start + k * sw.step;
+        SolverStep s = sim.solveDC(netlist);
+        if (!s.stats.converged) {
+            r.converged   = false;
+            r.errorDetail = "DC sweep failed at " + name + "=" + std::to_string(*value) + ": " +
+                            s.stats.error_detail;
+            break;
+        }
+        r.waveformPoints.push_back({*value, s.nodeVoltages});
+        cb.onProgress(static_cast<int>(k + 1), static_cast<int>(n + 1));
+    }
+    return r;
+}
+
 SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestDTO& req,
                                                           const EngineCallbacks& cb) {
-    TensorNetlist netlist;
+    SPICEParseResult parsed;
     SimulationResponseDTO failure;
-    if (!deserialiseRequest(req, netlist, failure)) return failure;
+    if (!deserialiseRequest(req, parsed, failure)) return failure;
+    TensorNetlist& netlist = parsed.netlist;
+    DCConfigDTO sweep = req.dc;  // an explicit request wins over the netlist's .dc
+    if (sweep.sweepVariable.empty() && !parsed.dcSource.empty())
+        sweep = {parsed.dcSource, parsed.dcStart, parsed.dcStop, parsed.dcStep};
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
@@ -159,9 +195,10 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
         cb.onConvergenceStep(it, res);
     };
 
-    SolverStep step = sim.solveDC(netlist);
-    return stepToResponse(step, jobId_, precision_);
+    if (sweep.sweepVariable.empty()) return stepToResponse(sim.solveDC(netlist), jobId_, precision_);
+    return dcSweep(sim, netlist, sweep, cb, [this] { return status_.load() == JobStatus::Cancelled; });
 }
+
 
 // ── AC Analysis ───────────────────────────────────────────────────────────
 SimulationResponseDTO SessionImpl::runAC(const SimulationRequestDTO& req,
@@ -169,29 +206,44 @@ SimulationResponseDTO SessionImpl::runAC(const SimulationRequestDTO& req,
     status_.store(JobStatus::Running);
     SimulationResponseDTO result = dispatch_ac_internal(req, cb);
     result.jobId = jobId_;
+    result.success = result.converged;  // driver-path consumers read success
     status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
     return result;
 }
 
 SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestDTO& req,
                                                           const EngineCallbacks& cb) {
-    TensorNetlist netlist;
-    SimulationResponseDTO failure;
-    if (!deserialiseRequest(req, netlist, failure)) return failure;
-    CircuitSim sim;
-    sim.execMode = selectExecMode(precision_);
-
-    SolverStep dc = sim.solveDC(netlist);
-    if (!dc.stats.converged) {
-        SimulationResponseDTO r;
-        r.converged   = false;
-        r.errorDetail = "DC operating point failed before AC analysis.";
+    SPICEParseResult parsed;
+    SimulationResponseDTO r;
+    if (!deserialiseRequest(req, parsed, r)) return r;
+    TensorNetlist& netlist = parsed.netlist;
+    ACConfigDTO ac = req.ac;  // an explicit request wins over the netlist's .ac
+    if (ac.points == 0) ac = {parsed.acSweep, parsed.acPoints, parsed.acStart, parsed.acStop};
+    const auto freqs = CircuitSim::acFrequencies(ac.sweep, ac.points, ac.fStart, ac.fStop);
+    if (freqs.empty()) {
+        r.errorDetail = "AC needs a sweep: .ac dec|oct|lin n fstart fstop (0 < fstart <= fstop).";
         return r;
     }
-
-    SimulationResponseDTO result = stepToResponse(dc, jobId_, precision_);
-    result.analysisType = AnalysisTypeDTO::AC;
-    return result;
+    CircuitSim sim;
+    sim.execMode = selectExecMode(precision_);
+    SolverStep dc = sim.solveDC(netlist);
+    if (!dc.stats.converged) {
+        r.errorDetail = "DC operating point failed before AC analysis: " + dc.stats.error_detail;
+        return r;
+    }
+    const auto X = sim.solveAC(netlist, freqs);
+    r.converged    = X.size() == freqs.size();
+    r.analysisType = AnalysisTypeDTO::AC;
+    for (size_t k = 0; k < X.size(); ++k) {
+        WaveformDataPoint pt{freqs[k], {}, {}, {}};
+        for (int i = 0; i < netlist.numGlobalNodes; ++i) {
+            pt.nodeVoltages.push_back(X[k][i].real());
+            pt.nodeVoltagesImag.push_back(X[k][i].imag());
+        }
+        r.waveformPoints.push_back(std::move(pt));
+        cb.onProgress(static_cast<int>(k + 1), static_cast<int>(freqs.size()));
+    }
+    return r;
 }
 
 // ── Transient Analysis ────────────────────────────────────────────────────
@@ -201,6 +253,7 @@ SimulationResponseDTO SessionImpl::runTransient(const SimulationRequestDTO& req,
     status_.store(JobStatus::Running);
     SimulationResponseDTO result = dispatch_tran_internal(req, cb, std::move(streamCallback));
     result.jobId = jobId_;
+    result.success = result.converged;  // driver-path consumers read success
     status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
     return result;
 }
@@ -208,10 +261,11 @@ SimulationResponseDTO SessionImpl::runTransient(const SimulationRequestDTO& req,
 SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationRequestDTO& req,
                                                             const EngineCallbacks& cb,
                                                             ResultChunkCallback streamCb) {
-    TensorNetlist netlist;
+    SPICEParseResult parsed;
     SimulationResponseDTO failure;
-    bool uic = false;
-    if (!deserialiseRequest(req, netlist, failure, &uic)) return failure;
+    if (!deserialiseRequest(req, parsed, failure)) return failure;
+    TensorNetlist& netlist = parsed.netlist;
+    const bool uic = parsed.tranUIC || req.transient.uic;
     const double  stopTime = req.transient.stopTimeS;
     const double  dt       = req.transient.stepSizeS;
 
@@ -221,7 +275,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     SimulationResponseDTO result;
     uint64_t stepIdx = 0;
     const std::string err = sim.runTransient(
-        netlist, dt, stopTime, uic || req.transient.uic, [&](const SolverStep& step) {
+        netlist, dt, stopTime, uic, [&](const SolverStep& step) {
             if (status_.load() == JobStatus::Cancelled) return false;
             WaveformDataPoint pt;
             pt.timeS        = step.time;
@@ -250,7 +304,7 @@ SimulationResponseDTO SessionImpl::runMonteCarlo(const SimulationRequestDTO& req
     agg.converged    = true;
     agg.jobId        = jobId_;
 
-    for (int i = 0; i < mc.numRuns && status_.load() != JobStatus::Cancelled; ++i) {
+    for (int i = 0; i < mc.sampleCount && status_.load() != JobStatus::Cancelled; ++i) {
         SimulationRequestDTO run_req = req;
         run_req.mcSeed = mc.seed + i;
         auto r = dispatch_dc_internal(run_req, cb);
@@ -258,17 +312,43 @@ SimulationResponseDTO SessionImpl::runMonteCarlo(const SimulationRequestDTO& req
         if (!r.waveformPoints.empty()) {
             agg.waveformPoints.push_back(r.waveformPoints.front());
         }
-        cb.onProgress(i + 1, mc.numRuns);
+        cb.onProgress(i + 1, mc.sampleCount);
     }
 
+    agg.success = agg.converged;  // driver-path consumers read success
     status_.store(agg.converged ? JobStatus::Completed : JobStatus::Failed);
     return agg;
 }
 
 // ── Noise ─────────────────────────────────────────────────────────────────
 SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
-                                             const EngineCallbacks& cb) {
-    return runAC(req, cb);
+                                             const EngineCallbacks& /*cb*/) {
+    status_.store(JobStatus::Running);
+    SimulationResponseDTO r;
+    r.jobId        = jobId_;
+    r.analysisType = AnalysisTypeDTO::NOISE;
+    SPICEParseResult parsed;
+    if (deserialiseRequest(req, parsed, r)) {
+        TensorNetlist& netlist = parsed.netlist;
+        const auto freqs = CircuitSim::acFrequencies(parsed.noiseSweep, parsed.noisePoints,
+                                                     parsed.noiseStart, parsed.noiseStop);
+        CircuitSim sim;
+        sim.execMode = selectExecMode(precision_);
+        if (parsed.noiseSource.empty() || freqs.empty())
+            r.errorDetail = "Noise needs .noise v(out[,ref]) src dec|oct|lin n fstart fstop.";
+        else if (SolverStep dc = sim.solveDC(netlist); !dc.stats.converged)
+            r.errorDetail = "DC operating point failed before noise analysis: " + dc.stats.error_detail;
+        else {
+            auto nz = sim.solveNoise(netlist, freqs, parsed.noiseOut, parsed.noiseRef, parsed.noiseSource);
+            r.errorDetail = nz.error;
+            r.converged   = nz.error.empty();
+            r.extended.hasNoise = r.converged;
+            r.extended.noise = {freqs, std::move(nz.onoise), std::move(nz.inoise), nz.onoiseTotal, nz.inoiseTotal};
+        }
+    }
+    r.success = r.converged;  // driver-path consumers read success
+    status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);
+    return r;
 }
 
 // ============================================================================

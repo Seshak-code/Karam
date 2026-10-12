@@ -83,36 +83,18 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_context_manager.cpp
 
     # === Infrastructure ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler_ctx.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/graph_partitioner.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/factor_graph.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/treewidth_analyzer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/bond_dimension_profiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/mpo_builder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_tree.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/tn_compiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_render_graph.cpp
 
     # === Math ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/math/sparse_lu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp
 
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/schur_solver.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/contraction_executor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/ac_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/fourier_analysis.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/pz_analysis.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/tf_analysis.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/superposition.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/webgpu_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/analysis_registry.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/staged_dispatcher.cpp
 
     # === Tensors (SIMD kernels) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/kernel_dispatch.cpp
@@ -126,12 +108,6 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
 
     # === Physics (Verilog-A model compiler pipeline) ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/quick_analysis.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/lexer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/parser.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/ast.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/analyzer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/graph_assembler.cpp
 )
 
 # AVX-512 source flags
