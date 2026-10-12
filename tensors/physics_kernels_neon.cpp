@@ -194,10 +194,12 @@ void batchMosfetPhysics_neon(MosfetTensor& tensor, const std::vector<double>& vo
         float64x2_t v_gm_sat  = vmulq_f64(vmulq_f64(v_beta, v_vov), v_clm);
         float64x2_t v_gds_sat = vmulq_f64(vmulq_f64(v_half_beta, v_vov2), v_lambda);
 
-        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)
-        float64x2_t v_ids_lin = vmulq_f64(v_beta, vsubq_f64(vmulq_f64(v_vov, vds_eq), vmulq_f64(v_half, vmulq_f64(vds_eq, vds_eq))));
-        float64x2_t v_gm_lin  = vmulq_f64(v_beta, vds_eq);
-        float64x2_t v_gds_lin = vmulq_f64(v_beta, vsubq_f64(v_vov, vds_eq));
+        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)*(1 + lambda*vds') (SPICE level 1)
+        float64x2_t v_core    = vmulq_f64(v_beta, vsubq_f64(vmulq_f64(v_vov, vds_eq), vmulq_f64(v_half, vmulq_f64(vds_eq, vds_eq))));
+        float64x2_t v_ids_lin = vmulq_f64(v_core, v_clm);
+        float64x2_t v_gm_lin  = vmulq_f64(vmulq_f64(v_beta, vds_eq), v_clm);
+        float64x2_t v_gds_lin = vaddq_f64(vmulq_f64(vmulq_f64(v_beta, vsubq_f64(v_vov, vds_eq)), v_clm),
+                                          vmulq_f64(v_core, v_lambda));
 
         // Per-lane region select
         uint64x2_t m_lin = vcltq_f64(vds_eq, v_vov);   // linear if vds' < vov
@@ -246,9 +248,13 @@ void batchMosfetPhysics_neon(MosfetTensor& tensor, const std::vector<double>& vo
             tensor.gm[i] = 0.0;
             tensor.gds[i] = 1e-12;
         } else if (vds_eq < vov) {
-            tensor.ids[i] = sign * beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
-            tensor.gm[i] = beta * vds_eq;
-            tensor.gds[i] = beta * (vov - vds_eq);
+            // SPICE level 1 applies (1 + lambda*Vds) in the linear region too; without it
+            // the current jumps at Vds = Vov (ngspice inverters were off by up to 14 mV)
+            double clm = 1.0 + tensor.lambda[i] * vds_eq;
+            double core = beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
+            tensor.ids[i] = sign * core * clm;
+            tensor.gm[i] = beta * vds_eq * clm;
+            tensor.gds[i] = beta * (vov - vds_eq) * clm + core * tensor.lambda[i];
         } else {
             double lam = tensor.lambda[i];
             tensor.ids[i] = sign * 0.5 * beta * vov * vov * (1.0 + lam * vds_eq);

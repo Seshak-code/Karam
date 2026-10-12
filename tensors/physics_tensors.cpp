@@ -88,10 +88,13 @@ void batchMosfetPhysics_generic(MosfetTensor& tensor, const std::vector<double>&
             tensor.gm[i] = 0.0;
             tensor.gds[i] = 1e-12; // GMIN
         } else if (local_vds < vov) {
-            // Linear region
-            tensor.ids[i] = sign * K * (2.0 * vov * local_vds - local_vds * local_vds);
-            tensor.gm[i] = 2.0 * K * local_vds;
-            tensor.gds[i] = 2.0 * K * (vov - local_vds);
+            // Linear region. SPICE level 1 applies (1 + lambda*Vds) in the linear region too; without it
+            // the current jumps at Vds = Vov (ngspice inverters were off by up to 14 mV)
+            double clm = 1.0 + tensor.lambda[i] * local_vds;
+            double core = K * (2.0 * vov * local_vds - local_vds * local_vds);
+            tensor.ids[i] = sign * core * clm;
+            tensor.gm[i] = 2.0 * K * local_vds * clm;
+            tensor.gds[i] = 2.0 * K * (vov - local_vds) * clm + core * tensor.lambda[i];
         } else {
             // Saturation
             double lam = tensor.lambda[i];

@@ -373,19 +373,20 @@ fn batchMosfetPhysics(
     let gm_cut  = f64(0.0,  0.0);
     let gds_cut = f64(1e-12, 0.0); // GMIN
 
-    // --- Linear region ---
-    let ids_lin = f64_mul(f64(sign, 0.0), f64_mul(K,
-        f64_sub(
-            f64_mul(f64(2.0, 0.0), f64_mul(vov, local_vds)),
-            f64_mul(local_vds, local_vds)
-        )
-    ));
-    let gm_lin  = f64_mul(f64(2.0, 0.0), f64_mul(K, local_vds));
-    let gds_lin = f64_mul(f64(2.0, 0.0), f64_mul(K, f64_sub(vov, local_vds)));
-
-    // --- Saturation region ---
+    // --- Channel-length modulation (both regions, as in SPICE level 1) ---
     let lam      = f64(mosfets.devices[i].lambda_hi, mosfets.devices[i].lambda_lo);
     let term     = f64_add(f64(1.0, 0.0), f64_mul(lam, local_vds));
+
+    // --- Linear region ---
+    let core_lin = f64_mul(K, f64_sub(
+            f64_mul(f64(2.0, 0.0), f64_mul(vov, local_vds)),
+            f64_mul(local_vds, local_vds)));
+    let ids_lin = f64_mul(f64(sign, 0.0), f64_mul(core_lin, term));
+    let gm_lin  = f64_mul(f64_mul(f64(2.0, 0.0), f64_mul(K, local_vds)), term);
+    let gds_lin = f64_add(f64_mul(f64_mul(f64(2.0, 0.0), f64_mul(K, f64_sub(vov, local_vds))), term),
+                          f64_mul(core_lin, lam));
+
+    // --- Saturation region ---
     let ids_sat  = f64_mul(f64(sign, 0.0), f64_mul(K, f64_mul(f64_mul(vov, vov), term)));
     let gm_sat   = f64_mul(f64(2.0, 0.0), f64_mul(K, f64_mul(vov, term)));
     let gds_sat  = f64_mul(K, f64_mul(f64_mul(vov, vov), lam));

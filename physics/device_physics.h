@@ -237,8 +237,9 @@ inline T mosfet_ids(T vgs, T vds, const MosfetParams<P>& p)
     
     if (vds < vov) 
     {
-        // Linear Region: Ids = K * (2*Vov*Vds - Vds^2)
-        return K * (2.0 * vov * vds - vds * vds);
+        // Linear Region: Ids = K * (2*Vov*Vds - Vds^2) * (1 + lambda*Vds)
+        // (SPICE level 1 applies channel-length modulation in both regions)
+        return K * (2.0 * vov * vds - vds * vds) * (1.0 + p.lambda * vds);
     } 
     else 
     {

@@ -192,12 +192,14 @@ void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& vo
         __m256d v_gm_sat  = _mm256_mul_pd(_mm256_mul_pd(v_beta, v_vov), v_clm);
         __m256d v_gds_sat = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_lambda);
 
-        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)
-        __m256d v_ids_lin = _mm256_mul_pd(v_beta,
+        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)*(1 + lambda*vds') (SPICE level 1)
+        __m256d v_core = _mm256_mul_pd(v_beta,
             _mm256_sub_pd(_mm256_mul_pd(v_vov, vds_eq),
                           _mm256_mul_pd(_mm256_set1_pd(0.5), _mm256_mul_pd(vds_eq, vds_eq))));
-        __m256d v_gm_lin  = _mm256_mul_pd(v_beta, vds_eq);
-        __m256d v_gds_lin = _mm256_mul_pd(v_beta, _mm256_sub_pd(v_vov, vds_eq));
+        __m256d v_ids_lin = _mm256_mul_pd(v_core, v_clm);
+        __m256d v_gm_lin  = _mm256_mul_pd(_mm256_mul_pd(v_beta, vds_eq), v_clm);
+        __m256d v_gds_lin = _mm256_add_pd(_mm256_mul_pd(_mm256_mul_pd(v_beta, _mm256_sub_pd(v_vov, vds_eq)), v_clm),
+                                          _mm256_mul_pd(v_core, v_lambda));
 
         // Per-lane region select via blendv
         __m256d m_lin = _mm256_cmp_pd(vds_eq, v_vov, _CMP_LT_OQ);   // linear if vds' < vov
@@ -254,9 +256,13 @@ void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& vo
             tensor.gm[i] = 0.0;
             tensor.gds[i] = 1e-12;
         } else if (vds_eq < vov) {
-            tensor.ids[i] = sign * beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
-            tensor.gm[i] = beta * vds_eq;
-            tensor.gds[i] = beta * (vov - vds_eq);
+            // SPICE level 1 applies (1 + lambda*Vds) in the linear region too; without it
+            // the current jumps at Vds = Vov (ngspice inverters were off by up to 14 mV)
+            double clm = 1.0 + tensor.lambda[i] * vds_eq;
+            double core = beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
+            tensor.ids[i] = sign * core * clm;
+            tensor.gm[i] = beta * vds_eq * clm;
+            tensor.gds[i] = beta * (vov - vds_eq) * clm + core * tensor.lambda[i];
         } else {
             tensor.ids[i] = sign * 0.5 * beta * vov * vov * (1.0 + lam * vds_eq);
             tensor.gm[i] = beta * vov * (1.0 + lam * vds_eq);
