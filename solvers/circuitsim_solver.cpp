@@ -189,48 +189,10 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   if (netlist.numGlobalNodes == 0)
     return {0.0, {}, {0, 0.0, true}, 0};
 
-#if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
-  // GPU execution path — delegate to WebGPUSolver hybrid NR loop
-  // (ACUTESIM_NO_GPU=1 forces CPU path for debugging/parity comparison)
-  if ((execMode == ExecutionMode::GPU || execMode == ExecutionMode::GPU_DEBUG)
-      && std::getenv("ACUTESIM_NO_GPU") == nullptr) {
-    netlist.globalBlock.computeTopologyHash();
-    // Borrow device + queue from the singleton — no second device creation.
-    auto &gpuMgr = acutesim::GPUContextManager::instance();
-    WebGPUSolver gpuSolver(gpuMgr.rawDevice(), gpuMgr.rawQueue());
-    if (gpuSolver.initialize(netlist)) {
-      gpuSolver.uploadNetlist(netlist);
-      constexpr int GPU_MAX_ITER = 50;
-      constexpr double GPU_TOL = 1e-9;
-      constexpr double GPU_GMIN = 1e-12;
-      std::vector<double> sol = gpuSolver.runHybridNRLoop(
-          netlist, GPU_MAX_ITER, GPU_TOL, GPU_GMIN, /*time=*/0.0, /*h=*/0.0);
-      if (!sol.empty() && gpuSolver.lastRunConverged) {
-        // The GPU loop only checks voltage deltas on the devices it stamps
-        // (no E/F/G/H, JFETs, subcircuit instances, ...), so a circuit it
-        // half-ignores can "converge". Accept only if the solution passes the
-        // CPU's own acceptance test against the FULL-netlist KCL audit.
-        scheduler.schedule(netlist); // audit walks subcircuit instances via jobs
-        double kcl_err = calculatePhysicalResiduals(netlist, sol);
-        if (checkConvergence(sol, sol, kcl_err, PhysicsConstants::KCL_TOL)) {
-          return {0.0,
-                  sol,
-                  {gpuSolver.lastRunIterations, kcl_err, true},
-                  netlist.globalBlock.topologyHash};
-        }
-        std::cerr << "[WARN] WebGPUSolver result failed KCL audit (max residual="
-                  << kcl_err << " A), falling back to CPU.\n";
-      } else {
-        std::cerr << "[WARN] WebGPUSolver did not converge (lastRunConverged="
-                  << (gpuSolver.lastRunConverged ? "true" : "false")
-                  << ", sol.empty=" << (sol.empty() ? "true" : "false")
-                  << "), falling back to CPU.\n";
-      }
-    } else {
-      std::cerr << "[WARN] WebGPUSolver init failed, falling back to CPU.\n";
-    }
-  }
-#endif
+  // GPU mode currently solves on the CPU path: the former WebGPU "hybrid" loop
+  // stamped and solved on the CPU anyway with its own copy of the device
+  // physics (voltage-only, no branch currents). Phase 4 replaces it with GPU
+  // device evaluation + batched front contraction.
 
   // Ensure topology hash is fresh
   netlist.globalBlock.computeTopologyHash();
@@ -238,7 +200,9 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // Initialize SoA Block for this solve
   soaBlock = tensorizeNetlist(netlist);
 
-  std::vector<double> voltageEstimate(netlist.numGlobalNodes, 0.0);
+  // Unknowns: node voltages then MNA branch currents (V, L, E, H)
+  const int nTot = systemSize(netlist);
+  std::vector<double> voltageEstimate(nTot, 0.0);
 
   // Gap 4: Neural seeder — use dV/dt extrapolation or EMA history if available.
   // The heuristic seedInitialGuess() always runs on top for supply rails / PN
@@ -305,9 +269,8 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       // Unified Stamping (Phase 1: Structural Abstraction)
       scheduler.schedule(netlist);
       matrixBuilder.clear();
-      matrixBuilder.setDimensions(netlist.numGlobalNodes,
-                                  netlist.numGlobalNodes);
-      rhsVector.assign(netlist.numGlobalNodes, 0.0);
+      matrixBuilder.setDimensions(nTot, nTot);
+      rhsVector.assign(nTot, 0.0);
 
       stampAllElements(netlist, 0.0, voltageEstimate, 0.0);
       addDiagonalConditioning(netlist.numGlobalNodes, gmin_factor);
@@ -324,23 +287,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         cachedPatternHash_ = netlist.globalBlock.topologyHash;
         matrix = matrixBuilder.createCsr();
 
-        // Phase B: Compute symbolic factorization from Phase A elimination
-        // ordering. The Min-Fill ordering IS the fill-reducing permutation for
-        // sparse LU.
-        if (compiledBlock_ && compiledBlock_->tnAnalysis.isAnalyzed &&
-            !compiledBlock_->tnAnalysis.eliminationOrdering.empty()) {
-          cachedSymbolic_ =
-              std::make_unique<SymbolicFactorization>(symbolicFactorize(
-                  *cachedPattern_,
-                  compiledBlock_->tnAnalysis.eliminationOrdering));
-        } else {
-          cachedSymbolic_.reset();
-        }
-
-        // Phase 5.3.3: Invalidate contraction workspace on topology change
-        cachedWorkspace_.reset();
-        // Gap 3: Invalidate cached MPOs and prev voltages on topology change
-        cachedMpos_.clear();
+        // Topology changed: drop history tied to the old unknown vector
         prevVoltages_.clear();
         // Gap 4: Reset seeder history on topology change
         neuralSeeder_.reset();
@@ -348,204 +295,14 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         matrix = matrixBuilder.assembleFast(*cachedPattern_);
       }
 
-      // Phase B: Treewidth-guided solver selection.
-      // Replaces the old binary hasActiveDevices ? LU : PCG selector with a
-      // multi-tier strategy informed by the Phase A treewidth analysis.
-      SolverResult result;
-      const auto &tw =
-          compiledBlock_ ? compiledBlock_->tnAnalysis : TreewidthAnalysis{};
-
-      if (!tw.isAnalyzed || netlist.numGlobalNodes < 20) {
-        // Default: tensor-contraction direct solver (scales; dense LU was O(N^3))
-        result = solveLinear(matrix, rhsVector);
-        if (iteration == 0 && gmin_step == 0) {
-          std::cerr << "[TN-ROUTE] CONTRACTION (nodes=" << netlist.numGlobalNodes
-                    << ", fronts=" << contractionPlan_->fronts.size()
-                    << ", levels=" << contractionPlan_->levels.size() << ")\n";
-        }
-      } else if (tw.estimatedTreewidth <= SPARSE_LU_TW_LIMIT &&
-                 cachedSymbolic_) {
-        // Low-treewidth circuits: sparse LU with Min-Fill ordering
-        if (iteration == 0 && gmin_step == 0) {
-          std::cerr << "[TN-ROUTE] SPARSE_LU (nodes=" << netlist.numGlobalNodes
-                    << ", tw=" << tw.estimatedTreewidth << ")\n";
-        }
-        result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
-        // Fallback safety: if sparse solver produces a bad residual, retry
-        // dense
-        if (result.converged && result.finalResidual > 1e-6) {
-          SolverResult denseResult = solveLinear(matrix, rhsVector);
-          if (denseResult.converged &&
-              denseResult.finalResidual < result.finalResidual) {
-            result = denseResult;
-          }
-        }
-      } else if (tw.estimatedTreewidth <= CONTRACTION_TW_LIMIT &&
-                 compiledBlock_ && compiledBlock_->tnProgram &&
-                 compiledBlock_->tnProgram->viable) {
-        // Phase 5.3.3 / Gap 1: Tensor contraction execution engine
-        if (iteration == 0 && gmin_step == 0) {
-          std::cerr << "[TN-ROUTE] CONTRACTION (nodes="
-                    << netlist.numGlobalNodes
-                    << ", tw=" << tw.estimatedTreewidth
-                    << ", mpos=" << compiledBlock_->tnProgram->mpos.size()
-                    << ")\n";
-        }
-        auto &prog = *compiledBlock_->tnProgram;
-
-        // ── Gap 3: Mixed-Precision IR — adaptive tier routing ────────────
-        // Assign precision tiers based on per-partition voltage activity.
-        // CACHED_REUSE partitions skip MPO rebuild; FP32_RELAXED uses FP64
-        // with single-precision GPU dispatch (enableFP32 defaults to false).
-        std::vector<SubgraphActivity> precisionActivities;
-        bool useCachedMpos = false;
-        if (!prevVoltages_.empty() && !cachedMpos_.empty() &&
-            compiledBlock_->partitions.size() > 1) {
-          AdaptivePrecisionRouter router;
-          precisionActivities = router.assignTiers(
-              compiledBlock_->partitions, voltageEstimate, prevVoltages_,
-              /* dt */ 1.0); // DC: use dt=1.0 (only relative dV matters)
-          uint32_t fp64N = 0, fp32N = 0, cachedN = 0;
-          AdaptivePrecisionRouter::countTiers(precisionActivities, fp64N, fp32N,
-                                              cachedN);
-          // If all partitions are cached, still do a full rebuild for safety
-          if (cachedN > 0 &&
-              cachedN < static_cast<uint32_t>(precisionActivities.size())) {
-            useCachedMpos = true;
-          }
-        }
-
-        // ── Gap 3 Full Selectivity: Per-partition selective MPO rebuild ───
-        // Only rebuild MPOs for partitions assigned FP64_FULL or FP32_RELAXED.
-        // CACHED_REUSE partitions retain their previous MPO values.
-        if (useCachedMpos && cachedMpos_.size() == prog.mpos.size()) {
-          // Build a set of device indices that need fresh evaluation
-          std::vector<bool> needsRebuild(prog.mpos.size(), false);
-          for (size_t pIdx = 0; pIdx < precisionActivities.size(); ++pIdx) {
-            if (precisionActivities[pIdx].assignedTier !=
-                PrecisionTier::CACHED_REUSE) {
-              // Mark all devices in this partition for rebuild
-              if (pIdx < compiledBlock_->partitions.size()) {
-                for (uint32_t devIdx :
-                     compiledBlock_->partitions[pIdx].deviceIndices) {
-                  if (devIdx < needsRebuild.size()) {
-                    needsRebuild[devIdx] = true;
-                  }
-                }
-              }
-            }
-          }
-
-          // Build fresh MPOs for the full block
-          auto freshMpos = MPOBuilder::buildMPOs(
-              soaBlock, voltageEstimate, netlist.environment.ambient_temp_K);
-
-          // Selective merge: use fresh for active partitions, cached for static
-          prog.mpos = cachedMpos_; // start from cached
-          for (size_t i = 0; i < freshMpos.size() && i < prog.mpos.size();
-               ++i) {
-            if (needsRebuild[i]) {
-              prog.mpos[i] = std::move(freshMpos[i]);
-            }
-          }
-        } else {
-          prog.mpos = MPOBuilder::buildMPOs(soaBlock, voltageEstimate,
-                                            netlist.environment.ambient_temp_K);
-        }
-        // Cache MPOs for next iteration's CACHED_REUSE check
-        cachedMpos_ = prog.mpos;
-
-#if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
-        // ── GPU Contraction Path (Gap 1 + HYBRID mode) ──────────────────
-        // GPU/GPU_DEBUG/HYBRID: forward the compiled contraction program to
-        // WebGPUSolver and execute the tree on GPU via tn_contraction.wgsl.
-        // HYBRID mode dispatches GPU contraction asynchronously and can
-        // overlap with CPU work on subsequent iterations.
-        if (execMode == ExecutionMode::GPU ||
-            execMode == ExecutionMode::GPU_DEBUG ||
-            execMode == ExecutionMode::HYBRID) {
-          auto &gpuMgr = acutesim::GPUContextManager::instance();
-          WebGPUSolver gpuContractor(gpuMgr.rawDevice(), gpuMgr.rawQueue());
-          if (gpuContractor.initialize(netlist)) {
-            // Upload MPO tensors + contraction tree to GPU workspace
-            gpuContractor.uploadContractionProgram(prog,
-                                                   netlist.numGlobalNodes);
-            // Execute GPU contraction sweep
-            std::vector<double> gpuSol = gpuContractor.executeContractionSweep(
-                netlist.numGlobalNodes, gmin_factor);
-            if (gpuSol.size() == static_cast<size_t>(matrix.rows)) {
-              // Real ||Ax - b|| against the CPU-assembled system (was hard-coded
-              // 0.0, which disabled the poor-residual fallback below).
-              std::vector<double> Ax(gpuSol.size(), 0.0);
-              matrixMultiplication(matrix, gpuSol.data(), Ax.data());
-              double r2 = 0.0;
-              for (size_t i = 0; i < Ax.size(); ++i)
-                r2 += (Ax[i] - rhsVector[i]) * (Ax[i] - rhsVector[i]);
-              result.solution = gpuSol;
-              result.converged = std::isfinite(r2);
-              result.finalResidual = std::sqrt(r2);
-            }
-            // Fallback: if GPU path returned empty, fall through to CPU below
-            if (!result.converged) {
-              std::cerr << "[WARN] GPU contraction sweep failed — falling back "
-                           "to CPU TN\n";
-            }
-          }
-        }
-#endif
-
-        // ── CPU Contraction Path (reference, always available) ───────────
-        if (!result.converged) {
-          // Allocate or reuse cached workspace
-          if (!cachedWorkspace_) {
-            cachedWorkspace_ = std::make_unique<TensorWorkspace>();
-            cachedWorkspace_->allocate(prog.tree);
-          }
-          result = ContractionExecutor::solve(
-              prog, *cachedWorkspace_, netlist.numGlobalNodes, gmin_factor);
-        }
-
-        // Fallback: if contraction solve fails or has poor residual, try
-        // sparse/dense
-        if (!result.converged || result.finalResidual > 1e-6) {
-          if (cachedSymbolic_) {
-            result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
-          }
-          if (!result.converged || result.finalResidual > 1e-6) {
-            result = solveLinear(matrix, rhsVector);
-          }
-        }
-
-      } else if (tw.estimatedTreewidth <= SCHUR_TW_LIMIT && compiledBlock_ &&
-                 compiledBlock_->tnProgram &&
-                 compiledBlock_->tnProgram->viable &&
-                 compiledBlock_->partitions.size() > 1) {
-        // Phase 5.3.2: Schur complement domain decomposition
-        if (iteration == 0 && gmin_step == 0) {
-          std::cerr << "[TN-ROUTE] SCHUR (nodes=" << netlist.numGlobalNodes
-                    << ", tw=" << tw.estimatedTreewidth
-                    << ", partitions=" << compiledBlock_->partitions.size()
-                    << ")\n";
-        }
-        result =
-            SchurSolver::solve(compiledBlock_->partitions, matrix, rhsVector);
-        // Fallback safety: if Schur solve produces a bad residual, retry
-        // sparse/dense
-        if (!result.converged || result.finalResidual > 1e-6) {
-          if (cachedSymbolic_) {
-            result = solveSparse_LU(matrix, rhsVector, *cachedSymbolic_);
-          }
-          if (!result.converged || result.finalResidual > 1e-6) {
-            result = solveLinear(matrix, rhsVector);
-          }
-        }
-      } else {
-        // High-treewidth or no symbolic data: PCG then dense fallback
-        if (iteration == 0 && gmin_step == 0) {
-          std::cerr << "[TN-ROUTE] PCG (nodes=" << netlist.numGlobalNodes
-                    << ", tw=" << tw.estimatedTreewidth << ")\n";
-        }
-        result = solveLinear(matrix, rhsVector);
+      // Tensor-contraction direct solver for every circuit (the legacy
+      // treewidth / MPO / Schur routes solved a voltage-only system)
+      SolverResult result = solveLinear(matrix, rhsVector);
+      if (iteration == 0 && si == 0) {
+        std::cerr << "[TN-ROUTE] CONTRACTION (unknowns=" << nTot
+                  << ", branches=" << nTot - netlist.numGlobalNodes
+                  << ", fronts=" << contractionPlan_->fronts.size()
+                  << ", levels=" << contractionPlan_->levels.size() << ")\n";
       }
       // Phase 2.9: Capture pivot diagnostics from LU
       if (result.smallestPivot < smallestPivotOverall) {
@@ -703,6 +460,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   std::vector<double> perNodeResiduals;
   final_kcl_error =
       calculatePhysicalResiduals(netlist, voltageEstimate, perNodeResiduals);
+  perNodeResiduals.resize(netlist.numGlobalNodes);  // worst NODE (not branch row)
 
   // Compute RMS and worst node
   double rmsResidual = 0.0;
@@ -779,6 +537,8 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                                  total_iterations);
   }
 
+  lastSolution_ = voltageEstimate;  // full x (incl. branch currents) seeds transient
+  voltageEstimate.resize(netlist.numGlobalNodes);  // API returns node voltages
   return {0.0, voltageEstimate, stats, netlist.globalBlock.topologyHash};
 }
 
@@ -792,7 +552,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 // subcircuits restarted from zero history every step.
 void CircuitSim::loadSoAFromNetlist(const TensorNetlist &netlist) {
   soaBlock = tensorizeNetlist(netlist);
-  size_t kc = 0, kl = 0;
+  size_t kc = 0;
   auto sync = [&](const TensorBlock &blk, const BlockState &st) {
     for (size_t i = 0; i < blk.capacitors.size(); ++i, ++kc) {
       if (i >= st.capacitorState.size() || kc >= soaBlock.capacitors.size()) continue;
@@ -800,12 +560,6 @@ void CircuitSim::loadSoAFromNetlist(const TensorNetlist &netlist) {
       if (!hist.v.empty()) soaBlock.capacitors.v_prev[kc] = hist.v[0];
       if (hist.v.size() > 1) soaBlock.capacitors.v_prev2[kc] = hist.v[1];
       if (!hist.i.empty()) soaBlock.capacitors.i_prev[kc] = hist.i[0];
-    }
-    for (size_t i = 0; i < blk.inductors.size(); ++i, ++kl) {
-      if (i >= st.inductorState.size() || kl >= soaBlock.inductors.size()) continue;
-      const auto &hist = st.inductorState[i];
-      if (!hist.i.empty()) soaBlock.inductors.i_prev[kl] = hist.i[0];
-      if (!hist.v.empty()) soaBlock.inductors.v_prev[kl] = hist.v[0];
     }
   };
   sync(netlist.globalBlock, netlist.globalState);
@@ -816,15 +570,29 @@ void CircuitSim::loadSoAFromNetlist(const TensorNetlist &netlist) {
   }
 }
 
-// Capacitor companion-model history after an accepted step, for the global
-// block AND every subcircuit instance, with exactly the formulas used by
-// stampSoABlock() and the KCL audit (this used to exist in three copies, one
-// global-only, with a Gear2 heuristic the audit did not share).
-void CircuitSim::updateCapacitorHistory(TensorNetlist &netlist, const std::vector<double> &v,
+// Reactive-element history after an accepted step, for the global block AND
+// every subcircuit instance. Capacitors use exactly the formulas of
+// stampSoABlock() and the KCL audit; inductors record their SOLVED branch
+// current (previously inductor history was never written back at all, so any
+// transient with an inductor failed to converge).
+void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector<double> &v,
                                         double h) {
   const IntegrationType type = integrator->getType();
   auto getV = [&](int n) { return (n > 0 && n <= (int)v.size()) ? v[n - 1] : 0.0; };
+  int total = 0;
+  const auto branchList = branchSlots(netlist, total);  // same block order as below
+  size_t slot = 0;
   auto update = [&](const TensorBlock &blk, BlockState &st, const std::function<int(int)> &mapNode) {
+    const int indBase = slot < branchList.size() ? branchList[slot++].ind : -1;
+    for (size_t a = 0; a < blk.inductors.size() && a < st.inductorState.size() && indBase >= 0; ++a) {
+      auto &hist = st.inductorState[a];
+      if (hist.v.empty()) hist.resize(3);
+      const auto &L = blk.inductors[a];
+      const int b = indBase + (int)a;
+      integrator->updateHistory(hist.v, hist.i,
+                                getV(mapNode(L.nodeCoil1)) - getV(mapNode(L.nodeCoil2)),
+                                b < (int)v.size() ? v[b] : 0.0);
+    }
     for (size_t i = 0; i < blk.capacitors.size() && i < st.capacitorState.size(); ++i) {
       const auto &c = blk.capacitors[i];
       auto &hist = st.capacitorState[i];
@@ -861,10 +629,9 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
   // The caller already set this before invoking coldStartSweep.
   const double dt_sub = totalTime / static_cast<double>(nSubsteps);
 
-  // Seed the first micro-step NR estimate from the DC OP (arbiter history).
-  std::vector<double> nrEstimate = arbiter.getPrevVoltages();
-  if (nrEstimate.empty())
-    nrEstimate.assign(netlist.numGlobalNodes, 0.0);
+  // Seed from the last full solution (node voltages + branch currents)
+  const int nTot = systemSize(netlist);
+  std::vector<double> nrEstimate = transientSeed(netlist, nTot);
 
   for (int k = 0; k < nSubsteps; ++k) {
     // Sync soaBlock capacitor/inductor history from AoS netlist state.
@@ -880,9 +647,8 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
     for (int iteration = 0; iteration < MAX_NR_ITER; ++iteration) {
       scheduler.schedule(netlist);
       matrixBuilder.clear();
-      matrixBuilder.setDimensions(netlist.numGlobalNodes,
-                                  netlist.numGlobalNodes);
-      rhsVector.assign(netlist.numGlobalNodes, 0.0);
+      matrixBuilder.setDimensions(nTot, nTot);
+      rhsVector.assign(nTot, 0.0);
 
       stampAllElements(netlist, dt_sub, nrEstimate, dt_sub * (k + 1));
       addDiagonalConditioning(netlist.numGlobalNodes);
@@ -908,7 +674,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
       return false;
     }
 
-    updateCapacitorHistory(netlist, nrEstimate, dt_sub);
+    updateReactiveHistory(netlist, nrEstimate, dt_sub);
     lteController_.recordStep(dt_sub);
     // Note: Inductor history write-back is not performed here, consistent with
     // stepTransient which also does not write back inductorState in its main
@@ -996,9 +762,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
     while (attempt < MAX_ATTEMPTS) {
       integrator->prepareStep(actualTimeStep);
 
-      std::vector<double> nrEstimate = arbiter.getPrevVoltages();
-      if (nrEstimate.empty())
-        nrEstimate.assign(netlist.numGlobalNodes, 0.0);
+      const int nTot = systemSize(netlist);
+      std::vector<double> nrEstimate = transientSeed(netlist, nTot);
 
       // Gap 4: Neural seeder dV/dt extrapolation for transient steps.
       // Uses the two most recent converged solutions to predict the next state.
@@ -1020,9 +785,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       for (int iteration = 0; iteration < MAX_NR_ITER; ++iteration) {
         scheduler.schedule(netlist);
         matrixBuilder.clear();
-        matrixBuilder.setDimensions(netlist.numGlobalNodes,
-                                    netlist.numGlobalNodes);
-        rhsVector.assign(netlist.numGlobalNodes, 0.0);
+        matrixBuilder.setDimensions(nTot, nTot);
+        rhsVector.assign(nTot, 0.0);
 
         stampAllElements(netlist, actualTimeStep, nrEstimate,
                          currentTime + actualTimeStep);
@@ -1078,8 +842,11 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       }
 
       // Original arbiter stability analysis (energy monitor, Lyapunov check)
+      // The arbiter tracks node voltages only (it re-initialises on a size change)
       int suggestion = arbiter.analyzeStability(
-          netlist, nrEstimate, actualTimeStep, next_dt_suggestion);
+          netlist,
+          std::vector<double>(nrEstimate.begin(), nrEstimate.begin() + netlist.numGlobalNodes),
+          actualTimeStep, next_dt_suggestion);
 
       if (suggestion == 1) {
         actualTimeStep *= 0.5;
@@ -1128,7 +895,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   // updated inside the sweep loop.  Skip the history-update block to avoid
   // double-updating the companion-model state.
   if (simulationConverged && !isFirstTransientStepHandled) {
-    updateCapacitorHistory(netlist, finalVoltages, actualTimeStep);
+    updateReactiveHistory(netlist, finalVoltages, actualTimeStep);
 
     lteController_.recordStep(actualTimeStep);
 
@@ -1181,6 +948,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   prevVoltages_ = finalVoltages;
   neuralSeeder_.recordSolution(finalVoltages, lastResult.finalResidual,
                                lastResult.iterations);
+  lastSolution_ = finalVoltages;                    // full x seeds the next step
+  finalVoltages.resize(netlist.numGlobalNodes);     // API returns node voltages
 
   return {
       currentTime + actualTimeStep,

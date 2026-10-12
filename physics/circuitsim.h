@@ -1292,9 +1292,20 @@ private:
    *  (global + instances) from the AoS state. */
   void loadSoAFromNetlist(const TensorNetlist& netlist);
 
-  /** Capacitor history after an accepted step (global + instances), using
-   *  the same companion formulas as the stamps and the KCL audit. */
-  void updateCapacitorHistory(TensorNetlist& netlist, const std::vector<double>& v, double h);
+  /** Capacitor + inductor history after an accepted step (global + instances),
+   *  using the same companion formulas as the stamps and the KCL audit. */
+  void updateReactiveHistory(TensorNetlist& netlist, const std::vector<double>& v, double h);
+
+  /** Last full solution x (node voltages + branch currents). */
+  std::vector<double> lastSolution_;
+  /** Newton starting point for a transient step: the last full solution when
+   *  the topology matches, else the arbiter's node voltages, zero-padded. */
+  std::vector<double> transientSeed(const TensorNetlist& netlist, int nTot) {
+    if ((int)lastSolution_.size() == nTot) return lastSolution_;
+    std::vector<double> x = arbiter.getPrevVoltages();
+    x.resize(nTot, 0.0);
+    return x;
+  }
 
   // NR Parameters (Using centralized PhysicsConstants)
   // Note: Kept as local constexpr for backward compatibility; prefer PhysicsConstants::
@@ -1337,6 +1348,128 @@ private:
   }
 
 public:
+  // ── MNA branch currents ────────────────────────────────────────────────
+  // Unknowns x = [node voltages (N) | branch currents (B)]. V sources,
+  // inductors, E (VCVS) and H (CCVS) each carry a branch current flowing from
+  // their + node through the element to their - node; F (CCCS) and H read the
+  // branch current of their controlling V source. Branch order: all V
+  // sources, then inductors, then E, then H, each over the global block then
+  // every instance (tensorizeNetlist order), so indices are fixed per topology.
+  // These replace the 1 mOhm / 100 uOhm Norton approximations: sources and
+  // shorts are now exact (an SoC power grid IS milliohms of metal).
+  struct BranchSlot {
+    const TensorBlock *blk;
+    const BlockState *st;
+    std::function<int(int)> map;   // local node -> global node
+    int vs, ind, e, h;             // first matrix row of each branch kind
+  };
+  std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
+    std::vector<BranchSlot> branchList;
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0});
+    for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
+      auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
+      if (it == nl.blockDefinitions.end()) continue;
+      const auto *inst = &nl.instances[k];
+      branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
+        return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
+      }, 0, 0, 0, 0});
+    }
+    int next = nl.numGlobalNodes;
+    for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
+    for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
+    for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
+    for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
+    total = next;
+    return branchList;
+  }
+  int systemSize(const TensorNetlist &nl) const { int t = 0; branchSlots(nl, t); return t; }
+
+  // All branch-element matrix entries + rhs. Stamping adds them to the matrix;
+  // the KCL audit evaluates rhs - A x from the SAME triplets, so the two can
+  // never disagree.
+  struct BranchSystem { std::vector<int> r, c; std::vector<double> v, rhs; };
+  void buildBranchSystem(const TensorNetlist &nl, double h, double time, BranchSystem &S) const {
+    int total = 0;
+    auto branchList = branchSlots(nl, total);
+    S.r.clear(); S.c.clear(); S.v.clear(); S.rhs.assign(total, 0.0);
+    auto add = [&](int r, int c, double v) {
+      if (r >= 0 && c >= 0) { S.r.push_back(r); S.c.push_back(c); S.v.push_back(v); }
+    };
+    const bool tran = h > 1e-15 && integrator;
+    const IntegrationType type = tran ? integrator->getType() : IntegrationType::GEAR_1_EULER;
+    // Inductor companion: v = coef * sum_j L_aj * i_j + history (per method)
+    const double coef = !tran ? 0.0 : type == IntegrationType::TRAPEZOIDAL ? 2.0 / h
+                       : type == IntegrationType::GEAR_2 ? 1.5 / h : 1.0 / h;
+    const double scale = nl.environment.global_voltage_scale;
+    for (const auto &sl : branchList) {
+      auto node = [&](int local) { return sl.map(local) - 1; };  // ground -> -1 (skipped)
+      auto branch = [&](int b, int np, int nn) {  // KCL coupling + v(+) - v(-) in row b
+        add(np, b, 1.0); add(nn, b, -1.0); add(b, np, 1.0); add(b, nn, -1.0);
+      };
+      const auto &blk = *sl.blk;
+      for (size_t i = 0; i < blk.voltageSources.size(); ++i) {
+        const auto &v = blk.voltageSources[i];
+        const int b = sl.vs + (int)i;
+        branch(b, node(v.nodePositive), node(v.nodeNegative));
+        S.rhs[b] += scale * (tran ? waveformValue(v, v.voltage_V, time) : v.voltage_V);
+      }
+      // Inductors (+ mutual coupling K: off-diagonal L_ab terms between branch rows)
+      const auto &L = blk.inductors;
+      std::vector<std::vector<std::pair<int, double>>> flux(L.size());
+      for (size_t a = 0; a < L.size(); ++a) flux[a].push_back({(int)a, L[a].inductance_henries});
+      for (const auto &k : blk.mutualInductors) {
+        int a = k.inductor1_index, c = k.inductor2_index;
+        if (a < 0 || c < 0 || a >= (int)L.size() || c >= (int)L.size() || a == c) continue;
+        double M = k.couplingCoefficient_k * std::sqrt(L[a].inductance_henries * L[c].inductance_henries);
+        flux[a].push_back({c, M});
+        flux[c].push_back({a, M});
+      }
+      for (size_t a = 0; a < L.size(); ++a) {
+        const int b = sl.ind + (int)a;
+        branch(b, node(L[a].nodeCoil1), node(L[a].nodeCoil2));  // DC: v1 - v2 = 0 (short)
+        if (!tran) continue;
+        for (auto [j, Laj] : flux[a]) {
+          add(b, sl.ind + j, -coef * Laj);
+          const auto &hj = sl.st->inductorState[j];
+          double i1 = hj.i.empty() ? 0.0 : hj.i[0];
+          double i2 = hj.i.size() > 1 ? hj.i[1] : i1;
+          S.rhs[b] += (type == IntegrationType::GEAR_2) ? (Laj / h) * (-2.0 * i1 + 0.5 * i2)
+                                                        : -coef * Laj * i1;
+        }
+        if (type == IntegrationType::TRAPEZOIDAL) {
+          const auto &ha = sl.st->inductorState[a];
+          S.rhs[b] -= ha.v.empty() ? 0.0 : ha.v[0];
+        }
+      }
+      for (size_t k = 0; k < blk.voltageControlledVoltageSources.size(); ++k) {
+        const auto &e = blk.voltageControlledVoltageSources[k];
+        const int b = sl.e + (int)k;
+        branch(b, node(e.outPos), node(e.outNeg));
+        add(b, node(e.ctrlPos), -e.gain);
+        add(b, node(e.ctrlNeg), e.gain);
+      }
+      for (size_t k = 0; k < blk.currentControlledVoltageSources.size(); ++k) {
+        const auto &hs = blk.currentControlledVoltageSources[k];
+        const int b = sl.h + (int)k;
+        branch(b, node(hs.outPos), node(hs.outNeg));
+        if (hs.ctrlSource >= 0 && hs.ctrlSource < (int)blk.voltageSources.size())
+          add(b, sl.vs + hs.ctrlSource, -hs.rm);
+      }
+      for (const auto &f : blk.currentControlledCurrentSources) {
+        if (f.ctrlSource < 0 || f.ctrlSource >= (int)blk.voltageSources.size()) continue;
+        const int bc = sl.vs + f.ctrlSource;  // alpha * I(ctrl) leaves out+ through the source
+        add(node(f.outPos), bc, f.alpha);
+        add(node(f.outNeg), bc, -f.alpha);
+      }
+    }
+  }
+  void stampBranchSystem(const TensorNetlist &nl, double h, double time) {
+    BranchSystem S;
+    buildBranchSystem(nl, h, time, S);
+    for (size_t t = 0; t < S.r.size(); ++t) matrixBuilder.add(S.r[t], S.c[t], S.v[t]);
+    for (size_t i = 0; i < S.rhs.size() && i < rhsVector.size(); ++i) rhsVector[i] += S.rhs[i];
+  }
+
   /**
    * calculatePhysicalResiduals
    * Audits the solution by checking Kirchhoff's Current Law using EXACT
@@ -1351,7 +1484,8 @@ public:
     if (n == 0)
       return 0.0;
 
-    std::vector<double> node_residuals(n, 0.0);
+    // Rows: node KCL (amps) then branch equations (volts)
+    std::vector<double> node_residuals(systemSize(netlist), 0.0);
 
     // helper to get node voltage (Safe Access)
     auto getV = [&](int nodeIdx) {
@@ -1375,17 +1509,8 @@ public:
       addRes(r.nodeTerminal2, i_r);  // Current ENTERING node
     }
 
-    // 2. Voltage Sources (Norton Equivalent for Check)
-    for (const auto &v : netlist.globalBlock.voltageSources) {
-      double v1 = getV(v.nodePositive);
-      double v2 = getV(v.nodeNegative);
-      double r_int = 1e-3; // Match the stamp's internal resistance
-      // Transient: same instantaneous value the stamps used at `time`
-      double vs = (h > 1e-15) ? waveformValue(v, v.voltage_V, time) : v.voltage_V;
-      double i_src = (vs - (v1 - v2)) / r_int;
-      addRes(v.nodePositive, i_src);
-      addRes(v.nodeNegative, -i_src);
-    }
+    // 2. V sources, inductors, E/F/H: branch-current elements, audited from
+    //    the same triplets they are stamped with (see buildBranchSystem below)
 
     // 2.5. Current Sources (Ideal Current Injection)
     // Current sources inject fixed current regardless of voltage
@@ -1396,42 +1521,12 @@ public:
       addRes(cs.nodeNegative, is);  // Current entering - node
     }
 
-    // 2.7 Dependent Sources (Global)
-    for (const auto &vcvs : netlist.globalBlock.voltageControlledVoltageSources) {
-        double v_ctrl = getV(vcvs.ctrlPos) - getV(vcvs.ctrlNeg);
-        double v_out = getV(vcvs.outPos) - getV(vcvs.outNeg);
-        double i_vcvs = (vcvs.gain * v_ctrl - v_out) / 1e-4; // R_int = 1e-4
-        addRes(vcvs.outPos, i_vcvs);
-        addRes(vcvs.outNeg, -i_vcvs);
-    }
+    // 2.7 Dependent Sources (Global): G only; E/F/H are branch elements
     for (const auto &vccs : netlist.globalBlock.voltageControlledCurrentSources) {
         double v_ctrl = getV(vccs.ctrlPos) - getV(vccs.ctrlNeg);
         double i_vccs = vccs.gm * v_ctrl;
         addRes(vccs.outPos, -i_vccs);
         addRes(vccs.outNeg, i_vccs);
-    }
-    for (const auto &ccvs : netlist.globalBlock.currentControlledVoltageSources) {
-        double v_sense = getV(ccvs.ctrlPos) - getV(ccvs.ctrlNeg);
-        // Sense resistor audit
-        double i_sense = v_sense / 1.0;
-        addRes(ccvs.ctrlPos, -i_sense);
-        addRes(ccvs.ctrlNeg, i_sense);
-        // Output audit
-        double v_out = getV(ccvs.outPos) - getV(ccvs.outNeg);
-        double i_out = (ccvs.rm * i_sense - v_out) / 1e-4; // R_out=1e-4
-        addRes(ccvs.outPos, i_out);
-        addRes(ccvs.outNeg, -i_out);
-    }
-    for (const auto &cccs : netlist.globalBlock.currentControlledCurrentSources) {
-        double v_sense = getV(cccs.ctrlPos) - getV(cccs.ctrlNeg);
-        // Sense resistor audit
-        double i_sense = v_sense / 1.0;
-        addRes(cccs.ctrlPos, -i_sense);
-        addRes(cccs.ctrlNeg, i_sense);
-        // Output audit
-        double i_cccs = cccs.alpha * i_sense;
-        addRes(cccs.outPos, -i_cccs);
-        addRes(cccs.outNeg, i_cccs);
     }
 
     // 3. Diodes (Shockley Equation: I = Is * (exp(V/Vt) - 1))
@@ -1601,45 +1696,6 @@ public:
         addRes(c.nodePlate2, i_c);
       }
       
-      // 4.5. Inductors (Transient Only)
-      // 4.5. Inductors (Transient Only)
-      for (size_t i = 0; i < netlist.globalBlock.inductors.size(); ++i) {
-        const auto &l = netlist.globalBlock.inductors[i];
-        const auto &hist = netlist.globalState.inductorState[i];
-        
-        double v_curr = getV(l.nodeCoil1) - getV(l.nodeCoil2);
-        double i_l = 0.0;
-        IntegrationType type = integrator->getType();
-
-        if (hist.i.empty())
-          continue;
-
-        if (type == IntegrationType::TRAPEZOIDAL) {
-          double g_eq = h / (2.0 * l.inductance_henries);
-          i_l = hist.i[0] + g_eq * (v_curr + hist.v[0]);
-        } else if (type == IntegrationType::GEAR_1_EULER) {
-          i_l = hist.i[0] + (h / l.inductance_henries) * v_curr;
-        } else if (type == IntegrationType::GEAR_2) {
-          if (hist.i.size() >= 2) {
-            double coeff = h / l.inductance_henries;
-            i_l = (4.0/3.0)*hist.i[0] - (1.0/3.0)*hist.i[1] 
-                  + (2.0/3.0)*coeff*v_curr;
-          } else {
-            i_l = hist.i[0] + (h / l.inductance_henries) * v_curr;
-          }
-        }
-
-        addRes(l.nodeCoil1, -i_l);
-        addRes(l.nodeCoil2, i_l);
-      }
-    } else if (h <= 1e-15) {
-      // 4.6. Inductors at DC: short of conductance DC_SHORT_G (matches stamp)
-      for (const auto &l : netlist.globalBlock.inductors) {
-        double i_l = PhysicsConstants::DC_SHORT_G *
-                     (getV(l.nodeCoil1) - getV(l.nodeCoil2));
-        addRes(l.nodeCoil1, -i_l);
-        addRes(l.nodeCoil2, i_l);
-      }
     }
 
     // 5. Hierarchical Instances
@@ -1664,14 +1720,7 @@ public:
           addRes(mapNode(r.nodeTerminal2), i_r);
         }
 
-        // Independent sources inside the subcircuit (were missing: a source in
-        // a .subckt was stamped but never audited, so NR could not converge)
-        for (const auto &v : block.voltageSources) {
-          double vs = (h > 1e-15) ? waveformValue(v, v.voltage_V, time) : v.voltage_V;
-          double i_src = (vs - (getV(mapNode(v.nodePositive)) - getV(mapNode(v.nodeNegative)))) / 1e-3;
-          addRes(mapNode(v.nodePositive), i_src);
-          addRes(mapNode(v.nodeNegative), -i_src);
-        }
+        // Current sources inside the subcircuit (V sources are branch elements)
         for (const auto &cs : block.currentSources) {
           double is = (h > 1e-15) ? waveformValue(cs, cs.current_A, time) : cs.current_A;
           addRes(mapNode(cs.nodePositive), -is);
@@ -1689,38 +1738,12 @@ public:
           addRes(mapNode(d.cathode), i_d);
         }
 
-        // Dependent Sources
-        for (const auto &vcvs : block.voltageControlledVoltageSources) {
-            double v_ctrl = getV(mapNode(vcvs.ctrlPos)) - getV(mapNode(vcvs.ctrlNeg));
-            double v_out = getV(mapNode(vcvs.outPos)) - getV(mapNode(vcvs.outNeg));
-            double i_vcvs = (vcvs.gain * v_ctrl - v_out) / 1e-4;
-            addRes(mapNode(vcvs.outPos), i_vcvs);
-            addRes(mapNode(vcvs.outNeg), -i_vcvs);
-        }
+        // Dependent Sources: G only (E/F/H are branch elements)
         for (const auto &vccs : block.voltageControlledCurrentSources) {
             double v_ctrl = getV(mapNode(vccs.ctrlPos)) - getV(mapNode(vccs.ctrlNeg));
             double i_vccs = vccs.gm * v_ctrl;
             addRes(mapNode(vccs.outPos), -i_vccs);
             addRes(mapNode(vccs.outNeg), i_vccs);
-        }
-        for (const auto &ccvs : block.currentControlledVoltageSources) {
-            double v_sense = getV(mapNode(ccvs.ctrlPos)) - getV(mapNode(ccvs.ctrlNeg));
-            double i_sense = v_sense / 1.0;
-            addRes(mapNode(ccvs.ctrlPos), -i_sense);
-            addRes(mapNode(ccvs.ctrlNeg), i_sense);
-            double v_out = getV(mapNode(ccvs.outPos)) - getV(mapNode(ccvs.outNeg));
-            double i_out = (ccvs.rm * i_sense - v_out) / 1e-4;
-            addRes(mapNode(ccvs.outPos), i_out);
-            addRes(mapNode(ccvs.outNeg), -i_out);
-        }
-        for (const auto &cccs : block.currentControlledCurrentSources) {
-            double v_sense = getV(mapNode(cccs.ctrlPos)) - getV(mapNode(cccs.ctrlNeg));
-            double i_sense = v_sense / 1.0;
-            addRes(mapNode(cccs.ctrlPos), -i_sense);
-            addRes(mapNode(cccs.ctrlNeg), i_sense);
-            double i_cccs = cccs.alpha * i_sense;
-            addRes(mapNode(cccs.outPos), -i_cccs);
-            addRes(mapNode(cccs.outNeg), i_cccs);
         }
 
         // MOSFETs (Instance)
@@ -1804,16 +1827,17 @@ public:
             addRes(mapNode(c.nodePlate1), -i_c);
             addRes(mapNode(c.nodePlate2), i_c);
           }
-        } else if (h <= 1e-15) {
-          // Inductors at DC (short, matches stampBlockLinear)
-          for (const auto &l : block.inductors) {
-            double i_l = PhysicsConstants::DC_SHORT_G *
-                         (getV(mapNode(l.nodeCoil1)) - getV(mapNode(l.nodeCoil2)));
-            addRes(mapNode(l.nodeCoil1), -i_l);
-            addRes(mapNode(l.nodeCoil2), i_l);
-          }
         }
       }
+    }
+
+    // Branch elements: residual = rhs - A x over exactly the stamped triplets
+    {
+      BranchSystem S;
+      buildBranchSystem(netlist, h, time, S);
+      auto xAt = [&](int c) { return c < (int)v_candidate.size() ? v_candidate[c] : 0.0; };
+      for (size_t t = 0; t < S.r.size(); ++t) node_residuals[S.r[t]] -= S.v[t] * xAt(S.c[t]);
+      for (size_t i = 0; i < S.rhs.size(); ++i) node_residuals[i] += S.rhs[i];
     }
 
     // 6. Find Max Residual
@@ -1857,54 +1881,8 @@ public:
                                     const std::vector<double> &v_candidate,
                                     std::vector<double> &perNodeResiduals,
                                     double h = 0.0) {
-    // Delegate to scalar overload to compute node_residuals, then expose them.
-    // We re-implement inline to avoid code duplication vs. exposing internals.
-    double max_err = calculatePhysicalResiduals(netlist, v_candidate, h);
-
-    // Re-build per-node vector (the scalar overload already built it internally;
-    // we rebuild here to keep the scalar overload self-contained).
-    int n = netlist.numGlobalNodes;
-    perNodeResiduals.assign(n, 0.0);
-
-    auto getV = [&](int nodeIdx) -> double {
-      if (nodeIdx <= 0 || nodeIdx > (int)v_candidate.size()) return 0.0;
-      return v_candidate[nodeIdx - 1];
-    };
-    auto addRes = [&](int nodeIdx, double val) {
-      if (nodeIdx > 0 && nodeIdx <= n) perNodeResiduals[nodeIdx - 1] += val;
-    };
-
-    for (const auto &r : netlist.globalBlock.resistors) {
-      double i_r = (getV(r.nodeTerminal1) - getV(r.nodeTerminal2)) / r.resistance_ohms;
-      addRes(r.nodeTerminal1, -i_r); addRes(r.nodeTerminal2, i_r);
-    }
-    for (const auto &v : netlist.globalBlock.voltageSources) {
-      double i_src = (v.voltage_V - (getV(v.nodePositive) - getV(v.nodeNegative))) / 1e-3;
-      addRes(v.nodePositive, i_src); addRes(v.nodeNegative, -i_src);
-    }
-    for (const auto &cs : netlist.globalBlock.currentSources) {
-      addRes(cs.nodePositive, -cs.current_A); addRes(cs.nodeNegative, cs.current_A);
-    }
-    if (h <= 1e-15) {
-      for (const auto &l : netlist.globalBlock.inductors) {
-        double i_l = PhysicsConstants::DC_SHORT_G * (getV(l.nodeCoil1) - getV(l.nodeCoil2));
-        addRes(l.nodeCoil1, -i_l); addRes(l.nodeCoil2, i_l);
-      }
-    }
-    for (const auto &d : netlist.globalBlock.diodes) {
-      DiodeParams<double> params = {d.saturationCurrent_I_S_A, d.emissionCoefficient_N, d.thermalVoltage_V_T_V};
-      double id = diode_current_clamped(getV(d.anode) - getV(d.cathode), params);
-      addRes(d.anode, -id); addRes(d.cathode, id);
-    }
-    for (const auto &q : netlist.globalBlock.bjts) {
-      BJTParams<double> p; p.Is = q.saturationCurrent_I_S_A; p.BetaF = q.betaF;
-      p.BetaR = q.betaR; p.Vt = q.thermalVoltage_V_T_V;
-      BJTCurrents<double> res = bjt_ebers_moll(getV(q.nodeCollector), getV(q.base), getV(q.emitter), q.isNPN, p);
-      addRes(q.nodeCollector, -res.Ic); addRes(q.base, -res.Ib);
-      addRes(q.emitter, res.Ic + res.Ib);
-    }
-
-    return max_err;
+    // Same audit as the scalar overload (it used to be a partial re-implementation)
+    return calculatePhysicalResiduals(netlist, v_candidate, h, 0.0, &perNodeResiduals);
   }
 
   /**
@@ -1954,16 +1932,14 @@ public:
           {{r.nodeTerminal1, -i_r}, {r.nodeTerminal2, i_r}}});
     }
 
-    // 2. Voltage Sources
-    for (const auto &v : netlist.globalBlock.voltageSources) {
-      double v1 = getV(v.nodePositive);
-      double v2 = getV(v.nodeNegative);
-      double r_int = 1e-3;
-      double i_src = (v.voltage_V - (v1 - v2)) / r_int;
-      addRes(v.nodePositive, i_src);
-      addRes(v.nodeNegative, -i_src);
-      attributions.push_back({v.type.empty() ? "V?" : v.type, "VoltageSource",
-          {{v.nodePositive, i_src}, {v.nodeNegative, -i_src}}});
+    // 2. Branch elements (V, L, E, F, H): node-row terms of the shared branch
+    //    system; their currents are unknowns in v_candidate (DC: h = 0)
+    {
+      BranchSystem S;
+      buildBranchSystem(netlist, 0.0, 0.0, S);
+      for (size_t t = 0; t < S.r.size(); ++t)
+        if (S.r[t] < n && S.c[t] < (int)v_candidate.size())
+          node_residuals[S.r[t]] -= S.v[t] * v_candidate[S.c[t]];
     }
 
     // Current Sources
@@ -1974,14 +1950,6 @@ public:
           {{cs.nodePositive, -cs.current_A}, {cs.nodeNegative, cs.current_A}}});
     }
 
-    // Inductors (DC short — this audit is DC-only)
-    for (const auto &l : netlist.globalBlock.inductors) {
-      double i_l = PhysicsConstants::DC_SHORT_G * (getV(l.nodeCoil1) - getV(l.nodeCoil2));
-      addRes(l.nodeCoil1, -i_l);
-      addRes(l.nodeCoil2, i_l);
-      attributions.push_back({l.name, "Inductor",
-          {{l.nodeCoil1, -i_l}, {l.nodeCoil2, i_l}}});
-    }
 
     // 3. Diodes
     for (const auto &d : netlist.globalBlock.diodes) {
@@ -2146,14 +2114,19 @@ public:
       // We assume standard stamping (double params) gives us the correct J = dF/dV
       scheduler.schedule(netlist);
       matrixBuilder.clear();
-      rhsVector.assign(netlist.numGlobalNodes, 0.0);
-      stampAllElements(netlist, 0.0, v_converged, 0.0); // h=0, time=0 for DC sensitivity
+      const int nTot = systemSize(netlist);  // nodes + branch currents
+      matrixBuilder.setDimensions(nTot, nTot);
+      rhsVector.assign(nTot, 0.0);
+      std::vector<double> x_converged = v_converged;
+      if ((int)lastSolution_.size() == nTot) x_converged = lastSolution_;  // with branch currents
+      x_converged.resize(nTot, 0.0);
+      stampAllElements(netlist, 0.0, x_converged, 0.0); // h=0, time=0 for DC sensitivity
       addDiagonalConditioning(netlist.numGlobalNodes);
       Csr_matrix J = matrixBuilder.createCsr(); /* Explicitly J */
       
       // 2. Build RHS vector b = - dF/dp
       // This vector is zero everywhere except at the nodes of the target component
-      std::vector<double> b_sens(netlist.numGlobalNodes, 0.0);
+      std::vector<double> b_sens(nTot, 0.0);
       
       auto getV = [&](int n) { return (n>0 && n<=(int)v_converged.size()) ? v_converged[n-1] : 0.0; };
 
@@ -2306,9 +2279,9 @@ public:
       }
 
       // 3. Solve J * x = b
-      // Reuse solvePCG (it needs Csr_matrix)
-      // Note: solvePCG args: A, b, tol...
-      SolverResult res = solvePCG(J, b_sens, 1e-6);
+      // J is nonsymmetric (PCG assumed symmetry); solve exactly, return node rows
+      SolverResult res = solveLinear(J, b_sens);
+      res.solution.resize(netlist.numGlobalNodes);
       return res.solution;
   }
 
@@ -2337,17 +2310,8 @@ public:
       stampResistor(mapNode(r.nodeTerminal1), mapNode(r.nodeTerminal2),
                     R, matrixBuilder);
     }
-    // 2. Voltage Sources
-    // 2. Voltage Sources
-    for (const auto &v : block.voltageSources) {
-      double val = (h > 1e-15) ? waveformValue(v, v.voltage_V, time) : v.voltage_V;
-
-      double scaled_V = val * voltageScale;
-      
-      stampVoltageSourceAsNorton(mapNode(v.nodePositive),
-                                 mapNode(v.nodeNegative), scaled_V,
-                                 matrixBuilder, rhsVector);
-    }
+    // 2. V sources, inductors (+K), E/F/H: branch-current elements, stamped
+    //    for every block by stampBranchSystem() from stampAllElements()
     // 2.5 Power Rails (System Source)
     for (size_t i = 0; i < block.powerRails.size(); ++i) {
         const auto &rail = block.powerRails[i];
@@ -2391,137 +2355,11 @@ public:
       }
     }
 
-    // 5. Inductors (Transient)
-    if (h > 1e-15 && integrator) {
-      for (size_t i = 0; i < block.inductors.size(); ++i) {
-          const auto &ind = block.inductors[i];
-          const auto &hist = state.inductorState[i];
-          int n1 = mapNode(ind.nodeCoil1);
-          int n2 = mapNode(ind.nodeCoil2);
-          double L = getPerturbedValue(ind.inductance_henries, ind.tolerance_percent, ind.name, mcSeed);
-          
-          if (hist.i.empty() || hist.v.empty()) continue;
-          
-          double i_prev = hist.i[0];
-          double v_prev = hist.v[0];
-
-          
-          double g_eq = 0.0;
-          double i_source = 0.0;
-          
-          IntegrationType type = integrator->getType();
-          if (type == IntegrationType::TRAPEZOIDAL) {
-              // Trapezoidal: i(n) = i(n-1) + (h/2L)*(v(n) + v(n-1))
-              // i(n) - (h/2L)v(n) = i(n-1) + (h/2L)v(n-1)
-              g_eq = h / (2.0 * L);
-              i_source = i_prev + g_eq * v_prev;
-          } else {
-              // Backward Euler: v(n) = L * (i(n) - i(n-1)) / h
-              // i(n) = i(n-1) + (h/L)v(n) -> i(n) - (h/L)v(n) = i(n-1)
-              g_eq = h / L;
-              i_source = i_prev;
-          }
-          
-          // Stamp Resistor (Conductance)
-          stampResistor(n1, n2, 1.0/g_eq, matrixBuilder);
-          
-          // Stamp Current Source (RHS)
-          // KCL Node 1: ... + i_ind = 0 -> ... + g_eq*(v1-v2) + i_source = 0 -> RHS = -i_source
-          if (n1 != 0) rhsVector[n1-1] -= i_source;
-          if (n2 != 0) rhsVector[n2-1] += i_source;
-      }
-
-      // 5.5 Mutual Inductance (Coupled Inductors / Transformers)
-      // Uses L-matrix inversion: Γ = L^-1 to get admittance form
-      // For coupled pair: [v1]   [L1  M ] [di1/dt]
-      //                   [v2] = [M   L2] [di2/dt]
-      // Invert to: [di1/dt]   1/det [L2  -M] [v1]
-      //            [di2/dt] =       [-M  L1] [v2]
-      // where det = L1*L2 - M^2
-      for (const auto &mut : block.mutualInductors) {
-          if (mut.inductor1_index < 0 || mut.inductor1_index >= (int)block.inductors.size()) continue;
-          if (mut.inductor2_index < 0 || mut.inductor2_index >= (int)block.inductors.size()) continue;
-          
-          const auto &L1_ind = block.inductors[mut.inductor1_index];
-          const auto &L2_ind = block.inductors[mut.inductor2_index];
-          
-          double L1 = L1_ind.inductance_henries;
-          double L2 = L2_ind.inductance_henries;
-          double k = mut.couplingCoefficient_k;
-          double M = k * std::sqrt(L1 * L2);
-          
-          // det = L1*L2 - M^2 = L1*L2*(1 - k^2)
-          double det = L1 * L2 - M * M;
-          if (std::abs(det) < 1e-20) continue; // Singular (k=1 ideal transformer)
-          
-          // Gamma coefficients (L^-1 scaled by h for transient)
-          double inv_det = 1.0 / det;
-          double g11 = h * L2 * inv_det;   // di1 = g11*v1 - g12*v2
-          double g12 = h * M * inv_det;    // Cross-coupling
-          double g22 = h * L1 * inv_det;   // di2 = g22*v2 - g12*v1
-          
-          int n1a = mapNode(L1_ind.nodeCoil1);
-          int n1b = mapNode(L1_ind.nodeCoil2);
-          int n2a = mapNode(L2_ind.nodeCoil1);
-          int n2b = mapNode(L2_ind.nodeCoil2);
-          
-          // Self-admittance for L1: stamps g11 across (n1a, n1b)
-          // Already stamped by single-inductor section above, so we only add cross-coupling
-          
-          // Cross-coupling: current in L1 due to voltage across L2
-          // i1_cross = -g12 * (v2a - v2b)
-          // Stamp as transconductance from (n2a-n2b) to (n1a-n1b)
-          if (n1a != 0 && n2a != 0) matrixBuilder.add(n1a-1, n2a-1, -g12);
-          if (n1a != 0 && n2b != 0) matrixBuilder.add(n1a-1, n2b-1,  g12);
-          if (n1b != 0 && n2a != 0) matrixBuilder.add(n1b-1, n2a-1,  g12);
-          if (n1b != 0 && n2b != 0) matrixBuilder.add(n1b-1, n2b-1, -g12);
-          
-          // Cross-coupling: current in L2 due to voltage across L1
-          // i2_cross = -g12 * (v1a - v1b)
-          if (n2a != 0 && n1a != 0) matrixBuilder.add(n2a-1, n1a-1, -g12);
-          if (n2a != 0 && n1b != 0) matrixBuilder.add(n2a-1, n1b-1,  g12);
-          if (n2b != 0 && n1a != 0) matrixBuilder.add(n2b-1, n1a-1,  g12);
-          if (n2b != 0 && n1b != 0) matrixBuilder.add(n2b-1, n1b-1, -g12);
-          
-          // History terms for cross-coupling
-          // History terms for cross-coupling
-          const auto &hist1 = state.inductorState[mut.inductor1_index];
-          const auto &hist2 = state.inductorState[mut.inductor2_index];
-          double i1_prev = hist1.i.empty() ? 0.0 : hist1.i[0];
-          double i2_prev = hist2.i.empty() ? 0.0 : hist2.i[0];
-
-          
-          // The history contribution is complex for coupled inductors
-          // Simplified: assume the single-inductor section handles self history,
-          // and cross-coupling history is approximated as zero for now.
-          // TODO: For accurate Trapezoidal integration, store coupled history terms.
-      }
-    } else if (h <= 1e-15) {
-      // DC: an inductor is a short (coupling is irrelevant at DC)
-      for (const auto &ind : block.inductors)
-        stampResistor(mapNode(ind.nodeCoil1), mapNode(ind.nodeCoil2),
-                      1.0 / PhysicsConstants::DC_SHORT_G, matrixBuilder);
-    }
-    // 6. Dependent Sources
-    for (const auto &vcvs : block.voltageControlledVoltageSources) {
-        stampVCVS(mapNode(vcvs.ctrlPos), mapNode(vcvs.ctrlNeg),
-                  mapNode(vcvs.outPos), mapNode(vcvs.outNeg),
-                  vcvs.gain, matrixBuilder, rhsVector);
-    }
+    // 6. Dependent Sources: G here; E/F/H are branch elements
     for (const auto &vccs : block.voltageControlledCurrentSources) {
         stampVCCS(mapNode(vccs.ctrlPos), mapNode(vccs.ctrlNeg),
                   mapNode(vccs.outPos), mapNode(vccs.outNeg),
                   vccs.gm, matrixBuilder, rhsVector);
-    }
-    for (const auto &ccvs : block.currentControlledVoltageSources) {
-        stampCCVS(mapNode(ccvs.ctrlPos), mapNode(ccvs.ctrlNeg),
-                  mapNode(ccvs.outPos), mapNode(ccvs.outNeg),
-                  ccvs.rm, matrixBuilder, rhsVector);
-    }
-    for (const auto &cccs : block.currentControlledCurrentSources) {
-        stampCCCS(mapNode(cccs.ctrlPos), mapNode(cccs.ctrlNeg),
-                  mapNode(cccs.outPos), mapNode(cccs.outNeg),
-                  cccs.alpha, matrixBuilder, rhsVector);
     }
 
     // 7. Transmission Lines (Phase 2 placeholder)
@@ -2574,34 +2412,7 @@ public:
         matrixBuilder.addBatch(rows, cols, vals);
     }
 
-    // Voltage Sources (Norton Equivalent)
-    size_t nVS = block.voltageSources.size();
-    if (nVS > 0) {
-        std::vector<int> rows, cols;
-        std::vector<double> vals;
-        rows.reserve(nVS * 4); cols.reserve(nVS * 4); vals.reserve(nVS * 4);
-        for (size_t i = 0; i < nVS; ++i) {
-            int nP = block.voltageSources.nodesPos[i];
-            int nN = block.voltageSources.nodesNeg[i];
-            double V = block.voltageSources.voltages[i];
-            double g_int = 1.0e3; // 1mOhm series
-            double i_eq = V * g_int;
-            
-            if (nP != 0 && nN != 0) {
-                rows.push_back(nP-1); cols.push_back(nP-1); vals.push_back(g_int);
-                rows.push_back(nN-1); cols.push_back(nN-1); vals.push_back(g_int);
-                rows.push_back(nP-1); cols.push_back(nN-1); vals.push_back(-g_int);
-                rows.push_back(nN-1); cols.push_back(nP-1); vals.push_back(-g_int);
-            } else if (nP != 0) {
-                rows.push_back(nP-1); cols.push_back(nP-1); vals.push_back(g_int);
-            } else if (nN != 0) {
-                rows.push_back(nN-1); cols.push_back(nN-1); vals.push_back(g_int);
-            }
-            if (nP != 0) rhsVector[nP-1] += i_eq;
-            if (nN != 0) rhsVector[nN-1] -= i_eq;
-        }
-        matrixBuilder.addBatch(rows, cols, vals);
-    }
+    // V sources / inductors: branch-current elements (stampBranchSystem)
 
     // Current Sources
     size_t nIS = block.currentSources.size();
@@ -2655,49 +2466,6 @@ public:
         }
         matrixBuilder.addBatch(rows, cols, vals);
     }
-    // Inductors (Transient)
-    size_t nL = block.inductors.size();
-    if (nL > 0 && h > 0.0) {
-        std::vector<int> rows, cols;
-        std::vector<double> vals;
-        rows.reserve(nL * 4); cols.reserve(nL * 4); vals.reserve(nL * 4);
-        for (size_t i = 0; i < nL; ++i) {
-            int n1 = block.inductors.coil1[i];
-            int n2 = block.inductors.coil2[i];
-            double g_eq, i_hist;
-            // GEAR_1_EULER (Backward Euler): g=h/L, no v_prev term.
-            // GEAR_2: SoA has only i_prev (no i_prev2), fall back to GEAR_1.
-            // TRAPEZOIDAL (default): g=h/(2L), companion uses v_prev.
-            if (intType == IntegrationType::GEAR_1_EULER ||
-                intType == IntegrationType::GEAR_2) {
-                g_eq   = h / block.inductors.L[i];
-                i_hist = block.inductors.i_prev[i];
-            } else {
-                g_eq   = h / (2.0 * block.inductors.L[i]);
-                i_hist = block.inductors.i_prev[i] + g_eq * block.inductors.v_prev[i];
-            }
-
-            if (n1 != 0 && n2 != 0) {
-                rows.push_back(n1-1); cols.push_back(n1-1); vals.push_back(g_eq);
-                rows.push_back(n2-1); cols.push_back(n2-1); vals.push_back(g_eq);
-                rows.push_back(n1-1); cols.push_back(n2-1); vals.push_back(-g_eq);
-                rows.push_back(n2-1); cols.push_back(n1-1); vals.push_back(-g_eq);
-            } else if (n1 != 0) {
-                rows.push_back(n1-1); cols.push_back(n1-1); vals.push_back(g_eq);
-            } else if (n2 != 0) {
-                rows.push_back(n2-1); cols.push_back(n2-1); vals.push_back(g_eq);
-            }
-            if (n1 != 0) rhsVector[n1-1] -= i_hist; // Out of n1
-            if (n2 != 0) rhsVector[n2-1] += i_hist; // Into n2
-        }
-        matrixBuilder.addBatch(rows, cols, vals);
-    } else if (nL > 0) {
-        // DC: an inductor is a short
-        for (size_t i = 0; i < nL; ++i)
-            stampResistor(block.inductors.coil1[i], block.inductors.coil2[i],
-                          1.0 / PhysicsConstants::DC_SHORT_G, matrixBuilder);
-    }
-
     // 1. Batch Compute Physics (Updates internal state: v_d, i_d, g_d, etc.)
     batchDiodePhysics(block.diodes, v_guess);
     batchMosfetPhysics(block.mosfets, v_guess);
@@ -3019,11 +2787,8 @@ public:
         // in transient re-evaluate every source at `time`, walking blocks in the
         // same order tensorizeNetlist() flattens them (global, then instances).
         if (h > 1e-15) {
-            size_t kv = 0, ki = 0;
+            size_t ki = 0;
             auto refresh = [&](const TensorBlock &blk) {
-                for (const auto &v : blk.voltageSources)
-                    if (kv < soaBlock.voltageSources.voltages.size())
-                        soaBlock.voltageSources.voltages[kv++] = waveformValue(v, v.voltage_V, time);
                 for (const auto &i : blk.currentSources)
                     if (ki < soaBlock.currentSources.currents.size())
                         soaBlock.currentSources.currents[ki++] = waveformValue(i, i.current_A, time);
@@ -3036,14 +2801,11 @@ public:
         }
         stampSoABlock(soaBlock, v_guess, h, integrator ? integrator->getType() : IntegrationType::TRAPEZOIDAL);
 
-        // Devices tensorizeNetlist() has no SoA tensors for (E, G, J) were
+        // Devices tensorizeNetlist() has no SoA tensors for (G, J) were
         // silently dropped here. Stamp them with the same helpers the AoS path
         // uses, so both paths share one implementation.
         auto getV = [&](int n) { return (n > 0 && n <= (int)v_guess.size()) ? v_guess[n - 1] : 0.0; };
         auto stampUncovered = [&](const TensorBlock &blk, const std::function<int(int)> &mapNode) {
-            for (const auto &e : blk.voltageControlledVoltageSources)
-                stampVCVS(mapNode(e.ctrlPos), mapNode(e.ctrlNeg), mapNode(e.outPos), mapNode(e.outNeg),
-                          e.gain, matrixBuilder, rhsVector);
             for (const auto &g : blk.voltageControlledCurrentSources)
                 stampVCCS(mapNode(g.ctrlPos), mapNode(g.ctrlNeg), mapNode(g.outPos), mapNode(g.outNeg),
                           g.gm, matrixBuilder, rhsVector);
@@ -3061,6 +2823,9 @@ public:
             });
         }
     }
+
+    // Branch-current elements (V, L+K, E, F, H): one implementation for both paths
+    stampBranchSystem(netlist, h, time);
 
     // ─── Gap 2: Digital Event Engine — D2A Stamping ──────────────────────
     if (digitalEngine_.hasOutputPorts()) {

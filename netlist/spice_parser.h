@@ -86,6 +86,10 @@ private:
     void parseJFET       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseCCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
+    // F/H name their controlling V source; resolve once the block is complete
+    void resolveControlledSources(TensorBlock& blk);
 
     // ── Directive Parsers ─────────────────────────────────────────────
     void parseModelCard  (const std::vector<std::string>& tok);

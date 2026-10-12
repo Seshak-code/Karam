@@ -11,16 +11,21 @@
       if (nodeIdx > 0 && nodeIdx <= n) node_residuals[nodeIdx - 1] += val;
     };
 
-    // AUDIT 1: Voltage Sources
-    for (const auto &v : netlist.globalBlock.voltageSources) {
-      double v1 = getV(v.nodePositive);
-      double v2 = getV(v.nodeNegative);
-      double r_int = 1e-3; 
-      double i_src = (v.voltage_V - (v1 - v2)) / r_int;
-      addRes(v.nodePositive, i_src);
-      addRes(v.nodeNegative, -i_src);
-      if (std::abs(i_src) > 100.0) {
-        report += "WARN: VSource (Nodes " + std::to_string(v.nodePositive) + "," + std::to_string(v.nodeNegative) + ") I=" + std::to_string(i_src) + " A\n";
+    // AUDIT 1: Branch elements (V, L, E, F, H): node-row terms of the shared
+    // branch system; V-source currents are solved unknowns in v_candidate
+    {
+      BranchSystem S;
+      buildBranchSystem(netlist, 0.0, 0.0, S);
+      for (size_t t = 0; t < S.r.size(); ++t)
+        if (S.r[t] < n && S.c[t] < (int)v_candidate.size())
+          node_residuals[S.r[t]] -= S.v[t] * v_candidate[S.c[t]];
+      for (size_t i = 0; i < netlist.globalBlock.voltageSources.size(); ++i) {
+        const int b = n + (int)i;  // global V sources are the first branch rows
+        const double i_src = b < (int)v_candidate.size() ? v_candidate[b] : 0.0;
+        if (std::abs(i_src) > 100.0) {
+          const auto &v = netlist.globalBlock.voltageSources[i];
+          report += "WARN: VSource (Nodes " + std::to_string(v.nodePositive) + "," + std::to_string(v.nodeNegative) + ") I=" + std::to_string(i_src) + " A\n";
+        }
       }
     }
 

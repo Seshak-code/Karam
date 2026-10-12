@@ -169,6 +169,7 @@ struct VoltageSource {
     double sine_phase = 0.0; // Phase [deg] (Extension)
 
     std::string expression;  // Symbolic override for DC/main value
+    std::string name;        // instance name (F/H cards reference it)
 };
 
 /*
@@ -260,16 +261,20 @@ struct VCCS {
 
 struct CCVS {
     int outPos, outNeg;
-    int ctrlPos, ctrlNeg;
+    int ctrlPos, ctrlNeg;      // unused by the solver (legacy sense-node fields)
     double rm;
     std::string role;
+    int ctrlSource = -1;       // index of the controlling V source in the same block
+    std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
 };
 
 struct CCCS {
     int outPos, outNeg;
-    int ctrlPos, ctrlNeg;
+    int ctrlPos, ctrlNeg;      // unused by the solver (legacy sense-node fields)
     double alpha;
     std::string role;
+    int ctrlSource = -1;       // index of the controlling V source in the same block
+    std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
 };
 
 // ============================================================================

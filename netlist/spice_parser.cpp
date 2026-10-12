@@ -253,11 +253,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 case 'J': parseJFET(tok, blk);        break;
                 case 'E': parseVCVS(tok, blk);        break;
                 case 'G': parseVCCS(tok, blk);        break;
-                // Previously parsed into no-op placeholders (F/H dropped their
-                // controlling source; T was two unconnected resistors) and
-                // gave silently wrong answers. Unsupported is an error.
-                case 'H': case 'F':
-                    throw std::runtime_error(tok[0] + ": current-controlled (F/H) sources are not supported yet");
+                case 'H': parseCCVS(tok, blk);        break;
+                case 'F': parseCCCS(tok, blk);        break;
+                // T used to be two unconnected resistors (silently wrong)
                 case 'T':
                     throw std::runtime_error(tok[0] + ": transmission lines are not supported yet");
                 case 'X': {
@@ -282,6 +280,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
 
     if (inSubckt_)
         return fail(lines.back().first, ".subckt " + subcktName_ + " has no .ends");
+    try { resolveControlledSources(result_.netlist.globalBlock); }
+    catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
 
     // Finalize: compute numGlobalNodes from nodeMap (max index)
     for (const auto& [name, idx] : nodeMap_) {
@@ -419,6 +419,7 @@ void SPICEParser::parseMutualInd(const std::vector<std::string>& tok, TensorBloc
 void SPICEParser::parseVoltSrc(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 3);
     VoltageSource vs;
+    vs.name = toUpper(tok[0]);
     vs.nodePositive = nodeIndex(tok[1]);
     vs.nodeNegative = nodeIndex(tok[2]);
     parseSourceSpec(tok, vs, vs.voltage_V);
@@ -637,8 +638,45 @@ void SPICEParser::parseSubcktBegin(const std::vector<std::string>& tok) {
     }
 }
 
+// H<name> <n+> <n-> <Vctrl> <transresistance>
+void SPICEParser::parseCCVS(const std::vector<std::string>& tok, TensorBlock& blk) {
+    requireFields(tok, 5);
+    CCVS h{};
+    h.outPos = nodeIndex(tok[1]);
+    h.outNeg = nodeIndex(tok[2]);
+    h.ctrlPos = h.ctrlNeg = 0;
+    h.ctrlName = toUpper(tok[3]);
+    h.rm = parseValue(tok[4]);
+    blk.currentControlledVoltageSources.push_back(h);
+}
+
+// F<name> <n+> <n-> <Vctrl> <gain>
+void SPICEParser::parseCCCS(const std::vector<std::string>& tok, TensorBlock& blk) {
+    requireFields(tok, 5);
+    CCCS f{};
+    f.outPos = nodeIndex(tok[1]);
+    f.outNeg = nodeIndex(tok[2]);
+    f.ctrlPos = f.ctrlNeg = 0;
+    f.ctrlName = toUpper(tok[3]);
+    f.alpha = parseValue(tok[4]);
+    blk.currentControlledCurrentSources.push_back(f);
+}
+
+void SPICEParser::resolveControlledSources(TensorBlock& blk) {
+    auto find = [&](const std::string& name) {
+        for (size_t i = 0; i < blk.voltageSources.size(); ++i)
+            if (blk.voltageSources[i].name == name) return (int)i;
+        throw std::runtime_error("controlling source " + name + " not found" +
+                                 (blk.name.empty() ? "" : " in subcircuit " + blk.name) +
+                                 " (F/H must reference a V source in the same block)");
+    };
+    for (auto& h : blk.currentControlledVoltageSources) h.ctrlSource = find(h.ctrlName);
+    for (auto& f : blk.currentControlledCurrentSources) f.ctrlSource = find(f.ctrlName);
+}
+
 void SPICEParser::parseSubcktEnd() {
     if (!inSubckt_) throw std::runtime_error(".ends without .subckt");
+    resolveControlledSources(subcktBlock_);
     inSubckt_ = false;
     inductorIndex_.swap(savedInductorIndex_);
     subcktBlock_.numInternalNodes = nextLocalNode_ - 1;  // ports + internal nodes
