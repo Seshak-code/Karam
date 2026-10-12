@@ -6,6 +6,10 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#ifdef ACUTESIM_THREADS_ENABLED
+#include <atomic>
+#include <thread>
+#endif
 
 namespace {
 
@@ -379,7 +383,44 @@ struct FrontFactor {
     std::vector<int> sw;      // row swapped into k at elimination step k
     std::vector<std::vector<int>> childPos;  // child trailing position -> local position
     int m = 0, e = 0, full = 0;  // dim, eliminated count, fully-summed count (p + d)
+    bool singular = false;
+    double minPivot = std::numeric_limits<double>::infinity();
 };
+
+// Run fn(i) for i in [0, n) on worker threads when the level carries enough
+// work to amortize thread start-up (~tens of us each); serial otherwise. Fronts
+// in a level share no writes and the result is independent of scheduling.
+// ponytail: threads are spawned per level; a persistent pool is the upgrade
+// once per-level overhead shows up in profiles.
+template <class Fn>
+void parallelFor(int n, double work, Fn&& fn) {
+#ifdef ACUTESIM_THREADS_ENABLED
+    constexpr double kMinParallelWork = 2e6;  // flops-ish
+    unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    int nt = (n > 1 && work >= kMinParallelWork) ? (int)std::min<unsigned>(hw, (unsigned)n) : 1;
+    if (nt > 1) {
+        std::atomic<int> next{0};
+        auto worker = [&] { for (int i; (i = next.fetch_add(1)) < n;) fn(i); };
+        std::vector<std::thread> pool;
+        pool.reserve(nt - 1);
+        for (int t = 1; t < nt; ++t) pool.emplace_back(worker);
+        worker();
+        for (auto& th : pool) th.join();
+        return;
+    }
+#endif
+    for (int i = 0; i < n; ++i) fn(i);
+}
+
+// Work estimate for one level: factorization ~ sum dim^2 * pivots, solve ~ sum dim^2
+double levelWork(const ContractionPlan& plan, const std::vector<int>& level, bool factor) {
+    double w = 0.0;
+    for (int id : level) {
+        double m = plan.fronts[id].dim();
+        w += factor ? m * m * (double)plan.fronts[id].pivots.size() : m * m;
+    }
+    return w;
+}
 
 // Dynamic layout of front `id` given its children's factors: fills lab,
 // childPos and the sizes. Shared by factorization so solves reuse it.
@@ -418,10 +459,7 @@ void solveWithFactors(const ContractionPlan& plan, const std::vector<FrontFactor
     const int nf = (int)plan.fronts.size();
     std::vector<std::vector<double>> w(nf);
     for (const auto& level : plan.levels) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-        for (int li = 0; li < (int)level.size(); ++li) {
+        parallelFor((int)level.size(), levelWork(plan, level, false), [&](int li) {
             const int id = level[li];
             const auto& fr = plan.fronts[id];
             const auto& ff = F[id];
@@ -438,15 +476,12 @@ void solveWithFactors(const ContractionPlan& plan, const std::vector<FrontFactor
             for (int k = 0; k < ff.e; ++k) std::swap(v[k], v[ff.sw[k]]);
             for (int k = 0; k < ff.e; ++k)
                 for (int r = k + 1; r < ff.m; ++r) v[r] -= ff.M[(size_t)r * ff.m + k] * v[k];
-        }
+        });
     }
     x.assign(plan.n, 0.0);
     for (int li = (int)plan.levels.size() - 1; li >= 0; --li) {
         const auto& level = plan.levels[li];
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-        for (int t = 0; t < (int)level.size(); ++t) {
+        parallelFor((int)level.size(), levelWork(plan, level, false), [&](int t) {
             const int id = level[t];
             const auto& ff = F[id];
             std::vector<double> xl(ff.m);
@@ -457,7 +492,7 @@ void solveWithFactors(const ContractionPlan& plan, const std::vector<FrontFactor
                 xl[k] = s / ff.M[(size_t)k * ff.m + k];
                 x[ff.colLab[k]] = xl[k];
             }
-        }
+        });
     }
 }
 
@@ -486,10 +521,7 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
     bool singular = false;
     double smallestPivot = std::numeric_limits<double>::infinity();
     for (const auto& level : plan.levels) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic) reduction(||:singular) reduction(min:smallestPivot)
-#endif
-        for (int li = 0; li < (int)level.size(); ++li) {
+        parallelFor((int)level.size(), levelWork(plan, level, true), [&](int li) {
             const int id = level[li];
             const auto& fr = plan.fronts[id];
             layoutFront(plan, id, F);
@@ -540,8 +572,8 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
                 }
                 ff.sw.push_back(pr);
                 const double piv = M[(size_t)k * m + k];
-                smallestPivot = std::min(smallestPivot, std::abs(piv));
-                if (!(std::abs(piv) > 0.0) || !std::isfinite(piv)) { singular = true; break; }
+                ff.minPivot = std::min(ff.minPivot, std::abs(piv));
+                if (!(std::abs(piv) > 0.0) || !std::isfinite(piv)) { ff.singular = true; break; }
                 const double inv = 1.0 / piv;
                 for (int r = k + 1; r < m; ++r) {
                     double& l = M[(size_t)r * m + k];
@@ -551,6 +583,10 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
                 }
                 ff.e = k + 1;
             }
+        });
+        for (int id : level) {  // reduce per-front results after the level
+            singular = singular || F[id].singular;
+            smallestPivot = std::min(smallestPivot, F[id].minPivot);
         }
         if (singular) break;
     }
