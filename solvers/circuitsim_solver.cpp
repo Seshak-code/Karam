@@ -774,6 +774,71 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 // COLD-START MICRO-STEPPING (SPICE3 dt_init = tstep/100)
 // =============================================================================
 
+// Re-tensorize and carry the AoS companion-model history (global block AND
+// subcircuit instances, in tensorizeNetlist()'s flattening order) into the SoA
+// arrays. Previously only global devices were synced, so capacitors inside
+// subcircuits restarted from zero history every step.
+void CircuitSim::loadSoAFromNetlist(const TensorNetlist &netlist) {
+  soaBlock = tensorizeNetlist(netlist);
+  size_t kc = 0, kl = 0;
+  auto sync = [&](const TensorBlock &blk, const BlockState &st) {
+    for (size_t i = 0; i < blk.capacitors.size(); ++i, ++kc) {
+      if (i >= st.capacitorState.size() || kc >= soaBlock.capacitors.size()) continue;
+      const auto &hist = st.capacitorState[i];
+      if (!hist.v.empty()) soaBlock.capacitors.v_prev[kc] = hist.v[0];
+      if (hist.v.size() > 1) soaBlock.capacitors.v_prev2[kc] = hist.v[1];
+      if (!hist.i.empty()) soaBlock.capacitors.i_prev[kc] = hist.i[0];
+    }
+    for (size_t i = 0; i < blk.inductors.size(); ++i, ++kl) {
+      if (i >= st.inductorState.size() || kl >= soaBlock.inductors.size()) continue;
+      const auto &hist = st.inductorState[i];
+      if (!hist.i.empty()) soaBlock.inductors.i_prev[kl] = hist.i[0];
+      if (!hist.v.empty()) soaBlock.inductors.v_prev[kl] = hist.v[0];
+    }
+  };
+  sync(netlist.globalBlock, netlist.globalState);
+  for (size_t k = 0; k < netlist.instances.size(); ++k) {
+    auto it = netlist.blockDefinitions.find(netlist.instances[k].blockName);
+    if (it != netlist.blockDefinitions.end() && k < netlist.instanceStates.size())
+      sync(it->second, netlist.instanceStates[k]);
+  }
+}
+
+// Capacitor companion-model history after an accepted step, for the global
+// block AND every subcircuit instance, with exactly the formulas used by
+// stampSoABlock() and the KCL audit (this used to exist in three copies, one
+// global-only, with a Gear2 heuristic the audit did not share).
+void CircuitSim::updateCapacitorHistory(TensorNetlist &netlist, const std::vector<double> &v,
+                                        double h) {
+  const IntegrationType type = integrator->getType();
+  auto getV = [&](int n) { return (n > 0 && n <= (int)v.size()) ? v[n - 1] : 0.0; };
+  auto update = [&](const TensorBlock &blk, BlockState &st, const std::function<int(int)> &mapNode) {
+    for (size_t i = 0; i < blk.capacitors.size() && i < st.capacitorState.size(); ++i) {
+      const auto &c = blk.capacitors[i];
+      auto &hist = st.capacitorState[i];
+      if (hist.v.empty()) hist.resize(3);
+      double v_curr = getV(mapNode(c.nodePlate1)) - getV(mapNode(c.nodePlate2));
+      double C = c.capacitance_farads, i_curr;
+      if (type == IntegrationType::TRAPEZOIDAL)
+        i_curr = (2.0 * C / h) * (v_curr - hist.v[0]) - hist.i[0];
+      else if (type == IntegrationType::GEAR_2 && hist.v.size() >= 2)
+        i_curr = (C / h) * (1.5 * v_curr - 2.0 * hist.v[0] + 0.5 * hist.v[1]);
+      else
+        i_curr = (C / h) * (v_curr - hist.v[0]);
+      integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
+    }
+  };
+  update(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
+  for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
+    const auto &inst = netlist.instances[k];
+    auto it = netlist.blockDefinitions.find(inst.blockName);
+    if (it == netlist.blockDefinitions.end()) continue;
+    update(it->second, netlist.instanceStates[k], [&](int n) {
+      return (n <= 0 || n > (int)inst.nodeMapping.size()) ? 0 : inst.nodeMapping[n - 1];
+    });
+  }
+}
+
 bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
                                 int nSubsteps,
                                 std::vector<double> &finalVoltages) {
@@ -793,27 +858,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
     // Sync soaBlock capacitor/inductor history from AoS netlist state.
     // This must happen at the start of each sub-step so stampAllElements
     // uses the correct companion-model source term for this micro-step.
-    soaBlock = tensorizeNetlist(netlist);
-    for (size_t i = 0; i < netlist.globalBlock.capacitors.size() &&
-                       i < soaBlock.capacitors.v_prev.size();
-         ++i) {
-      const auto &hist = netlist.globalState.capacitorState[i];
-      if (!hist.v.empty())
-        soaBlock.capacitors.v_prev[i] = hist.v[0];
-      if (hist.v.size() > 1)
-        soaBlock.capacitors.v_prev2[i] = hist.v[1];
-      if (!hist.i.empty())
-        soaBlock.capacitors.i_prev[i] = hist.i[0];
-    }
-    for (size_t i = 0; i < netlist.globalBlock.inductors.size() &&
-                       i < soaBlock.inductors.i_prev.size();
-         ++i) {
-      const auto &hist = netlist.globalState.inductorState[i];
-      if (!hist.i.empty())
-        soaBlock.inductors.i_prev[i] = hist.i[0];
-      if (!hist.v.empty())
-        soaBlock.inductors.v_prev[i] = hist.v[0];
-    }
+    loadSoAFromNetlist(netlist);
 
     integrator->prepareStep(dt_sub);
 
@@ -858,29 +903,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
       return false;
     }
 
-    // Update AoS capacitor history for this micro-step's converged solution.
-    // Using BE (GEAR_1_EULER) formula: i_curr = (C/dt_sub) * (v_cap_new -
-    // v_cap_prev) This matches exactly what stepTransient does in its
-    // history-update block when type == GEAR_1_EULER (line: i_curr =
-    // (C/actualTimeStep)*(v_curr - hist.v[0])).
-    for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
-      const auto &cap = netlist.globalBlock.capacitors[i];
-      auto &hist = netlist.globalState.capacitorState[i];
-
-      if (hist.v.empty())
-        hist.resize(3);
-
-      double v_cap_new = 0.0;
-      if (cap.nodePlate1 > 0 && cap.nodePlate1 <= (int)nrEstimate.size())
-        v_cap_new += nrEstimate[cap.nodePlate1 - 1];
-      if (cap.nodePlate2 > 0 && cap.nodePlate2 <= (int)nrEstimate.size())
-        v_cap_new -= nrEstimate[cap.nodePlate2 - 1];
-
-      double C = cap.capacitance_farads;
-      double i_curr = (C / dt_sub) * (v_cap_new - hist.v[0]);
-
-      integrator->updateHistory(hist.v, hist.i, v_cap_new, i_curr);
-    }
+    updateCapacitorHistory(netlist, nrEstimate, dt_sub);
     lteController_.recordStep(dt_sub);
     // Note: Inductor history write-back is not performed here, consistent with
     // stepTransient which also does not write back inductorState in its main
@@ -954,27 +977,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   // tensorizeNetlist() zero-inits v_prev/i_prev; we must carry the AoS history
   // (updated by the previous step's history-update loop) into the SoA arrays so
   // that stampSoABlock() uses the correct companion-model source term.
-  soaBlock = tensorizeNetlist(netlist);
-  for (size_t i = 0; i < netlist.globalBlock.capacitors.size() &&
-                     i < soaBlock.capacitors.v_prev.size();
-       ++i) {
-    const auto &hist = netlist.globalState.capacitorState[i];
-    if (!hist.v.empty())
-      soaBlock.capacitors.v_prev[i] = hist.v[0];
-    if (hist.v.size() > 1)
-      soaBlock.capacitors.v_prev2[i] = hist.v[1];
-    if (!hist.i.empty())
-      soaBlock.capacitors.i_prev[i] = hist.i[0];
-  }
-  for (size_t i = 0; i < netlist.globalBlock.inductors.size() &&
-                     i < soaBlock.inductors.i_prev.size();
-       ++i) {
-    const auto &hist = netlist.globalState.inductorState[i];
-    if (!hist.i.empty())
-      soaBlock.inductors.i_prev[i] = hist.i[0];
-    if (!hist.v.empty())
-      soaBlock.inductors.v_prev[i] = hist.v[0];
-  }
+  loadSoAFromNetlist(netlist);
 
   double actualTimeStep = timeStep;
   int attempt = 0;
@@ -1132,42 +1135,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   // updated inside the sweep loop.  Skip the history-update block to avoid
   // double-updating the companion-model state.
   if (simulationConverged && !isFirstTransientStepHandled) {
-    for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
-      const auto &cap = netlist.globalBlock.capacitors[i];
-      auto &hist = netlist.globalState.capacitorState[i];
-
-      double v_curr = 0.0;
-      if (cap.nodePlate1 > 0 && cap.nodePlate1 <= (int)finalVoltages.size())
-        v_curr += finalVoltages[cap.nodePlate1 - 1];
-      if (cap.nodePlate2 > 0 && cap.nodePlate2 <= (int)finalVoltages.size())
-        v_curr -= finalVoltages[cap.nodePlate2 - 1];
-
-      double i_curr = 0.0;
-      double C = cap.capacitance_farads;
-      IntegrationType type = integrator->getType();
-
-      if (hist.v.empty()) { // Auto-init if empty (should be done in
-                            // addCapacitor but safety check)
-        hist.resize(3);
-      }
-
-      if (type == IntegrationType::TRAPEZOIDAL) {
-        i_curr = (2.0 * C / actualTimeStep) * (v_curr - hist.v[0]) - hist.i[0];
-      } else if (type == IntegrationType::GEAR_1_EULER) {
-        i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-      } else if (type == IntegrationType::GEAR_2) {
-        if (hist.v.size() > 1 && hist.v[1] == 0.0 &&
-            currentTime > actualTimeStep) { // Heuristic check
-          i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-        } else if (hist.v.size() > 1) {
-          i_curr = (C / actualTimeStep) *
-                   (1.5 * v_curr - 2.0 * hist.v[0] + 0.5 * hist.v[1]);
-        } else {
-          i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-        }
-      }
-      integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
-    }
+    updateCapacitorHistory(netlist, finalVoltages, actualTimeStep);
 
     lteController_.recordStep(actualTimeStep);
 
@@ -1207,55 +1175,6 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       }
 
       integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
-    }
-
-    // Update Hierarchical Instances History
-    for (size_t idx = 0; idx < netlist.instances.size(); ++idx) {
-      const auto &inst = netlist.instances[idx];
-      auto &instState = netlist.instanceStates[idx];
-
-      auto it = netlist.blockDefinitions.find(inst.blockName);
-      if (it != netlist.blockDefinitions.end()) {
-        const auto &block = it->second;
-        auto mapNode = [&](int local) {
-          return local == 0 ? 0 : inst.nodeMapping[local - 1];
-        };
-        auto getV = [&](int n) {
-          return (n > 0 && n <= (int)finalVoltages.size())
-                     ? finalVoltages[n - 1]
-                     : 0.0;
-        };
-
-        for (size_t c_idx = 0; c_idx < block.capacitors.size(); ++c_idx) {
-          const auto &c = block.capacitors[c_idx];
-          auto &hist = instState.capacitorState[c_idx];
-
-          double v_curr =
-              getV(mapNode(c.nodePlate1)) - getV(mapNode(c.nodePlate2));
-          double i_curr = 0.0;
-          double C = c.capacitance_farads;
-          IntegrationType type = integrator->getType();
-
-          if (hist.v.empty())
-            hist.resize(3);
-
-          if (type == IntegrationType::TRAPEZOIDAL) {
-            i_curr =
-                (2.0 * C / actualTimeStep) * (v_curr - hist.v[0]) - hist.i[0];
-          } else if (type == IntegrationType::GEAR_1_EULER) {
-            i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-          } else if (type == IntegrationType::GEAR_2) {
-            if (hist.v.size() > 1)
-              i_curr = (C / actualTimeStep) *
-                       (1.5 * v_curr - 2.0 * hist.v[0] + 0.5 * hist.v[1]);
-            else
-              i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-          }
-          integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
-        }
-
-        // TODO: Also update Inductors, PowerRails for instances
-      }
     }
   }
 

@@ -114,31 +114,40 @@ public:
             return v_curr[nodeIdx - 1];
         };
 
-        // Capacitor LTE estimation
-        for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
-            const auto& cap = netlist.globalBlock.capacitors[i];
-            if (i >= netlist.globalState.capacitorState.size()) continue;
-            double lte_v = lteOf(getV(cap.nodePlate1) - getV(cap.nodePlate2),
-                                 netlist.globalState.capacitorState[i].v);
-            if (lte_v > result.maxLTE) {
-                result.maxLTE = lte_v;
-                result.worstElementIndex = static_cast<int>(i);
-                result.worstIsCapacitor = true;
+        // Capacitors and inductors of the global block AND every subcircuit
+        // instance (instance devices were skipped, so hierarchical designs ran
+        // with no LTE step control). Inductors use branch voltage: the solver
+        // does not write back inductor current history, so hist.i is unusable.
+        auto scan = [&](const TensorBlock& blk, const BlockState& st, auto mapNode) {
+            for (size_t i = 0; i < blk.capacitors.size() && i < st.capacitorState.size(); ++i) {
+                const auto& cap = blk.capacitors[i];
+                double lte_v = lteOf(getV(mapNode(cap.nodePlate1)) - getV(mapNode(cap.nodePlate2)),
+                                     st.capacitorState[i].v);
+                if (lte_v > result.maxLTE) {
+                    result.maxLTE = lte_v;
+                    result.worstElementIndex = static_cast<int>(i);
+                    result.worstIsCapacitor = true;
+                }
             }
-        }
-
-        // Inductor LTE estimation (on branch voltage: the solver does not write
-        // back inductor current history, so hist.i is not usable)
-        for (size_t i = 0; i < netlist.globalBlock.inductors.size(); ++i) {
-            const auto& ind = netlist.globalBlock.inductors[i];
-            if (i >= netlist.globalState.inductorState.size()) continue;
-            double lte_v = lteOf(getV(ind.nodeCoil1) - getV(ind.nodeCoil2),
-                                 netlist.globalState.inductorState[i].v);
-            if (lte_v > result.maxLTE) {
-                result.maxLTE = lte_v;
-                result.worstElementIndex = static_cast<int>(i);
-                result.worstIsCapacitor = false;
+            for (size_t i = 0; i < blk.inductors.size() && i < st.inductorState.size(); ++i) {
+                const auto& ind = blk.inductors[i];
+                double lte_v = lteOf(getV(mapNode(ind.nodeCoil1)) - getV(mapNode(ind.nodeCoil2)),
+                                     st.inductorState[i].v);
+                if (lte_v > result.maxLTE) {
+                    result.maxLTE = lte_v;
+                    result.worstElementIndex = static_cast<int>(i);
+                    result.worstIsCapacitor = false;
+                }
             }
+        };
+        scan(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
+        for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
+            const auto& inst = netlist.instances[k];
+            auto it = netlist.blockDefinitions.find(inst.blockName);
+            if (it == netlist.blockDefinitions.end()) continue;
+            scan(it->second, netlist.instanceStates[k], [&](int n) {
+                return (n <= 0 || n > (int)inst.nodeMapping.size()) ? 0 : inst.nodeMapping[n - 1];
+            });
         }
         // Compute safety factor and timestep suggestion
         double effective_tol = trtol_ * tolerance_;

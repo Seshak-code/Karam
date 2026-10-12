@@ -1144,7 +1144,10 @@ public:
              // Internal nodes are pinCount+1..numInternalNodes.
              // Map them to new global nodes.
              
-             int requiredSize = block.numInternalNodes + 1; // 0-based indexing requires size N+1
+             // Local nodes are 1..N and every consumer reads nodeMapping[local-1]
+             // (tensorizeNetlist, stampAllElements), so N entries. The old N+1
+             // allocated one phantom floating node per instance.
+             int requiredSize = block.numInternalNodes;
              
              if ((int)nodeMap.size() < requiredSize) {
                  int currentSize = nodeMap.size();

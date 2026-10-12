@@ -106,11 +106,20 @@ private:
     std::map<std::string, int> nodeMap_;
     int nextNode_ = 1;
 
-    // .subckt parsing state
+    // .subckt parsing state. Bodies use LOCAL node numbers (ports 1..P, then
+    // internal nodes); X cards are expanded after the whole file is read, so
+    // a subcircuit may be defined after use and may contain X cards itself.
     bool             inSubckt_ = false;
     std::string      subcktName_;
     std::vector<std::string> subcktPorts_;
     TensorBlock      subcktBlock_;
+    std::map<std::string, int> subcktNodeMap_;   // local node names of the body being parsed
+    int              nextLocalNode_ = 1;
+    struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; };
+    std::vector<PendingInstance> topInstances_;   // nodes are global indices
+    std::map<std::string, std::vector<PendingInstance>> subcktChildren_;  // nodes are body-local
+    std::map<std::string, int> savedInductorIndex_; // top-level K lookup, saved inside a body
+    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth);
 
     // Model cards collected during parse, merged into netlist at end
     std::map<std::string, ModelCard> modelCards_;

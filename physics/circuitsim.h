@@ -209,27 +209,29 @@ public:
           count++;
       }
 
-      // 2. Capacitor Branch Voltages (Internal State)
-      // Checks stability of charge storage elements
-      for (size_t i = 0; i < netlist.globalBlock.capacitors.size(); ++i) {
-          const auto &c = netlist.globalBlock.capacitors[i];
-          const auto &hist = netlist.globalState.capacitorState[i];
+      // 2. Capacitor Branch Voltages (Internal State), global + instances
+      auto getVc = [&](int n) { return (n > 0 && n <= (int)current_voltages.size()) ? current_voltages[n-1] : 0.0; };
+      auto capErr = [&](const TensorBlock &blk, const BlockState &st, auto mapNode) {
+        for (size_t i = 0; i < blk.capacitors.size() && i < st.capacitorState.size(); ++i) {
+          const auto &c = blk.capacitors[i];
+          const auto &hist = st.capacitorState[i];
           if (hist.v.size() < 2) continue;
-          
-          double v1 = (c.nodePlate1 > 0) ? current_voltages[c.nodePlate1-1] : 0.0;
-          double v2 = (c.nodePlate2 > 0) ? current_voltages[c.nodePlate2-1] : 0.0;
-          double v_branch = v1 - v2;
-          
-          double v_prev = hist.v[0];
-          double v_prev2 = (hist.v.size() > 1) ? hist.v[1] : v_prev;
-          
-          double v_pred = v_prev + (v_prev - v_prev2) * (dt / prev_dt);
-          double err = std::abs(v_branch - v_pred) * c_factor; // Predictor error
-          double w_err = err / getNorm(v_branch);
-          
+          double v_branch = getVc(mapNode(c.nodePlate1)) - getVc(mapNode(c.nodePlate2));
+          double v_pred = hist.v[0] + (hist.v[0] - hist.v[1]) * (dt / prev_dt);
+          double w_err = std::abs(v_branch - v_pred) * c_factor / getNorm(v_branch);
           sum_sq_error += w_err * w_err;
           max_err = std::max(max_err, w_err);
           count++;
+        }
+      };
+      capErr(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
+      for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
+        const auto &inst = netlist.instances[k];
+        auto it = netlist.blockDefinitions.find(inst.blockName);
+        if (it == netlist.blockDefinitions.end()) continue;
+        capErr(it->second, netlist.instanceStates[k], [&](int n) {
+          return (n <= 0 || n > (int)inst.nodeMapping.size()) ? 0 : inst.nodeMapping[n - 1];
+        });
       }
 
 
@@ -1276,6 +1278,14 @@ private:
   bool coldStartSweep(TensorNetlist& netlist, double totalTime, int nSubsteps,
                       std::vector<double>& finalVoltages);
 
+  /** Tensorize `netlist` into soaBlock and sync reactive-element history
+   *  (global + instances) from the AoS state. */
+  void loadSoAFromNetlist(const TensorNetlist& netlist);
+
+  /** Capacitor history after an accepted step (global + instances), using
+   *  the same companion formulas as the stamps and the KCL audit. */
+  void updateCapacitorHistory(TensorNetlist& netlist, const std::vector<double>& v, double h);
+
   // NR Parameters (Using centralized PhysicsConstants)
   // Note: Kept as local constexpr for backward compatibility; prefer PhysicsConstants::
   static constexpr double RELTOL = 1e-3;
@@ -1642,6 +1652,20 @@ public:
                        r.resistance_ohms;
           addRes(mapNode(r.nodeTerminal1), -i_r);
           addRes(mapNode(r.nodeTerminal2), i_r);
+        }
+
+        // Independent sources inside the subcircuit (were missing: a source in
+        // a .subckt was stamped but never audited, so NR could not converge)
+        for (const auto &v : block.voltageSources) {
+          double vs = (h > 1e-15) ? waveformValue(v, v.voltage_V, time) : v.voltage_V;
+          double i_src = (vs - (getV(mapNode(v.nodePositive)) - getV(mapNode(v.nodeNegative)))) / 1e-3;
+          addRes(mapNode(v.nodePositive), i_src);
+          addRes(mapNode(v.nodeNegative), -i_src);
+        }
+        for (const auto &cs : block.currentSources) {
+          double is = (h > 1e-15) ? waveformValue(cs, cs.current_A, time) : cs.current_A;
+          addRes(mapNode(cs.nodePositive), -is);
+          addRes(mapNode(cs.nodeNegative), is);
         }
 
         // Diodes

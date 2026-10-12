@@ -104,14 +104,15 @@ void SPICEParser::rejectArea(const std::vector<std::string>& tok, size_t from) c
 int SPICEParser::nodeIndex(const std::string& name) {
     std::string upper = toUpper(name);
     if (upper == "0" || upper == "GND" || upper == "VSS" || upper == "GROUND")
-        return 0;
+        return 0;  // ground is global, also inside subcircuit bodies
 
-    auto it = nodeMap_.find(upper);
-    if (it != nodeMap_.end()) return it->second;
-
-    int idx = nextNode_++;
-    nodeMap_[upper] = idx;
-    return idx;
+    // Inside a .subckt body node names are local to that definition
+    auto& map  = inSubckt_ ? subcktNodeMap_ : nodeMap_;
+    auto& next = inSubckt_ ? nextLocalNode_ : nextNode_;
+    auto it = map.find(upper);
+    if (it != map.end()) return it->second;
+    map[upper] = next;
+    return next++;
 }
 
 // ============================================================================
@@ -171,6 +172,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     nodeMap_.clear();
     nextNode_ = 1;
     inSubckt_ = false;
+    topInstances_.clear();
+    subcktChildren_.clear();
     modelCards_.clear();
     params_.clear();
     inductorIndex_.clear();
@@ -258,15 +261,12 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 case 'T':
                     throw std::runtime_error(tok[0] + ": transmission lines are not supported yet");
                 case 'X': {
-                    // Sub-circuit instance: X<name> <nodes...> <subcktName>
-                    if (tok.size() >= 3) {
-                        std::string subcktRef = toUpper(tok.back());
-                        std::vector<int> nodeMapping;
-                        for (size_t i = 1; i < tok.size() - 1; ++i) {
-                            nodeMapping.push_back(nodeIndex(tok[i]));
-                        }
-                        result_.netlist.addInstance(subcktRef, nodeMapping);
-                    }
+                    // X<name> <nodes...> <subcktName>; expanded after parsing
+                    requireFields(tok, 3);
+                    PendingInstance pi{toUpper(tok.back()), {}, lineNum};
+                    for (size_t i = 1; i + 1 < tok.size(); ++i)
+                        pi.nodes.push_back(nodeIndex(tok[i]));
+                    (inSubckt_ ? subcktChildren_[subcktName_] : topInstances_).push_back(pi);
                     break;
                 }
                 default:
@@ -280,10 +280,19 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
         }
     }
 
+    if (inSubckt_)
+        return fail(lines.back().first, ".subckt " + subcktName_ + " has no .ends");
+
     // Finalize: compute numGlobalNodes from nodeMap (max index)
     for (const auto& [name, idx] : nodeMap_) {
         if (idx > result_.netlist.numGlobalNodes)
             result_.netlist.numGlobalNodes = idx;
+    }
+
+    // Expand X cards (recursively) now that every .subckt is defined
+    for (const auto& pi : topInstances_) {
+        try { expandInstance(pi, pi.nodes, 0); }
+        catch (const std::exception& e) { return fail(pi.line, e.what()); }
     }
 
     // Resolve .model cards now that the whole file is read (SPICE allows .model
@@ -605,26 +614,61 @@ void SPICEParser::parseModelCard(const std::vector<std::string>& tok) {
 
 // .SUBCKT <name> <port1> <port2> ...
 void SPICEParser::parseSubcktBegin(const std::vector<std::string>& tok) {
-    if (tok.size() < 2) return;
+    requireFields(tok, 2);
+    if (inSubckt_)
+        throw std::runtime_error("nested .subckt definitions are not supported (missing .ends for " +
+                                 subcktName_ + "?)");
     inSubckt_ = true;
     subcktName_ = toUpper(tok[1]);
+    if (result_.netlist.blockDefinitions.count(subcktName_))
+        throw std::runtime_error("subcircuit " + subcktName_ + " defined twice");
     subcktBlock_ = TensorBlock{};
     subcktBlock_.name = subcktName_;
+    subcktNodeMap_.clear();
+    nextLocalNode_ = 1;
+    savedInductorIndex_.swap(inductorIndex_);  // K cards inside see only this body's L
+    inductorIndex_.clear();
 
     subcktPorts_.clear();
     for (size_t i = 2; i < tok.size(); ++i) {
         subcktPorts_.push_back(tok[i]);
         subcktBlock_.pinNames.push_back(tok[i]);
-        subcktBlock_.portNodeIndices.push_back(nodeIndex(tok[i]));
+        subcktBlock_.portNodeIndices.push_back(nodeIndex(tok[i]));  // local 1..P
     }
 }
 
 void SPICEParser::parseSubcktEnd() {
-    if (!inSubckt_) return;
+    if (!inSubckt_) throw std::runtime_error(".ends without .subckt");
     inSubckt_ = false;
+    inductorIndex_.swap(savedInductorIndex_);
+    subcktBlock_.numInternalNodes = nextLocalNode_ - 1;  // ports + internal nodes
 
     result_.netlist.defineBlock(subcktBlock_);
     result_.subcircuitsCreated++;
+}
+
+// One instance of `pi.subckt` with ports on global nodes `portNodes`: fresh
+// global nodes for its internal nodes, then its own X cards, recursively.
+void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes,
+                                 int depth) {
+    if (depth > 64) throw std::runtime_error("subcircuit nesting deeper than 64 (recursive .subckt?)");
+    auto it = result_.netlist.blockDefinitions.find(pi.subckt);
+    if (it == result_.netlist.blockDefinitions.end())
+        throw std::runtime_error("unknown subcircuit '" + pi.subckt + "'");
+    const TensorBlock& blk = it->second;
+    if (portNodes.size() != blk.pinNames.size())
+        throw std::runtime_error(pi.subckt + " has " + std::to_string(blk.pinNames.size()) +
+                                 " pins but the instance connects " + std::to_string(portNodes.size()));
+
+    std::vector<int> map(portNodes);  // local node l -> global map[l-1]
+    for (int l = (int)map.size() + 1; l <= blk.numInternalNodes; ++l) map.push_back(nextNode_++);
+    result_.netlist.addInstance(pi.subckt, map);
+
+    for (const auto& child : subcktChildren_[pi.subckt]) {
+        std::vector<int> childPorts;
+        for (int l : child.nodes) childPorts.push_back(l == 0 ? 0 : map[l - 1]);
+        expandInstance(child, childPorts, depth + 1);
+    }
 }
 
 // .PARAM <name>=<value> [<name>=<value>]...
