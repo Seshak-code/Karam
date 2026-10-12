@@ -46,8 +46,9 @@ void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& v
         double g_base = (Is / n_vt) * exp_arg;
         
         double delta = std::max(0.0, tensor.v_d[i] - Vcrit);
-        tensor.i_d[i] = i_base + delta * g_base;
-        tensor.g_d[i] = std::max(GMIN, g_base);
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        tensor.i_d[i] = i_base + delta * g_base + GMIN * tensor.v_d[i];
+        tensor.g_d[i] = g_base + GMIN;
     }
 }
 
@@ -138,12 +139,13 @@ void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& volta
             double exp_val = std::exp(arg_clamped);
             double i_base = Is * (exp_val - 1.0);
             double g_base = (Is / Vt) * exp_val;
-            double g_clamped = std::max(GMIN, g_base);
+            // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+            double g_clamped = g_base + GMIN;
             
             double delta = std::max(0.0, v_j - Vcrit);
             double i_ext = g_clamped * delta; // Use clamped slope
             
-            return {i_base + i_ext, g_clamped};
+            return {i_base + i_ext + GMIN * v_j, g_clamped};
         };
         
         auto [i_f, g_f] = linear_continuation_diode(v_be);

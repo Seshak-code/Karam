@@ -83,8 +83,10 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
         __m256d v_g_base = _mm256_mul_pd(_mm256_div_pd(v_Is, v_n_vt), v_exp_val);
         __m256d v_delta = _mm256_max_pd(_mm256_setzero_pd(), _mm256_sub_pd(v_v_d, _mm256_mul_pd(vc_argmax, v_n_vt)));
         __m256d v_i_d = _mm256_add_pd(_mm256_mul_pd(v_delta, v_g_base), v_i_base);
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        v_i_d = _mm256_add_pd(v_i_d, _mm256_mul_pd(v_GMIN, v_v_d));
         _mm256_storeu_pd(&tensor.i_d[i], v_i_d);
-        __m256d v_g_d = _mm256_max_pd(v_GMIN, v_g_base);
+        __m256d v_g_d = _mm256_add_pd(v_g_base, v_GMIN);  // additive; replaces the max() floor
         _mm256_storeu_pd(&tensor.g_d[i], v_g_d);
     }
 
@@ -109,9 +111,10 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
         double i_base = ((exp_val - 1.0) * Is);
         double g_base = ((Is / n_vt) * exp_val);
         double delta = std::max(0.0, (v_d - (PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt)));
-        tensor.i_d[i] = ((delta * g_base) + i_base);
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        tensor.i_d[i] = ((delta * g_base) + i_base) + GMIN * v_d;
         double i_d = tensor.i_d[i];
-        tensor.g_d[i] = std::max(GMIN, g_base);
+        tensor.g_d[i] = g_base + GMIN;  // additive; replaces the max() floor
         double g_d = tensor.g_d[i];
     }
 }

@@ -99,11 +99,13 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         // delta = max(0.0, v_d - Vcrit)
         __m512d v_delta = _mm512_max_pd(v_zero, _mm512_sub_pd(v_d, v_vcrit));
         
-        // i_d = i_base + delta * g_base
+        // i_d = i_base + delta * g_base + GMIN * v_d
+        // (ngspice GMIN: parallel junction conductance — mirrors diode_model_pair())
         __m512d v_id = _mm512_add_pd(v_ibase, _mm512_mul_pd(v_delta, v_gbase));
+        v_id = _mm512_add_pd(v_id, _mm512_mul_pd(v_gmin, v_d));
         
-        // g_d = max(GMIN, g_base)
-        __m512d v_gd = _mm512_max_pd(v_gmin, v_gbase);
+        // g_d = g_base + GMIN  (additive; replaces the max() floor)
+        __m512d v_gd = _mm512_add_pd(v_gbase, v_gmin);
         
         // Store results
         _mm512_storeu_pd(&tensor.i_d[i], v_id);
@@ -134,8 +136,9 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         double g_base = (Is / n_vt) * exp_arg;
         
         double delta = std::max(0.0, tensor.v_d[i] - Vcrit);
-        tensor.i_d[i] = i_base + delta * g_base;
-        tensor.g_d[i] = std::max(GMIN, g_base);
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        tensor.i_d[i] = i_base + delta * g_base + GMIN * tensor.v_d[i];
+        tensor.g_d[i] = g_base + GMIN;  // additive; replaces the max() floor
     }
 }
 

@@ -76,6 +76,11 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
     // NASA Optimization: Keep params as scalars where possible
     auto n_vt = p.N * p.Vt;
     T arg = vd / n_vt;
+    // ngspice GMIN: a 1e-12 S conductance in parallel with every PN junction —
+    // never a node-to-ground leak (the solver's node gmin is dropped at
+    // convergence; ngspice has none once converged). It lives here in the
+    // junction model so the SoA kernels, the AoS stamps and both KCL audits
+    // all carry it consistently.
     T GMIN = T(1e-12); 
 
     // Linear Continuation Region
@@ -88,16 +93,14 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
         T g_max = (p.Is / n_vt) * exp_max;
         
         T delta = vd - (n_vt * T(max_arg));
-        return {i_max + delta * g_max, g_max};
+        return {i_max + delta * g_max + GMIN * vd, g_max + GMIN};
     }
     
     using std::exp;
     T exp_val = exp(arg);
-    T i_val = p.Is * (exp_val - T(1.0));
-    T g_val = (p.Is / n_vt) * exp_val;
-    
-    // Safety clamp for G
-    if (g_val < GMIN) g_val = GMIN;
+    T i_val = p.Is * (exp_val - T(1.0)) + GMIN * vd;
+    // Additive (g_base >= 0, so g >= GMIN without the old floor)
+    T g_val = (p.Is / n_vt) * exp_val + GMIN;
     
     return {i_val, g_val};
 }
@@ -474,7 +477,7 @@ inline T zener_current(T vd, const ZenerParams<P>& p)
         }
     }
     
-    return i_fwd + i_rev;
+    return i_fwd + i_rev + T(1e-12) * vd;  // ngspice GMIN: parallel junction conductance (same as diode_model_pair)
 }
 
 // ============================================================================

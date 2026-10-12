@@ -247,10 +247,13 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   std::vector<int> gminSchedule{GMIN_STEPS - 1};
   for (size_t si = 0; si < gminSchedule.size(); ++si) {
     const int gmin_step = gminSchedule[si];
-    // Scale GMIN: start at 1e-3, reduce by sqrt(10) each step to 1e-12
+    // Scale GMIN: start at 1e-3, reduce by sqrt(10) each step; the final step
+    // carries NO node gmin (junction GMIN in the device models keeps floating
+    // junction nodes referenced, like ngspice) — a node-to-ground leak settles
+    // them differently (aac_10_bridge).
     gmin_factor = std::pow(10.0, -(3.0 + gmin_step * 0.5));
-    if (gmin_factor < 1e-12)
-      gmin_factor = 1e-12;
+    if (gmin_factor <= 1e-12)
+      gmin_factor = 0.0;
     bool gmin_converged = false;
 
     // Phase 2.9: Track regularization
@@ -961,7 +964,8 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
       rhsVector.assign(nTot, 0.0);
 
       stampAllElements(netlist, dt_sub, nrEstimate, dt_sub * (k + 1));
-      addDiagonalConditioning(netlist.numGlobalNodes);
+      // (no node-to-ground gmin in transient: junction GMIN in the device
+      // models keeps floating junction nodes referenced, like ngspice)
 
       Csr_matrix A = matrixBuilder.createCsr();
 
@@ -1100,7 +1104,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
 
         stampAllElements(netlist, actualTimeStep, nrEstimate,
                          currentTime + actualTimeStep);
-        addDiagonalConditioning(netlist.numGlobalNodes);
+        // (no node-to-ground gmin in transient: junction GMIN in the device
+        // models keeps floating junction nodes referenced, like ngspice)
 
         Csr_matrix A = matrixBuilder.createCsr();
 

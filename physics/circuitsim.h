@@ -2461,6 +2461,11 @@ public:
 
 
   void addDiagonalConditioning(int n, double gmin = 1e-12) {
+    // gmin <= 0: no node-to-ground conditioning. Like ngspice, once converged
+    // the only gmin is the 1e-12 S across each junction (device models); a
+    // node-to-ground leak settles floating junction nodes differently
+    // (aac_10_bridge). Mid-ladder DC steps still pass gmin > 0 for conditioning.
+    if (gmin <= 0.0) return;
     for (int i = 0; i < n; ++i)
       matrixBuilder.add(i, i, gmin);
   }
