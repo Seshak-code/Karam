@@ -1,0 +1,16 @@
+transformer
+v1 1 0 ac 120
+rbogus0 1 6 1e-3
+l1 6 0 100
+l2 2 4 1
+l3 3 5 25
+k1 l1 l2 0.999
+k2 l2 l3 0.999
+k3 l1 l3 0.999
+r1 2 4 1000
+r2 3 5 1000
+rbogus1 5 0 1e10
+rbogus2 4 0 1e10
+.ac lin 1 60 60
+.print ac v(1,0) v(2,0) v(3,0)
+.end

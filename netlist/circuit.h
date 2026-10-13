@@ -2,6 +2,9 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <memory>
 #include <map>
 #include <set>
 #include <cassert>
@@ -61,8 +64,6 @@ struct Resistor {
     std::string model_name;       // e.g., "poly_res"
     double width_m = 0.0;
     double length_m = 0.0;
-    double tc1 = 0.0;
-    double tc2 = 0.0;
 
     double tolerance_percent = 0.0; // Monte Carlo Tolerance (e.g. 1.0 = 1%)
     std::string expression;         // Symbolic override (e.g. "Rload", "2*Vbias/Iref")
@@ -90,6 +91,9 @@ struct Capacitor {
     
     double tolerance_percent = 0.0;
     std::string expression;         // Symbolic override for capacitance
+
+    bool   icGiven = false;           // IC= (initial voltage), used only with UIC
+    double ic_V    = 0.0;
 };
 
 /*
@@ -116,6 +120,9 @@ struct Inductor {
     int turns = 0;                // Number of turns
 
     std::string expression;       // Symbolic override for inductance
+
+    bool   icGiven = false;       // IC= (initial current), used only with UIC
+    double ic_A    = 0.0;
 };
 
 /*
@@ -143,7 +150,7 @@ struct MutualInductor {
 struct VoltageSource {
     int nodePositive;
     int nodeNegative;
-    double voltage_V;        // DC/Offset Voltage
+    double voltage_V = 0.0;  // DC value (parser: t=0 waveform value if no DC given)
     std::string type = "";   // "PULSE", "SINE", "DC", etc.
 
     // Waveform Parameters (SPICE-like)
@@ -168,6 +175,7 @@ struct VoltageSource {
     double sine_phase = 0.0; // Phase [deg] (Extension)
 
     std::string expression;  // Symbolic override for DC/main value
+    std::string name;        // instance name (F/H cards reference it)
 };
 
 /*
@@ -178,7 +186,8 @@ struct VoltageSource {
 struct CurrentSource {
     int nodePositive;
     int nodeNegative;
-    double current_A;        // DC Current
+    double current_A = 0.0;  // DC value (parser: t=0 waveform value if no DC given)
+    std::string name;        // instance name (.dc sweeps reference it)
     std::string type = "";   // "PULSE", "SINE", "DC"
 
     // Waveform Parameters (Mirror of VoltageSource)
@@ -202,6 +211,58 @@ struct CurrentSource {
 
     std::string expression;  // Symbolic override for DC/main value
 };
+
+/*
+ * Instantaneous value of an independent V or I source at time t (transient).
+ * The single definition shared by the parser (t=0 DC value), both stamping
+ * paths and the KCL audit, so they can never disagree on a source's value.
+ * The transient lands on its corners via nextBreakpoint() below.
+ */
+template <class Src>
+inline double waveformValue(const Src& s, double dcValue, double t) {
+    if (s.type == "PULSE") {
+        double tt = t - s.pulse_td;
+        if (tt <= 0.0) return s.pulse_v1;
+        tt = std::fmod(tt, s.pulse_per > 0.0 ? s.pulse_per : 1e99);
+        if (tt < s.pulse_tr) return s.pulse_v1 + (s.pulse_v2 - s.pulse_v1) * (tt / s.pulse_tr);
+        tt -= s.pulse_tr;
+        if (tt < s.pulse_pw) return s.pulse_v2;
+        tt -= s.pulse_pw;
+        if (tt < s.pulse_tf) return s.pulse_v2 + (s.pulse_v1 - s.pulse_v2) * (tt / s.pulse_tf);
+        return s.pulse_v1;
+    }
+    if (s.type == "SINE") {
+        const double kPi = 3.141592653589793;
+        double phase = s.sine_phase * (kPi / 180.0);
+        double tt = t - s.sine_td;
+        if (tt <= 0.0) return s.sine_vo + s.sine_va * std::sin(phase);
+        return s.sine_vo + s.sine_va * std::exp(-tt * s.sine_theta) *
+                               std::sin(2.0 * kPi * s.sine_freq * tt + phase);
+    }
+    return dcValue;
+}
+
+/*
+ * First corner of waveformValue() strictly after t (PULSE edges, SIN start);
+ * +inf if none. Corners are where the waveform's derivative jumps: a step that
+ * straddles one integrates a kink as if it were smooth.
+ */
+template <class Src>
+inline double nextBreakpoint(const Src& s, double t) {
+    const double inf = std::numeric_limits<double>::infinity();
+    if (s.type == "SINE") return t < s.sine_td ? s.sine_td : inf;
+    if (s.type != "PULSE") return inf;
+    const double c[4] = {0.0, s.pulse_tr, s.pulse_tr + s.pulse_pw, s.pulse_tr + s.pulse_pw + s.pulse_tf};
+    const double per = s.pulse_per > 0.0 ? s.pulse_per : inf;
+    // this period, then the next (k * per would be 0 * inf = NaN for a single pulse)
+    double k = t < s.pulse_td ? 0.0 : std::floor((t - s.pulse_td) / per);
+    for (int p = 0; p < 2; ++p, ++k) {
+        const double base = s.pulse_td + (k == 0.0 ? 0.0 : k * per);
+        for (double ci : c)
+            if (base + ci > t) return base + ci;
+    }
+    return inf;
+}
 
 // ============================================================================
 // DEPENDENT SOURCES (Bench + Block internal modes)
@@ -228,16 +289,20 @@ struct VCCS {
 
 struct CCVS {
     int outPos, outNeg;
-    int ctrlPos, ctrlNeg;
+    int ctrlPos, ctrlNeg;      // unused by the solver (legacy sense-node fields)
     double rm;
     std::string role;
+    int ctrlSource = -1;       // index of the controlling V source in the same block
+    std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
 };
 
 struct CCCS {
     int outPos, outNeg;
-    int ctrlPos, ctrlNeg;
+    int ctrlPos, ctrlNeg;      // unused by the solver (legacy sense-node fields)
     double alpha;
     std::string role;
+    int ctrlSource = -1;       // index of the controlling V source in the same block
+    std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
 };
 
 // ============================================================================
@@ -393,15 +458,17 @@ struct Diode {
     std::string instanceName;         // e.g. "D1"
     int anode;                        // P-type side (+)
     int cathode;                      // N-type side (-)
-    double saturationCurrent_I_S_A;       // I_S [A]
-    double emissionCoefficient_N;         // N (dimensionless)
-    double thermalVoltage_V_T_V;          // V_T [V]
-    
+    // Defaults match SPICE3 D-model defaults and addDiode(); left uninitialised
+    // these were read as garbage by every parser-created diode (NaN results).
+    double saturationCurrent_I_S_A = 1e-14;  // I_S [A]
+    double emissionCoefficient_N = 1.0;      // N (dimensionless)
+    double thermalVoltage_V_T_V = 0.02585;   // V_T [V]
+
     // Thermal (Optional, default 300.15K)
     double temperature_K = 300.15;
 
     // Generic PDK Support
-    std::string modelName = "diode_generic"; 
+    std::string modelName = "diode_generic";
     double area_m2 = 1e-12;       // Junction Area
     double perimeter_m = 4e-6;    // Junction Perimeter
 
@@ -493,8 +560,20 @@ struct Mosfet {
     // Advanced Params
     struct Params {
         int nf = 1;      // Number of fingers
-        int mult = 1;    // Multiplier
+        double mult = 1.0;  // Multiplier (M=): scales beta, the junctions and every capacitance
     } extra;
+
+    // SPICE level-1 .model values, resolved by the parser (SPICE defaults for
+    // missing keys). resolved = false (the GUI's Verilog-A path, no cards):
+    // engine defaults chosen by model name, no capacitances.
+    struct Card {
+        bool resolved = false, pmos = false;
+        double kp = 2e-5, vto = 0.0, lambda = 0.0, gamma = 0.0, phi = 0.6, is = 1e-14, ld = 0.0;
+        double tox = 0.0;                                   // > 0: Meyer gate capacitance
+        double cgso = 0.0, cgdo = 0.0, cgbo = 0.0;          // overlap [F/m]
+        double cbd = 0.0, cbs = 0.0, cj = 0.0, cjsw = 0.0;  // bulk junctions [F, F/m^2, F/m]
+        double mj = 0.5, mjsw = 0.33, pb = 0.8, fc = 0.5;
+    } card;
 
     // Noise Parameters
     double KF = 0.0;     // Flicker noise coefficient
@@ -503,8 +582,6 @@ struct Mosfet {
 
     double temperature_K = 300.15;
 };
-
-
 
 struct BJT {
     std::string instanceName;
@@ -1026,12 +1103,18 @@ struct BlockState {
         void resize(size_t n) { v.resize(n, 0.0); i.resize(n, 0.0); }
     };
 
-    struct MosfetOP { double vgs=0, vds=0, vbs=0; };
+    // MOSFET charge history after the last accepted step, per branch
+    // gs, gd, gb (Meyer + overlap) and bd, bs (bulk junctions), actual polarity.
+    struct MosfetCharge {
+        double v[3][5] = {};  // branch voltages, last three accepted steps (v[0] latest; LTE)
+        double q[5] = {}, i[5] = {};
+        double half[3] = {};  // Meyer half-capacitances gs, gd, gb (ngspice averages two)
+    };
 
     std::vector<History> capacitorState;
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
-    std::vector<MosfetOP> mosfetState;
+    std::vector<MosfetCharge> mosfetState;
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
 
@@ -1075,6 +1158,10 @@ public:
     // SPICE .MODEL card library
     std::map<std::string, ModelCard> modelCards;
 
+    // .ic V(node)=value: forced during the transient's DC bias, or the initial
+    // node voltages with UIC
+    std::vector<std::pair<int, double>> nodeICs;
+
     void addModelCard(const ModelCard& card) {
         modelCards[card.name] = card;
     }
@@ -1110,7 +1197,10 @@ public:
              // Internal nodes are pinCount+1..numInternalNodes.
              // Map them to new global nodes.
              
-             int requiredSize = block.numInternalNodes + 1; // 0-based indexing requires size N+1
+             // Local nodes are 1..N and every consumer reads nodeMapping[local-1]
+             // (tensorizeNetlist, stampAllElements), so N entries. The old N+1
+             // allocated one phantom floating node per instance.
+             int requiredSize = block.numInternalNodes;
              
              if ((int)nodeMap.size() < requiredSize) {
                  int currentSize = nodeMap.size();

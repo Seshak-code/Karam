@@ -7,7 +7,7 @@
 > production simulator: device-model coverage stops at MOSFET level 1, and the GPU path is
 > still being built. Everything below marked *planned* or *open* does not exist yet.
 
-Karam is the simulation kernel of the AcuteSim / CuteApp design environment. Its long-term
+Karam is the simulation kernel of the AcuteSim / CuteApp design environment, developed here as a standalone library. Its long-term
 goal is one application where you can design an SoC, attach RAM, run firmware on it and see
 the program's output, with transistor-level simulation available wherever it matters.
 
@@ -78,7 +78,7 @@ honest expected scaling, not a claim of beating it.
 | Elements | R, C, L, K (mutual inductance), V/I sources (DC, PULSE, SIN, AC), E/F/G/H controlled sources, D, Q (Ebers–Moll), J (Shichman–Hodges), X subcircuits (nested, local node scoping) |
 | MOSFET | Level 1 complete: source/drain swap, body effect, bulk junctions, Meyer gate charge, overlap and junction capacitances |
 | Netlist | SPICE syntax with SI suffixes, `.model`, `.param` substitution, `.subckt`. Unknown or unsupported cards are **hard errors**, never silently dropped |
-| Convergence | Plain Newton first, then a gmin ladder on failure; gmin across each PN junction as in ngspice; responses fail closed on NaN or non-convergence |
+| Convergence | Plain Newton first, then ngspice's dynamic gmin stepping on failure; gmin across each PN junction as in ngspice; responses fail closed on NaN or non-convergence |
 | Determinism | No `-ffast-math`, round-to-nearest enforced, deterministic parallel solve |
 
 **Not yet supported:** BSIM4/BSIM-CMG, Gummel–Poon BJT, diode RS/CJO/TT/BV, `.lib`/`.include`,
@@ -96,12 +96,7 @@ Correctness is established by **running** reference simulators. Checklists do no
   solutions. The largest, ibmpg6, solves in 37 s.
 - Every engine fix adds a regression check derived from an analytic or hand-derived reference.
 
-Open issues are tracked with reproducer netlists. As of October 2026 they are:
-
-- a `uic` initial-charge bug in the MOS model;
-- `.op` failing on 100-stage-plus inverter chains, which needs dynamic gmin stepping;
-- a nested-subcircuit DC error;
-- a coarse-step LTE error.
+Known issues are tracked with reproducer netlists, and each fix is retested before it is marked done.
 
 ---
 
@@ -145,7 +140,8 @@ waveform corners, all running through one transient loop shared by the API and t
 | Diode RS/CJO/TT/BV, Gummel–Poon BJT with junction capacitances | Established |
 | BSIM4, BSIM-CMG and PSP through an OSDI loader compiled with OpenVAF (the ngspice ≥ 39 route), not hand ports | Established |
 | `.lib` sections and process corners (PDK ingestion) | Established |
-| Dynamic gmin and source stepping with ngspice default tolerances | Established |
+| Dynamic gmin stepping (ngspice `dynamic_gmin`) | ✅ done |
+| Source stepping | Established |
 | **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so Karam must win there too, not only on resistor grids | Established techniques, open outcome |
 | **Condition-number survey** of real MNA matrices, with and without gmin and scaling. This decides whether low-precision factors are viable | Open: no published data |
 | Per-front dirty flags with exact reuse of an unchanged subtree's Schur complement (CPU prototype) | Open integration |
@@ -224,9 +220,33 @@ These are ranked by fit with Karam's architecture. Each is publishable only with
 
 ---
 
+## Building and testing
+
+Karam is a C++17 CMake project with no required dependencies. Dawn/WebGPU is used when present.
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build                      # engine regression suites
+python3 tests/ngspice_diff/run_diff.py      # waveform diff against ngspice (needs ngspice on PATH)
+python3 tests/xyce_diff.py                  # Xyce regression gold (needs datasets/xyce)
+python3 tests/ibmpg_diff.py -k ibmpg2       # IBM power-grid benchmarks (needs datasets/ibmpg)
+build/acutesim_engine_dump <netlist> cpu tran <step> <stop>   # machine-readable waveforms
+```
+
+`datasets/` is git-ignored. See `ENGINE_HANDOFF.md` for where to download the Xyce and IBM sets.
+
+### Using Karam from another project
+
+The public API is `engine_api/`: `ISimulationEngine`, sessions, request/response DTOs and callbacks.
+The netlist data model (`netlist/circuit.h`, `netlist/spice_parser.h`) is also public for now.
+Everything else is internal and may change. AcuteSim/CuteApp consumes Karam as a git submodule
+at `acutesim_engine/`, using `add_subdirectory(acutesim_engine)` and linking `acutesim_engine`.
+
 ## Repository layout
 
 ```
+engine_api/    public API: ISimulationEngine, sessions, DTOs, callbacks
 autodiff/      Dual-number forward-mode AD (device Jacobians)
 math/          contraction solver, FPU control, integration methods
 netlist/       SPICE parser, circuit model, canonical topology hash
@@ -235,11 +255,9 @@ tensors/       structure-of-arrays device storage, SIMD kernels (NEON / AVX2 / A
 solvers/       DC / transient / AC / noise, LTE control, analysis registry
 infrastructure/  scheduling, tracing, Monte Carlo
 cli/           acutesim_engine_cli, acutesim_engine_dump (machine-readable waveforms)
+tests/         C++ suites, ngspice / Xyce / IBM power-grid differential harnesses
 engine_impl.*  session API (.op/.dc/.tran/.ac/.noise)
 ```
-
-Karam builds as a CMake subdirectory of the AcuteSim application (C++17). A standalone
-top-level build is planned.
 
 ## References
 

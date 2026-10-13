@@ -1,0 +1,8 @@
+* QA: junction caps with FC=0 and MJ != MJSW (depletion-width exponent handling)
+VDD 1 0 DC 5
+VIN 2 0 DC 2 AC 1
+RD 1 3 10k
+M1 3 2 0 0 NM W=20u L=1u AD=50p AS=50p PD=30u PS=30u
+.model NM NMOS(KP=100u VTO=0.7 LAMBDA=0.02 CJ=800u CJSW=400p MJ=0.5 MJSW=0.33 PB=0.8 FC=0)
+.ac DEC 20 100 10MEG
+.end

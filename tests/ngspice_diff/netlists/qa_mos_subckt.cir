@@ -1,0 +1,16 @@
+* QA: MOS1 inside .subckt — two inverter stages, models defined inside the subckt, transient
+* (edges 1u >> tmax = tstep/10 so the ngspice reference resolves them; the first version's
+*  1n edges smeared in the reference interpolation and false-failed at the corner samples)
+VDD 1 0 DC 5
+VIN 2 0 PULSE(0 5 1u 1u 1u 4u 10u)
+X1 2 3 1 INV
+X2 3 4 1 INV
+RL 4 0 100k
+.subckt INV IN OUT VP
+MN1 OUT IN 0 0 NMI W=10u L=1u
+MP1 OUT IN VP VP PMI W=20u L=1u
+.model NMI NMOS(KP=100u VTO=0.7 GAMMA=0.4 PHI=0.6)
+.model PMI PMOS(KP=100u VTO=-0.7 GAMMA=0.4 PHI=0.6)
+.ends INV
+.tran 0.5u 30u
+.end

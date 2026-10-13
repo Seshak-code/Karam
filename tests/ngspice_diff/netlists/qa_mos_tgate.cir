@@ -1,0 +1,13 @@
+* QA: transmission gate (NMOS + PMOS in parallel), both signs of Vds
+VIN 1 0 SIN(0 2.5 1k)
+VGN 2 0 DC 5
+VGP 4 0 DC -5
+VNN 5 0 DC -5
+RL 3 0 10k
+CL 3 0 10n
+MN 1 2 3 0 NM W=10u L=1u
+MP 1 4 3 5 PM W=20u L=1u
+.model NM NMOS(KP=100u VTO=0.7 GAMMA=0.4 PHI=0.6)
+.model PM PMOS(KP=100u VTO=-0.7 GAMMA=0.4 PHI=0.6)
+.tran 5u 3m
+.end

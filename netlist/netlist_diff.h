@@ -88,6 +88,8 @@ public:
             [](const Capacitor& a, const Capacitor& b) {
                 if (std::abs(a.capacitance_farads - b.capacitance_farads) > 1e-15)
                     return "C: " + std::to_string(a.capacitance_farads) + " -> " + std::to_string(b.capacitance_farads);
+                if (a.icGiven != b.icGiven || a.ic_V != b.ic_V)
+                    return "IC: " + std::to_string(a.ic_V) + " -> " + std::to_string(b.ic_V);
                 return std::string("");
             },
             [](const Capacitor& c) -> std::pair<int, int> { return {c.nodePlate1, c.nodePlate2}; }
@@ -97,6 +99,8 @@ public:
             [](const Inductor& a, const Inductor& b) {
                 if (std::abs(a.inductance_henries - b.inductance_henries) > 1e-15)
                     return "L: " + std::to_string(a.inductance_henries) + " -> " + std::to_string(b.inductance_henries);
+                if (a.icGiven != b.icGiven || a.ic_A != b.ic_A)
+                    return "IC: " + std::to_string(a.ic_A) + " -> " + std::to_string(b.ic_A);
                 return std::string("");
             },
             [](const Inductor& l) -> std::pair<int, int> { return {l.nodeCoil1, l.nodeCoil2}; }

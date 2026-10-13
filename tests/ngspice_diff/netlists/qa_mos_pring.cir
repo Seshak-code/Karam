@@ -1,0 +1,14 @@
+* QA: ring oscillator with the full charge set on the PMOS devices (Meyer + overlap + junctions)
+VDD 1 0 DC 5
+RL 2 0 100k
+X1 2 3 1 INV
+X2 3 4 1 INV
+X3 4 2 1 INV
+.subckt INV IN OUT VP
+MN1 OUT IN 0 0 NMI W=10u L=1u
+MP1 OUT IN VP VP PMI W=40u L=1u
+.ends INV
+.model NMI NMOS(KP=100u VTO=0.7)
+.model PMI PMOS(KP=50u VTO=-0.8 LAMBDA=0.02 TOX=40n CGSO=2n CGDO=2n CGBO=1n CBD=10f CBS=10f)
+.tran 0.2u 40u
+.end

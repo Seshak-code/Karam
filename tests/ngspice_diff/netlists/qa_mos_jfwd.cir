@@ -1,0 +1,12 @@
+* QA: source/body junction forward-biased beyond FC*PB (PB=0.8 FC=0.5 -> 0.4 V; driven to 0.7 V)
+* in .ac — the forward-region junction charge (linearised beyond FC*PB) shapes the response
+VDD 1 0 DC 5
+VB 4 0 DC 0.7
+RS 2 4 100
+M1 1 3 2 4 NM W=20u L=1u AD=50p AS=50p PD=30u PS=30u
+VIN 3 0 DC 2 AC 1
+RD 1 5 10k
+VD 5 0 DC 3
+.model NM NMOS(KP=100u VTO=0.7 CJ=800u CJSW=400p MJ=0.5 MJSW=0.33 PB=0.8 FC=0.5)
+.ac DEC 20 100 10MEG
+.end

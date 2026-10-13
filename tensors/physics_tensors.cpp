@@ -1,4 +1,5 @@
 #include "../tensors/physics_tensors.h"
+#include "../physics/physics_constants.h"
 #include "kernel_dispatch.h"
 #include "../infrastructure/model_registry.h"
 #include "../netlist/circuit.h"
@@ -18,7 +19,7 @@ using namespace acutesim::compute;
 
 void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
-    const double GMIN = 1e-12;
+    const double GMIN = PhysicsConstants::JUNCTION_GMIN;
     
     for (size_t i = 0; i < n; ++i) {
         int nA = tensor.node_a[i];
@@ -33,79 +34,27 @@ void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& v
         double N = tensor.N[i];
         double Vt = tensor.Vt[i];
         double n_vt = N * Vt;
-        double Vcrit = 30.0 * n_vt;
+        double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt;
         
         double arg = tensor.v_d[i] / n_vt;
         
         // Linear continuation (branchless-style using std::min/max)
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_arg = std::exp(arg_clamped);
         
         double i_base = Is * (exp_arg - 1.0);
         double g_base = (Is / n_vt) * exp_arg;
         
         double delta = std::max(0.0, tensor.v_d[i] - Vcrit);
-        tensor.i_d[i] = i_base + delta * g_base;
-        tensor.g_d[i] = std::max(GMIN, g_base);
-    }
-}
-
-void batchMosfetPhysics_generic(MosfetTensor& tensor, const std::vector<double>& voltages) {
-    size_t n = tensor.size();
-    
-    for (size_t i = 0; i < n; ++i) {
-        int nD = tensor.drains[i];
-        int nG = tensor.gates[i];
-        int nS = tensor.sources[i];
-        
-        double v_d_orig = (nD > 0 && nD <= (int)voltages.size()) ? voltages[nD - 1] : 0.0;
-        double v_g_orig = (nG > 0 && nG <= (int)voltages.size()) ? voltages[nG - 1] : 0.0;
-        double v_s_orig = (nS > 0 && nS <= (int)voltages.size()) ? voltages[nS - 1] : 0.0;
-        
-        bool isPMOS = tensor.isPMOS[i];
-        double sign = isPMOS ? -1.0 : 1.0;
-        
-        // PMOS equivalent: flip all voltages relative to source?
-        // Actually legacy flips: Vgs'=-Vgs, Vds'=-Vds, Vth'=-Vth
-        double v_g = isPMOS ? v_g_orig : v_g_orig;
-        double v_s = isPMOS ? v_s_orig : v_s_orig;
-        double v_d = isPMOS ? v_d_orig : v_d_orig;
-
-        tensor.vgs[i] = v_g - v_s;
-        tensor.vds[i] = v_d - v_s;
-        
-        double local_vgs = sign * tensor.vgs[i];
-        double local_vds = sign * tensor.vds[i];
-        double local_vth = sign * tensor.Vth[i];
-        
-        double K = 0.5 * tensor.Kp[i] * (tensor.W[i] / tensor.L[i]);
-        double vov = local_vgs - local_vth;
-        
-        if (vov <= 0.0) {
-            // Cutoff
-            tensor.ids[i] = 0.0;
-            tensor.gm[i] = 0.0;
-            tensor.gds[i] = 1e-12; // GMIN
-        } else if (local_vds < vov) {
-            // Linear region
-            tensor.ids[i] = sign * K * (2.0 * vov * local_vds - local_vds * local_vds);
-            tensor.gm[i] = 2.0 * K * local_vds;
-            tensor.gds[i] = 2.0 * K * (vov - local_vds);
-        } else {
-            // Saturation
-            double lam = tensor.lambda[i];
-            tensor.ids[i] = sign * K * vov * vov * (1.0 + lam * local_vds);
-            tensor.gm[i] = 2.0 * K * vov * (1.0 + lam * local_vds);
-            tensor.gds[i] = K * vov * vov * lam;
-        }
-        
-        if (tensor.gds[i] < 1e-12) tensor.gds[i] = 1e-12;
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        tensor.i_d[i] = i_base + delta * g_base + GMIN * tensor.v_d[i];
+        tensor.g_d[i] = g_base + GMIN;
     }
 }
 
 void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
-    const double GMIN = 1e-12;
+    const double GMIN = PhysicsConstants::JUNCTION_GMIN;
     
     for (size_t i = 0; i < n; ++i) {
         int nC = tensor.collectors[i];
@@ -125,21 +74,19 @@ void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& volta
         double BetaF = tensor.BetaF[i];
         double BetaR = tensor.BetaR[i];
         
-        const double Vcrit = 30.0 * Vt;
+        const double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * Vt;
 
         auto linear_continuation_diode = [&](double v_j) -> std::pair<double, double> {
             double arg = v_j / Vt;
-            double arg_clamped = std::min(arg, 30.0);
+            double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
             
             double exp_val = std::exp(arg_clamped);
             double i_base = Is * (exp_val - 1.0);
             double g_base = (Is / Vt) * exp_val;
-            double g_clamped = std::max(GMIN, g_base);
-            
+            // continuation with the junction's own slope, plus the parallel GMIN —
+            // exactly diode_model_pair()
             double delta = std::max(0.0, v_j - Vcrit);
-            double i_ext = g_clamped * delta; // Use clamped slope
-            
-            return {i_base + i_ext, g_clamped};
+            return {i_base + g_base * delta + GMIN * v_j, g_base + GMIN};
         };
         
         auto [i_f, g_f] = linear_continuation_diode(v_be);
@@ -176,12 +123,8 @@ void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& volta
         tensor.g_ec[i] = -dIe_dVbc;
         tensor.g_eb[i] = dIe_dVbe + dIe_dVbc;
         tensor.g_ee[i] = -dIe_dVbe;
-        
-        // CRITICAL: Add GMIN to diagonal terms to prevent singular Jacobian
-        // This is essential for convergence when BJT is in cutoff/low current
-        tensor.g_cc[i] = std::max(tensor.g_cc[i], GMIN);
-        tensor.g_bb[i] = std::max(tensor.g_bb[i], GMIN);
-        tensor.g_ee[i] = std::max(tensor.g_ee[i], GMIN);
+        // (no max(g, GMIN) floors: the junction GMIN above keeps the matrix
+        // regular, and a floor would be conductance with no matching current)
     }
 }
 
@@ -193,9 +136,6 @@ void batchDiodePhysics(DiodeTensor& tensor, const std::vector<double>& voltages)
     KernelDispatcher::get().batch_diode_physics(tensor, voltages);
 }
 
-void batchMosfetPhysics(MosfetTensor& tensor, const std::vector<double>& voltages) {
-    KernelDispatcher::get().batch_mosfet_physics(tensor, voltages);
-}
 
 void batchBJTPhysics(BJTTensor& tensor, const std::vector<double>& voltages) {
     KernelDispatcher::get().batch_bjt_physics(tensor, voltages);
@@ -205,8 +145,7 @@ void batchBJTPhysics(BJTTensor& tensor, const std::vector<double>& voltages) {
 // AOS -> SOA CONVERSION
 // ============================================================================
 
-TensorizedBlock tensorizeBlock(const TensorBlock& block,
-                               const std::map<std::string, ModelCard>* modelCards) {
+TensorizedBlock tensorizeBlock(const TensorBlock& block) {
     TensorizedBlock result;
     
     // Convert Resistors
@@ -214,23 +153,11 @@ TensorizedBlock tensorizeBlock(const TensorBlock& block,
     result.resistors.nodes2.reserve(block.resistors.size());
     result.resistors.R.reserve(block.resistors.size());
     
-    // Safety Clamps for Fixed-Point Solver (1e9 Scale)
-    // Max Conductance G_max = 2.0 S => R_min = 0.5 Ohm
-    // Min Conductance G_min = 1 nS => R_max = 1 GigaOhm
-    const double R_MIN_SAFE = 0.5; 
-    const double R_MAX_SAFE = 1.0e9;
-
-    for (const auto& r : block.resistors) {
-        double safeR = r.resistance_ohms;
-        if (safeR < R_MIN_SAFE) {
-            std::cerr << "[WARNING] Resistor clamped: " << safeR << " -> " << R_MIN_SAFE << " (Min Safe R)\n";
-            safeR = R_MIN_SAFE;
-        } else if (safeR > R_MAX_SAFE) {
-             // Not strictly dangerous for crash, but prevents 0 conductance
-            safeR = R_MAX_SAFE;
-        }
-        result.resistors.push(r.nodeTerminal1, r.nodeTerminal2, safeR);
-    }
+    // Exact values: the 0.5 ohm .. 1 Gohm clamps (for a fixed-point solver that no
+    // longer exists) doubled every sub-ohm power-grid resistor and disagreed with
+    // the KCL audit. R <= 0 is rejected by the parser.
+    for (const auto& r : block.resistors)
+        result.resistors.push(r.nodeTerminal1, r.nodeTerminal2, r.resistance_ohms);
     
     // Convert Capacitors
     for (const auto& c : block.capacitors) {
@@ -247,37 +174,6 @@ TensorizedBlock tensorizeBlock(const TensorBlock& block,
                            d.thermalVoltage_V_T_V,
                            0.0, // Rs
                            d.temperature_K);
-    }
-    
-    // Convert MOSFETs (with model card lookup)
-    result.mosfets.reserve(block.mosfets.size());
-    for (const auto& m : block.mosfets) {
-        bool isPMOS = false;
-        double kp = 200e-6, vth = 0.7, lam = 0.02;
-
-        if (modelCards) {
-            auto it = modelCards->find(m.modelName);
-            if (it != modelCards->end()) {
-                const auto& card = it->second;
-                isPMOS = (card.type == "PMOS");
-                kp  = card.get("KP", isPMOS ? 100e-6 : 200e-6);
-                vth = card.get("VTO", isPMOS ? -0.7 : 0.7);
-                lam = card.get("LAMBDA", 0.02);
-            } else {
-                isPMOS = (m.modelName.find("PMOS") != std::string::npos ||
-                          m.modelName.find("pmos") != std::string::npos);
-                if (isPMOS) { kp = 100e-6; vth = -0.7; }
-            }
-        } else {
-            isPMOS = (m.modelName.find("PMOS") != std::string::npos ||
-                      m.modelName.find("pmos") != std::string::npos);
-            if (isPMOS) { kp = 100e-6; vth = -0.7; }
-        }
-
-        result.mosfets.push(m.drain, m.gate, m.source, m.body,
-                           m.w, m.l,
-                           kp, vth, lam,
-                           isPMOS, m.temperature_K);
     }
     
     // Convert BJTs
@@ -304,18 +200,15 @@ TensorizedBlock tensorizeBlock(const TensorBlock& block,
 
 TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
     // 1. Start with the flattened global block (standard components)
-    const auto* cards = netlist.modelCards.empty() ? nullptr : &netlist.modelCards;
-    TensorizedBlock result = tensorizeBlock(netlist.globalBlock, cards);
+    TensorizedBlock result = tensorizeBlock(netlist.globalBlock);
     
     // -------------------------------------------------------------------------
     // BUCKETING STAGING AREA: Group devices by model to maximize SIMD efficiency
     // -------------------------------------------------------------------------
     struct DiodeJob { int a, c; double is, n, vt; std::string model; };
-    struct MosfetJob { int d, g, s, b; double w, l, kp, vth, lam; bool pmos; std::string model; };
     struct BjtJob { int c, b, e; double is, bf, br, vt; bool npn; std::string model; };
 
     std::map<std::string, std::vector<DiodeJob>> diodeBuckets;
-    std::map<std::string, std::vector<MosfetJob>> mosfetBuckets;
     std::map<std::string, std::vector<BjtJob>> bjtBuckets;
 
     std::map<std::string, size_t> typeCounts;
@@ -420,25 +313,6 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
             diodeBuckets[d.modelName].push_back({remap(d.anode), remap(d.cathode), 
                                                 d.saturationCurrent_I_S_A, d.emissionCoefficient_N, vts, d.modelName});
         }
-        // Collect MOSFETs
-        for (const auto& m : block.mosfets) {
-            bool isPMOS = false;
-            double kp = 200e-6, vth = 0.7, lam = 0.02;
-            if (cards) {
-                auto cit = cards->find(m.modelName);
-                if (cit != cards->end()) {
-                    isPMOS = (cit->second.type == "PMOS");
-                    kp  = cit->second.get("KP", isPMOS ? 100e-6 : 200e-6);
-                    vth = cit->second.get("VTO", isPMOS ? -0.7 : 0.7);
-                    lam = cit->second.get("LAMBDA", 0.02);
-                } else {
-                    isPMOS = (m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos);
-                    if (isPMOS) { kp = 100e-6; vth = -0.7; }
-                }
-            }
-            mosfetBuckets[m.modelName].push_back({remap(m.drain), remap(m.gate), remap(m.source), remap(m.body),
-                                                 m.w, m.l, kp, vth, lam, isPMOS, m.modelName});
-        }
         // Collect BJTs
         for (const auto& q : block.bjts) {
             double vts = q.thermalVoltage_V_T_V * (netlist.environment.ambient_temp_K / 300.15);
@@ -481,9 +355,6 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
     // 3. Flush Buckets (Deterministic sort by model name)
     for (auto& [model, bucket] : diodeBuckets) {
         for (auto& d : bucket) result.diodes.push(d.a, d.c, d.is, d.n, d.vt, 0.0, netlist.environment.ambient_temp_K);
-    }
-    for (auto& [model, bucket] : mosfetBuckets) {
-        for (auto& m : bucket) result.mosfets.push(m.d, m.g, m.s, m.b, m.w, m.l, m.kp, m.vth, m.lam, m.pmos, netlist.environment.ambient_temp_K);
     }
     for (auto& [model, bucket] : bjtBuckets) {
         for (auto& q : bucket) result.bjts.push(q.c, q.b, q.e, q.is, q.bf, q.br, q.vt, q.npn, netlist.environment.ambient_temp_K);

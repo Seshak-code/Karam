@@ -1,0 +1,12 @@
+hier divider chain, subckt after use
+V1 1 0 DC 4
+X1 1 2 DIV
+X2 2 3 DIV
+R9 3 0 1MEG
+.subckt DIV a b
+R1 a mid 1k
+R2 mid b 1k
+R3 b 0 10k
+.ends
+.op
+.end

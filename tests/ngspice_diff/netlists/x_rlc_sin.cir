@@ -1,0 +1,7 @@
+series RLC driven by SIN
+V1 1 0 SIN(0 1 1k)
+R1 1 2 50
+L1 2 3 10m
+C1 3 0 2.5u
+.tran 10u 5m
+.end

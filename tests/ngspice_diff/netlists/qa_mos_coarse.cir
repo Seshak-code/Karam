@@ -1,0 +1,10 @@
+* QA: very coarse .tran steps (25u) with 5u edges — LTE/corner logic must sub-step internally
+* and the ngspice reference (tmax = 2.5u) still resolves the edges
+VDD 1 0 DC 5
+VIN 2 0 PULSE(0 5 2u 5u 5u 5u 20u)
+RD 1 3 10k
+CG 3 0 1n
+M1 3 2 0 0 NM W=20u L=1u
+.model NM NMOS(KP=100u VTO=0.7 LAMBDA=0.02 TOX=40n CGSO=2n CGDO=2n CBD=20f CBS=20f)
+.tran 25u 100u
+.end

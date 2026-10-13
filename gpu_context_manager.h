@@ -14,7 +14,7 @@
 // because WebGPU command encoding is CPU-side and thread-safe.
 // ============================================================================
 
-#include "acutesim_engine/engine_export.h"
+#include "engine_export.h"
 #include <string>
 #include <vector>
 #include <mutex>

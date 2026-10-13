@@ -1,0 +1,9 @@
+VCCS transconductance stage
+V1 1 0 DC 0.5
+R1 1 0 1k
+G1 0 2 1 0 2m
+R2 2 0 3k
+G2 3 0 2 0 1m
+R3 3 0 500
+.op
+.end

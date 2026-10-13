@@ -1,0 +1,13 @@
+* noise: BJT common-emitter stage (collector/base shot, resistor thermal)
+VCC 1 0 DC 10
+VIN 4 0 DC 0 AC 1
+RB 4 2 100k
+VB 5 0 DC 1.5
+RBB 5 2 100k
+RC 1 3 4.7k
+RE 6 0 1k
+Q1 3 2 6 QN
+CE 6 0 10u
+.model QN NPN(IS=1e-15 BF=100)
+.noise v(3) VIN dec 3 10 10meg
+.end

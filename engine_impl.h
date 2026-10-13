@@ -16,8 +16,8 @@
 // and calls CircuitSim directly — no virtual dispatch in NR loop.
 // ============================================================================
 
-#include "acutesim_engine/engine_export.h"
-#include "acutesim_engine/gpu_context_manager.h"
+#include "engine_export.h"
+#include "gpu_context_manager.h"
 #include "engine_api/isimulation_engine.h"
 #include "engine_api/simulation_session.h"
 

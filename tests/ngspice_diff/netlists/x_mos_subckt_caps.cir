@@ -1,0 +1,14 @@
+* MOS1 caps inside .subckt instances: 3-inverter chain, per-instance charge history
+.subckt inv in out vdd
+MP out in vdd vdd PM W=6u L=1u AD=12p AS=12p PD=10u PS=10u
+MN out in 0 0 NM W=3u L=1u AD=6p AS=6p PD=8u PS=8u
+.ends
+.model NM NMOS(VTO=0.7 KP=60u TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=3e-4 CJSW=4e-10)
+.model PM PMOS(VTO=-0.8 KP=25u TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=4e-4 CJSW=3e-10)
+VDD 1 0 DC 3.3
+VIN 2 0 PULSE(0 3.3 0.5n 0.1n 0.1n 3n 8n)
+X1 2 3 1 inv
+X2 3 4 1 inv
+X3 4 5 1 inv
+.tran 0.02n 8n
+.end

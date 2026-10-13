@@ -1,0 +1,8 @@
+* MOS1: NMOS source follower, body at ground (body effect GAMMA/PHI)
+VDD 1 0 DC 5
+VG 2 0 DC 0
+M1 1 2 3 0 NM W=20u L=1u
+RS 3 0 10k
+.model NM NMOS(KP=80u VTO=0.6 GAMMA=0.6 PHI=0.7 LAMBDA=0.02)
+.dc VG 0 5 0.25
+.end

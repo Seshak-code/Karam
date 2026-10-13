@@ -1,0 +1,10 @@
+Multiple ac source
+v1 1 0 ac 55 0
+v2 4 0 ac 43 25
+l1 1 2 450m
+c1 2 0 330u
+l2 2 3 150m
+rbogus 3 4 1e-12
+.ac lin 1 30 30
+.print ac v(2)
+.end

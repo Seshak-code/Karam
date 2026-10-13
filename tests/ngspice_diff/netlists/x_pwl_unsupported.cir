@@ -1,0 +1,6 @@
+PWL source, expected ENGINE-UNSUPPORTED
+V1 1 0 PWL(0 0 1m 1 2m 0)
+R1 1 2 1k
+C1 2 0 1u
+.tran 10u 2m
+.end

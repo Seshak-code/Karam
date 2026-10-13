@@ -1,0 +1,10 @@
+BJT CE amplifier DC bias
+VCC 1 0 DC 12
+R1 1 2 47k
+R2 2 0 10k
+RC 1 3 2.2k
+RE 4 0 1k
+Q1 3 2 4 QN
+.model QN NPN(IS=1e-14 BF=100)
+.op
+.end

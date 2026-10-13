@@ -1,0 +1,9 @@
+* QA: PMOS body floating through 1MEG (bulk junctions + gmin find its potential)
+VDD 1 0 DC 5
+VG 2 0 DC 5
+RB 4 0 1MEG
+RD 3 0 10k
+M1 3 2 1 4 PM W=20u L=1u
+.model PM PMOS(KP=80u VTO=-0.7 GAMMA=0.5 PHI=0.6 LAMBDA=0.02)
+.dc VG 0 5 0.25
+.end

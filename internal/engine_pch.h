@@ -13,8 +13,8 @@
 // DO NOT include this from gui/, ai_api/, or connectivity/ code.
 // ============================================================================
 
-#include "acutesim_engine/engine_export.h"
-#include "acutesim_engine/internal/precision.h"
+#include "engine_export.h"
+#include "internal/precision.h"
 
 // Standard library fundamentals used pervasively in the engine
 #include <cstdint>
@@ -32,13 +32,13 @@
 // During migration transitional includes are allowed via CMake's
 // ${CMAKE_SOURCE_DIR} fallback include path.
 #if __has_include("acutesim_engine/math/emulated_f64.h")
-    #include "acutesim_engine/math/emulated_f64.h"
+    #include "math/emulated_f64.h"
 #elif __has_include("compute/math/emulated_f64.h")
-    #include "acutesim_engine/math/emulated_f64.h"   // transitional
+    #include "math/emulated_f64.h"   // transitional
 #endif
 
 #if __has_include("acutesim_engine/autodiff/dual.h")
-    #include "acutesim_engine/autodiff/dual.h"
+    #include "autodiff/dual.h"
 #elif __has_include("autodiff/dual.h")
-    #include "acutesim_engine/autodiff/dual.h"               // transitional
+    #include "autodiff/dual.h"               // transitional
 #endif

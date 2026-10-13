@@ -1,0 +1,8 @@
+* .dc over a current source driving a diode (current-source names, continuation)
+I1 0 1 DC 0
+R1 1 0 1k
+D1 1 2 DX
+R2 2 0 100
+.model DX D(IS=1e-14)
+.dc I1 0 10m 0.25m
+.end

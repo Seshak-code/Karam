@@ -1,0 +1,11 @@
+* MOS1 caps: CMOS inverter delay from Meyer gate + overlap + bulk junction caps (no load C)
+VDD 1 0 DC 3.3
+VIN 2 0 PULSE(0 3.3 1n 0.2n 0.2n 4n 10n)
+MP 3 2 1 1 PM W=8u L=1u AD=16p AS=16p PD=12u PS=12u
+MN 3 2 0 0 NM W=4u L=1u AD=8p AS=8p PD=8u PS=8u
+MN2 4 3 0 0 NM W=4u L=1u AD=8p AS=8p PD=8u PS=8u
+MP2 4 3 1 1 PM W=8u L=1u AD=16p AS=16p PD=12u PS=12u
+.model NM NMOS(VTO=0.7 TOX=20n UO=500 LAMBDA=0.02 GAMMA=0.4 CGSO=3e-10 CGDO=3e-10 CGBO=2e-10 CJ=3e-4 MJ=0.45 CJSW=4e-10 PB=0.85)
+.model PM PMOS(VTO=-0.8 TOX=20n UO=200 LAMBDA=0.03 GAMMA=0.5 CGSO=3e-10 CGDO=3e-10 CJ=4e-4 CJSW=3e-10 MJSW=0.3)
+.tran 0.02n 12n
+.end

@@ -4,6 +4,7 @@
 // FMA: disabled (deterministic)
 
 #include "../tensors/physics_tensors.h"  // Tensor structs
+#include "../physics/physics_constants.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -41,7 +42,7 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
 
     // Pre-broadcast constants
     const __m256d vc_1 = _mm256_set1_pd(1.0);
-    const __m256d vc_30 = _mm256_set1_pd(30.0);
+    const __m256d vc_argmax = _mm256_set1_pd(PhysicsConstants::JUNCTION_EXP_ARG_MAX);
 
     size_t i = 0;
     // --- SIMD Loop: 4 devices per iteration ---
@@ -76,14 +77,16 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
         _mm256_storeu_pd(&tensor.v_d[i], v_v_d);
         __m256d v_n_vt = _mm256_mul_pd(v_N, v_Vt);
         __m256d v_arg = _mm256_div_pd(v_v_d, v_n_vt);
-        __m256d v_arg_clamped = _mm256_min_pd(v_arg, vc_30);
+        __m256d v_arg_clamped = _mm256_min_pd(v_arg, vc_argmax);
         __m256d v_exp_val = _mm256_exp_pd_fallback(v_arg_clamped);
         __m256d v_i_base = _mm256_mul_pd(_mm256_sub_pd(v_exp_val, vc_1), v_Is);
         __m256d v_g_base = _mm256_mul_pd(_mm256_div_pd(v_Is, v_n_vt), v_exp_val);
-        __m256d v_delta = _mm256_max_pd(_mm256_setzero_pd(), _mm256_sub_pd(v_v_d, _mm256_mul_pd(vc_30, v_n_vt)));
+        __m256d v_delta = _mm256_max_pd(_mm256_setzero_pd(), _mm256_sub_pd(v_v_d, _mm256_mul_pd(vc_argmax, v_n_vt)));
         __m256d v_i_d = _mm256_add_pd(_mm256_mul_pd(v_delta, v_g_base), v_i_base);
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        v_i_d = _mm256_add_pd(v_i_d, _mm256_mul_pd(v_GMIN, v_v_d));
         _mm256_storeu_pd(&tensor.i_d[i], v_i_d);
-        __m256d v_g_d = _mm256_max_pd(v_GMIN, v_g_base);
+        __m256d v_g_d = _mm256_add_pd(v_g_base, v_GMIN);  // additive; replaces the max() floor
         _mm256_storeu_pd(&tensor.g_d[i], v_g_d);
     }
 
@@ -103,166 +106,16 @@ void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& volt
         double v_d = tensor.v_d[i];
         double n_vt = (N * Vt);
         double arg = (v_d / n_vt);
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_val = std::exp(arg_clamped);
         double i_base = ((exp_val - 1.0) * Is);
         double g_base = ((Is / n_vt) * exp_val);
-        double delta = std::max(0.0, (v_d - (30.0 * n_vt)));
-        tensor.i_d[i] = ((delta * g_base) + i_base);
+        double delta = std::max(0.0, (v_d - (PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt)));
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        tensor.i_d[i] = ((delta * g_base) + i_base) + GMIN * v_d;
         double i_d = tensor.i_d[i];
-        tensor.g_d[i] = std::max(GMIN, g_base);
+        tensor.g_d[i] = g_base + GMIN;  // additive; replaces the max() floor
         double g_d = tensor.g_d[i];
-    }
-}
-
-// ── MOSFET Level-1 (Shichman-Hodges) AVX2 Kernel ──
-// Adapted from physics compiler output for MosfetTensor field names.
-// Uses saturation-region equations with max() clamping.
-// GMIN = 1e-12 (constant, not per-device).
-
-void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& voltages) {
-    const size_t n = tensor.size();
-    const __m256d v_GMIN = _mm256_set1_pd(1e-12);
-
-    size_t i = 0;
-    // --- SIMD Loop: 4 devices per iteration ---
-    for (; i + 3 < n; i += 4) {
-        const double* __restrict__ v_ptr = voltages.data();
-        const int v_size = (int)voltages.size();
-
-        // Gather terminal voltages
-        alignas(32) double _buf_d[4];
-        for (int k = 0; k < 4; ++k) {
-            int idx = tensor.drains[i + k];
-            _buf_d[k] = (idx > 0 && idx <= v_size) ? v_ptr[idx - 1] : 0.0;
-        }
-        __m256d v_v_d = _mm256_load_pd(_buf_d);
-
-        alignas(32) double _buf_g[4];
-        for (int k = 0; k < 4; ++k) {
-            int idx = tensor.gates[i + k];
-            _buf_g[k] = (idx > 0 && idx <= v_size) ? v_ptr[idx - 1] : 0.0;
-        }
-        __m256d v_v_g = _mm256_load_pd(_buf_g);
-
-        alignas(32) double _buf_s[4];
-        for (int k = 0; k < 4; ++k) {
-            int idx = tensor.sources[i + k];
-            _buf_s[k] = (idx > 0 && idx <= v_size) ? v_ptr[idx - 1] : 0.0;
-        }
-        __m256d v_v_s = _mm256_load_pd(_buf_s);
-
-        // Load parameters
-        __m256d v_Kp = _mm256_loadu_pd(&tensor.Kp[i]);
-        __m256d v_W = _mm256_loadu_pd(&tensor.W[i]);
-        __m256d v_L = _mm256_loadu_pd(&tensor.L[i]);
-        __m256d v_Vth = _mm256_loadu_pd(&tensor.Vth[i]);
-        __m256d v_lambda = _mm256_loadu_pd(&tensor.lambda[i]);
-
-        // PMOS sign vector: +1 NMOS, -1 PMOS (was ignored before - critical fix)
-        alignas(32) double _buf_sign[4];
-        for (int k = 0; k < 4; ++k)
-            _buf_sign[k] = tensor.isPMOS[i + k] ? -1.0 : 1.0;
-        __m256d v_sign = _mm256_load_pd(_buf_sign);
-
-        // vgs, vds (raw, stored for stamping)
-        __m256d vgs_val = _mm256_sub_pd(v_v_g, v_v_s);
-        __m256d vds_val = _mm256_sub_pd(v_v_d, v_v_s);
-        _mm256_storeu_pd(&tensor.vgs[i], vgs_val);
-        _mm256_storeu_pd(&tensor.vds[i], vds_val);
-
-        // NMOS-equivalent voltages: vgs' = sign*vgs, vds' = sign*vds, vth' = sign*vth
-        __m256d vgs_eq = _mm256_mul_pd(v_sign, vgs_val);
-        __m256d vds_eq = _mm256_mul_pd(v_sign, vds_val);
-        __m256d vth_eq = _mm256_mul_pd(v_sign, v_Vth);
-
-        // beta = Kp * (W / L)
-        __m256d v_beta = _mm256_mul_pd(_mm256_div_pd(v_W, v_L), v_Kp);
-        // vov = vgs' - vth'
-        __m256d v_vov = _mm256_sub_pd(vgs_eq, vth_eq);
-
-        // Region select (NMOS-equivalent): cutoff / linear / saturation
-        __m256d v_half_beta = _mm256_mul_pd(_mm256_set1_pd(0.5), v_beta);
-        __m256d v_vov2 = _mm256_mul_pd(v_vov, v_vov);
-        __m256d v_clm = _mm256_add_pd(_mm256_set1_pd(1.0), _mm256_mul_pd(v_lambda, vds_eq));
-
-        // Saturation branch
-        __m256d v_ids_sat = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_clm);
-        __m256d v_gm_sat  = _mm256_mul_pd(_mm256_mul_pd(v_beta, v_vov), v_clm);
-        __m256d v_gds_sat = _mm256_mul_pd(_mm256_mul_pd(v_half_beta, v_vov2), v_lambda);
-
-        // Linear branch: ids = beta*(vov*vds' - 0.5*vds'^2)
-        __m256d v_ids_lin = _mm256_mul_pd(v_beta,
-            _mm256_sub_pd(_mm256_mul_pd(v_vov, vds_eq),
-                          _mm256_mul_pd(_mm256_set1_pd(0.5), _mm256_mul_pd(vds_eq, vds_eq))));
-        __m256d v_gm_lin  = _mm256_mul_pd(v_beta, vds_eq);
-        __m256d v_gds_lin = _mm256_mul_pd(v_beta, _mm256_sub_pd(v_vov, vds_eq));
-
-        // Per-lane region select via blendv
-        __m256d m_lin = _mm256_cmp_pd(vds_eq, v_vov, _CMP_LT_OQ);   // linear if vds' < vov
-        __m256d m_cut = _mm256_cmp_pd(v_vov, _mm256_setzero_pd(), _CMP_LE_OQ); // cutoff if vov <= 0
-        __m256d v_ids_sel = _mm256_blendv_pd(v_ids_sat, v_ids_lin, m_lin);
-        __m256d v_gm_sel  = _mm256_blendv_pd(v_gm_sat, v_gm_lin, m_lin);
-        __m256d v_gds_sel = _mm256_blendv_pd(v_gds_sat, v_gds_lin, m_lin);
-        __m256d v_ids = _mm256_blendv_pd(v_ids_sel, _mm256_setzero_pd(), m_cut);
-        __m256d v_gm  = _mm256_blendv_pd(v_gm_sel, _mm256_setzero_pd(), m_cut);
-        __m256d v_gds = _mm256_blendv_pd(v_gds_sel, v_GMIN, m_cut);
-
-        // Restore PMOS current sign: ids = sign * |ids|
-        v_ids = _mm256_mul_pd(v_sign, v_ids);
-
-        // Floor conductances at GMIN
-        v_gm  = _mm256_max_pd(v_GMIN, v_gm);
-        v_gds = _mm256_max_pd(v_GMIN, v_gds);
-
-        _mm256_storeu_pd(&tensor.ids[i], v_ids);
-        _mm256_storeu_pd(&tensor.gm[i], v_gm);
-        _mm256_storeu_pd(&tensor.gds[i], v_gds);
-    }
-
-    // --- Scalar Tail Loop ---
-    for (; i < n; ++i) {
-        int n_d = tensor.drains[i];
-        double v_d = (n_d > 0 && n_d <= (int)voltages.size()) ? voltages[n_d - 1] : 0.0;
-        int n_g = tensor.gates[i];
-        double v_g = (n_g > 0 && n_g <= (int)voltages.size()) ? voltages[n_g - 1] : 0.0;
-        int n_s = tensor.sources[i];
-        double v_s = (n_s > 0 && n_s <= (int)voltages.size()) ? voltages[n_s - 1] : 0.0;
-
-        double Kp = tensor.Kp[i];
-        double W = tensor.W[i];
-        double L = tensor.L[i];
-        double Vth = tensor.Vth[i];
-        double lam = tensor.lambda[i];
-
-        double vgs = v_g - v_s;
-        double vds = v_d - v_s;
-        tensor.vgs[i] = vgs;
-        tensor.vds[i] = vds;
-
-        // PMOS sign-flip (matches generic kernel)
-        double sign = tensor.isPMOS[i] ? -1.0 : 1.0;
-        double vgs_eq = sign * vgs;
-        double vds_eq = sign * vds;
-        double vth_eq = sign * Vth;
-
-        double beta = Kp * (W / L);
-        double vov = vgs_eq - vth_eq;
-        if (vov <= 0.0) {
-            tensor.ids[i] = 0.0;
-            tensor.gm[i] = 0.0;
-            tensor.gds[i] = 1e-12;
-        } else if (vds_eq < vov) {
-            tensor.ids[i] = sign * beta * (vov * vds_eq - 0.5 * vds_eq * vds_eq);
-            tensor.gm[i] = beta * vds_eq;
-            tensor.gds[i] = beta * (vov - vds_eq);
-        } else {
-            tensor.ids[i] = sign * 0.5 * beta * vov * vov * (1.0 + lam * vds_eq);
-            tensor.gm[i] = beta * vov * (1.0 + lam * vds_eq);
-            tensor.gds[i] = 0.5 * beta * vov * vov * lam;
-        }
-        if (tensor.gm[i] < 1e-12) tensor.gm[i] = 1e-12;
-        if (tensor.gds[i] < 1e-12) tensor.gds[i] = 1e-12;
     }
 }
 

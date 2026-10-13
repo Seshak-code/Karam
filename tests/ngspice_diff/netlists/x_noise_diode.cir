@@ -1,0 +1,7 @@
+* noise: forward-biased diode (shot 2qI) plus resistor thermal noise
+V1 1 0 DC 5 AC 1
+R1 1 2 10k
+D1 2 0 DX
+.model DX D(IS=1e-14)
+.noise v(2) V1 dec 3 10 100meg
+.end

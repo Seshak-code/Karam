@@ -1,0 +1,10 @@
+* QA: .tran with uic and .ic on a MOS gate — history starts from the imposed state
+VDD 1 0 DC 5
+VIN 2 0 PULSE(0 5 2u 1u 1u 4u 10u)
+RD 1 3 10k
+CG 3 0 100p
+M1 3 2 0 0 NM W=20u L=1u
+.model NM NMOS(KP=100u VTO=0.7 LAMBDA=0.02 TOX=40n CGSO=2n CGDO=2n)
+.ic v(3)=1.5
+.tran 0.5u 30u uic
+.end

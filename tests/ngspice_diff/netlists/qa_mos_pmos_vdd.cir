@@ -1,0 +1,8 @@
+* QA: PMOS source follower, body at VDD (body effect, VBS != 0)
+VDD 1 0 DC 5
+VG 2 0 DC 0
+M1 1 2 3 1 PM W=20u L=1u
+RS 3 0 10k
+.model PM PMOS(KP=80u VTO=-0.7 GAMMA=0.5 PHI=0.6 LAMBDA=0.02)
+.dc VG 0 5 0.25
+.end

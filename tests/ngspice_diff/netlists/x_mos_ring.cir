@@ -1,0 +1,13 @@
+* MOS1 caps: 3-stage ring oscillator, frequency set by device capacitances alone
+VDD 1 0 DC 3.3
+MN1 3 2 0 0 NM W=2u L=1u AD=4p AS=4p PD=6u PS=6u
+MP1 3 2 1 1 PM W=4u L=1u AD=8p AS=8p PD=8u PS=8u
+MN2 4 3 0 0 NM W=2u L=1u AD=4p AS=4p PD=6u PS=6u
+MP2 4 3 1 1 PM W=4u L=1u AD=8p AS=8p PD=8u PS=8u
+MN3 2 4 0 0 NM W=2u L=1u AD=4p AS=4p PD=6u PS=6u
+MP3 2 4 1 1 PM W=4u L=1u AD=8p AS=8p PD=8u PS=8u
+.model NM NMOS(VTO=0.7 KP=60u TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=3e-4 CJSW=4e-10)
+.model PM PMOS(VTO=-0.8 KP=25u TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=4e-4 CJSW=3e-10)
+.ic V(2)=0 V(3)=3.3 V(4)=0
+.tran 0.01n 5n
+.end

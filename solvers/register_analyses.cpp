@@ -2,7 +2,7 @@
 // compute/solvers/register_analyses.cpp — Explicit registration entrypoint
 // ============================================================================
 // Call registerAllAnalyses() to populate AnalysisRegistry with fully
-// functional TF / PZ / FOURIER handlers that go through the solver.
+// functional TF / FOURIER handlers that go through the solver.
 //
 // Each handler:
 //   1. Applies corner parameters to the netlist.
@@ -12,16 +12,15 @@
 // Phase 4.5 / Reconcile — stubs replaced with real implementations.
 // ============================================================================
 
-#include "acutesim_engine/solvers/register_analyses.h"
-#include "acutesim_engine/solvers/analysis_registry.h"
-#include "acutesim_engine/solvers/tf_analysis.h"
-#include "acutesim_engine/solvers/pz_analysis.h"
-#include "acutesim_engine/solvers/fourier_analysis.h"
+#include "solvers/register_analyses.h"
+#include "solvers/analysis_registry.h"
+#include "solvers/tf_analysis.h"
+#include "solvers/fourier_analysis.h"
 
 // Full physics headers for handler implementations
-#include "acutesim_engine/physics/circuitsim.h"
-#include "acutesim_engine/physics/corner_config.h"
-#include "acutesim_engine/netlist/circuit.h"
+#include "physics/circuitsim.h"
+#include "physics/corner_config.h"
+#include "netlist/circuit.h"
 
 namespace acutesim {
 namespace compute {
@@ -63,21 +62,7 @@ static SimulationResponseDTO tfHandler(
     SolverStep dc;
     if (!applyCornerAndDC(sim, runNetlist, req, dc, errOut)) return errOut;
     errOut.topologyHash = req.topologyHash;
-    return runTFAnalysis(runNetlist, dc.nodeVoltages, req);
-}
-
-// ── Pole-Zero ────────────────────────────────────────────────────────────────
-static SimulationResponseDTO pzHandler(
-    const SimulationRequestDTO& req,
-    const TensorNetlist& netlist,
-    CircuitSim& sim)
-{
-    TensorNetlist runNetlist = netlist;
-    SimulationResponseDTO errOut;
-    SolverStep dc;
-    if (!applyCornerAndDC(sim, runNetlist, req, dc, errOut)) return errOut;
-    errOut.topologyHash = req.topologyHash;
-    return runPZAnalysis(runNetlist, dc.nodeVoltages, req);
+    return runTFAnalysis(sim, runNetlist, req);
 }
 
 // ── Fourier ──────────────────────────────────────────────────────────────────
@@ -113,16 +98,18 @@ static SimulationResponseDTO fourierHandler(
 
     std::vector<double> timeVec;
     std::vector<double> waveform;
-    double dt = 1e-5;
-    double t  = 0.0;
-    while (t < stopTime) {
-        SolverStep step = sim.stepTransient(runNetlist, dt, t);
-        t = step.time;
-        timeVec.push_back(t);
-        double v = (probeNode - 1 < (int)step.nodeVoltages.size())
-                   ? step.nodeVoltages[probeNode - 1] : 0.0;
-        waveform.push_back(v);
-        if (!step.stats.converged) break;
+    const std::string err = sim.runTransient(runNetlist, 1e-5, stopTime, req.transient.uic,
+        [&](const SolverStep& step) {
+            timeVec.push_back(step.time);
+            waveform.push_back(probeNode - 1 < (int)step.nodeVoltages.size()
+                               ? step.nodeVoltages[probeNode - 1] : 0.0);
+            return true;
+        });
+    if (!err.empty()) {
+        SimulationResponseDTO errOut;
+        errOut.success     = false;
+        errOut.errorDetail = err;
+        return errOut;
     }
 
     return runFourierAnalysis(runNetlist, timeVec, waveform, req);
@@ -133,7 +120,6 @@ void registerAllAnalyses() {
     auto& reg = AnalysisRegistry::instance();
     // Idempotent — overwrites any previous stub; safe to call multiple times.
     reg.registerHandler(AnalysisTypeDTO::TRANSFER_FUNCTION, tfHandler);
-    reg.registerHandler(AnalysisTypeDTO::POLE_ZERO,         pzHandler);
     reg.registerHandler(AnalysisTypeDTO::FOURIER,           fourierHandler);
 }
 

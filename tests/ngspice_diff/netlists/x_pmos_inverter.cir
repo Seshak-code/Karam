@@ -1,0 +1,8 @@
+PMOS inverter with resistor load, input sweep
+VDD 1 0 DC 5
+VIN 2 0 DC 5
+RD 3 0 10k
+M1 3 2 1 1 PM W=20u L=1u
+.model PM PMOS(LEVEL=1 VTO=-1 KP=25u LAMBDA=0.02)
+.dc VIN 0 5 0.5
+.end

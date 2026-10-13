@@ -1,13 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ===========================================================================
-# acutesim_engine — Tensor MNA Simulation Library
+# Karam (acutesim_engine) — SPICE-equivalent circuit simulation engine
 # ===========================================================================
-# This is the standalone engine library. ALL simulation, GPU, and physics
-# logic lives here. The rest of AcuteSim is a consumer via engine_api/.
+# Builds standalone (this directory is the top level: library, tools, tests)
+# or as a subdirectory of AcuteSim/CuteApp (git submodule at acutesim_engine/),
+# which consumes it through engine_api/ and the netlist data model.
 #
 # Build pattern: OBJECT → STATIC (future: SHARED/PLUGIN without recompilation)
 # ===========================================================================
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(Karam LANGUAGES C CXX)
+    set(KARAM_STANDALONE ON)
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE Release)
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,9 +33,11 @@ target_compile_options(acutesim_engine_objects PRIVATE
     -fvisibility-inlines-hidden
 )
 
+# No -ffast-math: it implies -ffinite-math-only, which deletes every
+# isnan/isfinite guard in the solver (NaN results were reported as converged),
+# and it breaks the project's cross-platform determinism rule (see CLAUDE.md).
 if(NOT EMSCRIPTEN)
     target_compile_options(acutesim_engine_objects PRIVATE
-        -ffast-math
         -march=native     # Enables AVX-512 / NEON auto-detection at runtime
     )
 endif()
@@ -45,11 +56,9 @@ target_compile_definitions(acutesim_engine_objects PRIVATE
 # ---------------------------------------------------------------------------
 target_include_directories(acutesim_engine_objects
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../engine_api>
-        $<INSTALL_INTERFACE:include/engine_api>
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..   # for transitional includes
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>              # "engine_api/x.h", "netlist/circuit.h"
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/engine_api>   # bare "simulation_dto.h"
+        $<INSTALL_INTERFACE:include>
 )
 
 # ---------------------------------------------------------------------------
@@ -81,35 +90,18 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_context_manager.cpp
 
     # === Infrastructure ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/netlist_compiler_ctx.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/graph_partitioner.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/factor_graph.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/treewidth_analyzer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/bond_dimension_profiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/mpo_builder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_tree.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/tn_compiler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/contraction_render_graph.cpp
 
     # === Math ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/math/sparse_lu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp
 
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/schur_solver.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/contraction_executor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/ac_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/fourier_analysis.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/pz_analysis.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/tf_analysis.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/superposition.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/webgpu_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/analysis_registry.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/solvers/staged_dispatcher.cpp
 
     # === Tensors (SIMD kernels) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/kernel_dispatch.cpp
@@ -119,16 +111,9 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_neon.cpp
 
     # === Netlist ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/netlist/netlist_export.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
 
     # === Physics (Verilog-A model compiler pipeline) ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/quick_analysis.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/lexer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/parser.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/ast.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/analyzer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/physics/veriloga/graph_assembler.cpp
 )
 
 # AVX-512 source flags
@@ -165,7 +150,28 @@ endif()
 # ---------------------------------------------------------------------------
 # CLI — Engine Consumer
 # ---------------------------------------------------------------------------
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cli/engine_cli_main.cpp)
-    add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
-    target_link_libraries(acutesim_engine_cli PRIVATE acutesim_sim_layer acutesim_orchestration acutesim_engine)
+add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
+target_link_libraries(acutesim_engine_cli PRIVATE acutesim_engine)
+
+# ---------------------------------------------------------------------------
+# Waveform dump tool — machine-readable output for tests/ngspice_diff
+# Output: "CONVERGED <0|1>", "ERROR <text>", then "<time> <v1> <v2> ..." rows
+# (node order = first appearance in the netlist, subcircuit bodies excluded)
+# ---------------------------------------------------------------------------
+add_executable(acutesim_engine_dump cli/engine_dump_main.cpp)
+target_link_libraries(acutesim_engine_dump PRIVATE acutesim_engine)
+
+# ---------------------------------------------------------------------------
+# Engine tests (standalone build): C++ checks + differential harnesses
+#   ctest                                  — the C++ suites below
+#   python3 tests/ngspice_diff/run_diff.py — vs ngspice (needs ngspice on PATH)
+#   python3 tests/xyce_diff.py, tests/ibmpg_diff.py — need datasets/ (git-ignored)
+# ---------------------------------------------------------------------------
+if(KARAM_STANDALONE)
+    enable_testing()
+    foreach(t test_engine_fixes test_contraction_solver test_convergence_engine)
+        add_executable(${t} tests/${t}.cpp)
+        target_link_libraries(${t} PRIVATE acutesim_engine)
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
 endif()

@@ -1,0 +1,12 @@
+hier E amplifier + diode clamp
+V1 1 0 DC 0.3
+XA 1 OUT AMP
+.subckt AMP in out
+RI in inv 1k
+RF inv out 10k
+E1 out 0 0 inv 999k
+D1 out 0 DCLAMP
+.ends
+.model DCLAMP D(IS=1e-14)
+.op
+.end

@@ -1,0 +1,16 @@
+* QA diag: depth-2 subckt hierarchy, MOS WITHOUT caps (attributes the qa_mos_nest failure)
+VDD 1 0 DC 5
+VIN 2 0 PULSE(0 5 1u 1u 1u 4u 10u)
+X1 2 3 1 WRAP
+RL 3 0 100k
+.subckt WRAP IN OUT VP
+XIN IN OUT VP INV2
+.ends WRAP
+.subckt INV2 A B VQ
+MN1 B A 0 0 NMI W=10u L=1u
+MP1 B A VQ VQ PMI W=20u L=1u
+.ends INV2
+.model NMI NMOS(KP=100u VTO=0.7)
+.model PMI PMOS(KP=50u VTO=-0.8)
+.tran 0.5u 30u
+.end

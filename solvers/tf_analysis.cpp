@@ -1,19 +1,16 @@
 // ============================================================================
 // compute/solvers/tf_analysis.cpp — Transfer Function Analysis
 // ============================================================================
-// H(jω) = V_out/V_in — computed via the AC admittance matrix.
+// H(jω) = V_out/V_in from CircuitSim::solveAC (the circuit's own AC sources).
 // Extracts gain/phase margins from the Bode plot.
-//
-// Exposes: acutesim::compute::solvers::runTFAnalysis(netlist, dcSolution, req)
-// Self-registers into AnalysisRegistry at static-init time.
 //
 // Phase 4.5
 // ============================================================================
 
-#include "acutesim_engine/solvers/tf_analysis.h"
-#include "acutesim_engine/solvers/analysis_registry.h"
+#include "solvers/tf_analysis.h"
 #include "engine_api/simulation_dto.h"
-#include "acutesim_engine/solvers/ac_solver.h"
+#include "physics/circuitsim.h"
+#include <complex>
 
 #include <cmath>
 #include <algorithm>
@@ -61,111 +58,48 @@ static void computeMargins(
     }
 }
 
-SimulationResponseDTO runTFAnalysis(
-    const TensorNetlist& netlist,
-    const std::vector<double>& dcSolution,
-    const SimulationRequestDTO& req)
+SimulationResponseDTO runTFAnalysis(CircuitSim& sim, TensorNetlist& netlist,
+                                    const SimulationRequestDTO& req)
 {
     SimulationResponseDTO resp;
     resp.topologyHash = req.topologyHash;
-
-    if (netlist.numGlobalNodes == 0) {
-        resp.success      = false;
-        resp.errorDetail = "TF analysis: empty netlist";
-        return resp;
-    }
-
-    // Extract parameters
-    auto getParam = [&](const std::string& key, double def) -> double {
+    auto param = [&](const std::string& key, double def) {
         auto it = req.parameters.find(key);
         if (it == req.parameters.end()) return def;
         try { return std::stod(it->second); } catch (...) { return def; }
     };
-    auto getParamInt = [&](const std::string& key, int def) -> int {
-        auto it = req.parameters.find(key);
-        if (it == req.parameters.end()) return def;
-        try { return std::stoi(it->second); } catch (...) { return def; }
-    };
-
-    double fStart   = getParam("fStart",   1.0);
-    double fStop    = getParam("fStop",    1e9);
-    int    points   = getParamInt("points", 200);
-    int    outNode  = getParamInt("outputNode", netlist.numGlobalNodes);
-    int    inNode   = getParamInt("inputNode",  0);
-
-    outNode = std::max(1, std::min(outNode, netlist.numGlobalNodes));
-
-    // AC sweep with excitation at input node
-    ACSolver::ACResult ac = ACSolver::solveAC(
-        netlist, dcSolution, fStart, fStop, points, inNode, 1.0);
+    const int n       = netlist.numGlobalNodes;
+    const int outNode = std::max(1, std::min(static_cast<int>(param("outputNode", n)), n));
+    const int inNode  = static_cast<int>(param("inputNode", 0));  // 0 = absolute V(out)
+    const auto freqs  = CircuitSim::acFrequencies("log", static_cast<int>(param("points", 200)),
+                                                  param("fStart", 1.0), param("fStop", 1e9));
+    const auto X = sim.solveAC(netlist, freqs);
+    bool excited = false;
+    for (const auto& x : X) for (const auto& v : x) excited |= v != 0.0;
+    if (n == 0 || freqs.empty() || X.size() != freqs.size() || !excited) {
+        resp.errorDetail = "TF needs a converged operating point, a frequency range and an AC source "
+                           "(AC magnitude on a V or I source).";
+        return resp;
+    }
 
     TFResultDTO tf;
-    tf.frequencies  = ac.frequencies;
-    tf.gainDb.resize(points,       0.0);
-    tf.phaseDegrees.resize(points, 0.0);
-
-    const double toDB  = 20.0 / std::log(10.0);
-    const double toDeg = 180.0 / M_PI;
-
-    for (int fi = 0; fi < points; ++fi) {
-        if (fi >= static_cast<int>(ac.nodeVoltages.size())) break;
-        const auto& vSlice = ac.nodeVoltages[fi];
-        if (outNode - 1 < static_cast<int>(vSlice.size())) {
-            ACSolver::Complex v = vSlice[outNode - 1];
-            double mag = std::abs(v);
-            tf.gainDb[fi]       = toDB * std::log(std::max(mag, 1e-300));
-            tf.phaseDegrees[fi] = std::arg(v) * toDeg;
-        }
+    tf.frequencies = freqs;
+    for (const auto& x : X) {
+        const std::complex<double> h = x[outNode - 1] / (inNode > 0 && inNode <= n ? x[inNode - 1] : 1.0);
+        tf.gainDb.push_back(20.0 * std::log10(std::max(std::abs(h), 1e-300)));
+        tf.phaseDegrees.push_back(std::arg(h) * 180.0 / M_PI);
     }
-
     computeMargins(tf.frequencies, tf.gainDb, tf.phaseDegrees, tf);
 
-    // Pack into response
-    resp.success             = true;
-    resp.timeVector          = ac.frequencies;  // x-axis = frequency
-    resp.extended.hasTF      = true;
-    resp.extended.tf         = std::move(tf);
-
-    // Also populate nodeVoltages for backward-compat renderers
-    for (int node = 0; node < netlist.numGlobalNodes; ++node) {
-        std::vector<double> mag;
-        mag.reserve(points);
-        for (int fi = 0; fi < points; ++fi) {
-            if (fi < static_cast<int>(ac.nodeVoltages.size()) &&
-                node < static_cast<int>(ac.nodeVoltages[fi].size())) {
-                mag.push_back(std::abs(ac.nodeVoltages[fi][node]));
-            }
-        }
-        resp.nodeVoltages[node] = std::move(mag);
-    }
-
+    resp.success = resp.converged = true;
+    resp.timeVector = freqs;  // x-axis = frequency
+    for (int node = 0; node < n; ++node)
+        for (const auto& x : X) resp.nodeVoltages[node].push_back(std::abs(x[node]));
+    resp.extended.hasTF = true;
+    resp.extended.tf    = std::move(tf);
     return resp;
 }
 
 } // namespace solvers
-
-namespace {
-
-// ── Registry stub ────────────────────────────────────────────────────────────
-// The registry expects a handler with signature:
-//   SimulationResponseDTO(const SimulationRequestDTO&, CircuitSim&)
-// TF analysis requires a TensorNetlist that the driver constructs from the
-// request source. We register a stub that reports "use driver path".
-// Real TF execution goes through LocalWorkerDriver::Impl::solverLambda.
-
-orchestration::SimulationResponseDTO tfStub(
-    const orchestration::SimulationRequestDTO&,
-    const TensorNetlist&,
-    CircuitSim&)
-{
-    orchestration::SimulationResponseDTO r;
-    r.success = false;
-    r.errorDetail = "TF: use ISimulationDriver::submitJob with AnalysisTypeDTO::TRANSFER_FUNCTION";
-    return r;
-}
-
-static RegisterAnalysis<orchestration::AnalysisTypeDTO::TRANSFER_FUNCTION, &tfStub> s_reg;
-
-} // anonymous namespace
 } // namespace compute
 } // namespace acutesim

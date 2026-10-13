@@ -1,0 +1,6 @@
+RC with PULSE source
+V1 1 0 PULSE(0 5 1m 100u 100u 4m 10m)
+R1 1 2 1k
+C1 2 0 1u
+.tran 50u 10m
+.end

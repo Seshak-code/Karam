@@ -1,0 +1,369 @@
+// test_engine_fixes.cpp — Regression checks for engine review fixes 1-4.
+// Drives the public ISimulationEngine API (both CPU and default/GPU modes):
+//   1. NaN results must NOT report converged (fail-closed convergence)
+//   2. Transient must terminate and match the analytic RC answer
+//   3. Parsed diodes get SPICE defaults and honour a trailing .model card
+//   4. Inductors are shorts at DC
+// Run: ./build/test_engine_fixes
+
+#include "engine_api/isimulation_engine.h"
+#include "engine_api/simulation_session.h"
+#include "engine_api/simulation_dto.h"
+#include "engine_api/engine_callbacks.h"
+#include "physics/circuitsim.h"
+
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <string>
+
+using namespace acutesim;
+using namespace acutesim::compute::orchestration;
+
+static int g_fail = 0;
+static void check(bool ok, const std::string& what) {
+    std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
+    if (!ok) ++g_fail;
+}
+
+static SimulationResponseDTO run(PrecisionMode mode, const std::string& netlist,
+                                 double tranStep = 0, double tranStop = 0) {
+    auto engine = ISimulationEngine::create();
+    engine->setPrecisionMode(mode);
+    auto session = engine->createSession();
+    SimulationRequestDTO req;
+    req.source.payload = netlist;
+    EngineCallbacks cb;
+    if (tranStop > 0) {
+        req.transient.stepSizeS = tranStep;
+        req.transient.stopTimeS = tranStop;
+        return session->runTransient(req, cb, nullptr);
+    }
+    return session->runDC(req, cb);
+}
+
+// V(node) of the last waveform point; node numbers are 1-based.
+static double V(const SimulationResponseDTO& r, int node) {
+    if (r.waveformPoints.empty() || (int)r.waveformPoints.back().nodeVoltages.size() < node)
+        return NAN;
+    return r.waveformPoints.back().nodeVoltages[node - 1];
+}
+
+static bool near(double a, double b, double tol) { return std::abs(a - b) <= tol; }
+
+int main() {
+    for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
+        std::printf("\n== mode %s ==\n", mode == PrecisionMode::Native_F64 ? "CPU" : "default (GPU if available)");
+
+        // Fix 4: inductor is a short at DC (1 mOhm model -> ~5 uV error)
+        auto r = run(mode, "* series RL\nV1 1 0 DC 5\nL1 1 2 1m\nR1 2 0 1k\n.op\n");
+        check(r.converged && near(V(r, 2), 5.0, 1e-4), "series RL: V(2) = 5 V at DC");
+        r = run(mode, "* shunt RL\nV1 1 0 DC 5\nR1 1 2 1k\nL1 2 0 1m\n.op\n");
+        check(r.converged && near(V(r, 2), 0.0, 1e-4), "shunt RL: V(2) = 0 V at DC");
+
+        // Fix 3: default diode (IS=1e-14) and trailing .model card (IS=1e-12)
+        r = run(mode, "* diode default\nV1 1 0 DC 5\nR1 1 2 1k\nD1 2 0 NOCARD\n.model NOCARD D\n.op\n");
+        double vd = V(r, 2), id = (5.0 - vd) / 1e3;
+        check(r.converged && near(vd, 0.02585 * std::log(id / 1e-14 + 1), 1e-4),
+              "diode with SPICE defaults matches Shockley (V=" + std::to_string(vd) + ")");
+        r = run(mode, "* diode card after\nV1 1 0 DC 5\nR1 1 2 1k\nD1 2 0 DB\n.model DB D(IS=1e-12)\n.op\n");
+        vd = V(r, 2); id = (5.0 - vd) / 1e3;
+        check(r.converged && near(vd, 0.02585 * std::log(id / 1e-12 + 1), 1e-4),
+              "trailing .model IS=1e-12 is applied (V=" + std::to_string(vd) + ")");
+
+        // Junction exponent cap: at 1 A (Is=1e-14) the old cap of 30 made the
+        // diode linear above 0.107 A and gave 0.9915 V; Shockley gives 0.8335 V.
+        r = run(mode, "* 1A diode\nI1 0 1 DC 1\nD1 1 0 DM\n.model DM D(IS=1e-14)\n.op\n");
+        check(r.converged && near(V(r, 1), 0.02585 * std::log(1.0 / 1e-14 + 1), 2e-3),
+              "1 A diode follows Shockley, not the old linear clamp (V=" + std::to_string(V(r, 1)) + ")");
+
+        // Fix 1: a NaN solution must not be reported as converged (N=0 -> /0)
+        r = run(mode, "* nan diode\nV1 1 0 DC 5\nR1 1 2 1k\nD1 2 0 DZ\n.model DZ D(N=0)\n.op\n");
+        check(!r.converged, "NaN-producing circuit reports NOT converged");
+
+        // GPU acceptance: a device the GPU loop doesn't stamp (E source) must
+        // not yield a wrong answer flagged converged. Right answer or honest
+        // failure both pass, so this survives VCVS support being added later.
+        r = run(mode, "* noninverting opamp\nV1 1 0 DC 5\nRB 1 0 10k\nE1 2 0 1 3 999k\n"
+                      "R1 2 3 20k\nR2 3 0 10k\n.op\n");
+        check(!r.converged || near(V(r, 2), 15.0, 1e-2),
+              "E-source op-amp: no false convergence (converged=" +
+              std::to_string(r.converged) + ", V(out)=" + std::to_string(V(r, 2)) + ")");
+
+        // E/G/J on the default path (were silently dropped). Gain 999k also
+        // exercises the scale-aware KCL test (raw residual ~1e-5 A from rounding).
+        r = run(mode, "* noninverting opamp\nV1 1 0 DC 5\nRB 1 0 10k\nE1 2 0 1 3 999k\n"
+                      "R1 2 3 20k\nR2 3 0 10k\n.op\n");
+        check(r.converged && near(V(r, 2), 15.0, 1e-3),
+              "E-source op-amp converges to 15 V (V=" + std::to_string(V(r, 2)) + ")");
+        r = run(mode, "* G source\nV1 1 0 DC 2\nRB 1 0 1k\nG1 2 0 1 0 1m\nR2 2 0 1k\n.op\n");
+        check(r.converged && near(V(r, 2), -2.0, 1e-3), "VCCS: 1 mS * 2 V into 1k gives -2 V");
+        // Shichman-Hodges sat: Id = BETA*(Vgs-VTO)^2 = 1e-3*(−1+2)^2 = 1 mA -> V(d) = 10 - 1 = 9 V
+        r = run(mode, "* njf\nVDD 1 0 DC 10\nVG 2 0 DC -1\nRD 1 3 1k\nJ1 3 2 0 JN\n"
+                      ".model JN NJF(BETA=1e-3 VTO=-2)\n.op\n");
+        check(r.converged && near(V(r, 3), 9.0, 1e-3), "N-JFET saturation current matches hand calc");
+        r = run(mode, "* pjf mirror\nVDD 1 0 DC -10\nVG 2 0 DC 1\nRD 1 3 1k\nJ1 3 2 0 JP\n"
+                      ".model JP PJF(BETA=1e-3 VTO=-2)\n.op\n");
+        check(r.converged && near(V(r, 3), -9.0, 1e-3), "P-JFET is the exact mirror (was mis-linearised)");
+
+        // UIC: op-amp integrator has no DC operating point (open loop); SPICE
+        // skips it with UIC. Also drives the Trap->Gear2 switch, whose SoA stamp
+        // used to be Backward Euler and made every later step fail.
+        r = run(mode, "* integrator\nVIN 1 0 SIN(0 15 60)\nR1 1 2 10k\nC1 2 3 150u\n"
+                      "E1 3 0 0 2 999k\n.tran 1e-4 30e-3 uic\n", 1e-4, 30e-3);
+        {
+            double w = 2 * 3.141592653589793 * 60, t = 30e-3;
+            double ideal = -(15.0 / (1.5 * w)) * (1 - std::cos(w * t));
+            check(r.converged && near(V(r, 3), ideal, 1e-4),
+                  "UIC integrator runs to 30 ms and matches -(1/RC)*integral (V=" +
+                  std::to_string(V(r, 3)) + ", ideal " + std::to_string(ideal) + ")");
+        }
+
+        // Subcircuits: hierarchical and flattened netlists must agree exactly
+        // (instance internals are numbered after the top-level nodes, so only
+        // top-level nodes 1..N are compared). Covers: .subckt defined after use,
+        // nesting, instance capacitor history and instance LTE step control.
+        {
+            auto same = [&](const char* what, const std::string& hier, const std::string& flat,
+                            int nodes, double step, double stop) {
+                auto rh = run(mode, hier, step, stop), rf = run(mode, flat, step, stop);
+                double worst = (rh.waveformPoints.empty() || rf.waveformPoints.empty()) ? INFINITY : 0.0;
+                for (int n = 1; n <= nodes && worst < INFINITY; ++n)
+                    worst = std::max(worst, std::abs(V(rh, n) - V(rf, n)));
+                check(rh.converged && rf.converged && worst < 1e-9,
+                      std::string(what) + " (max |hier-flat| = " + std::to_string(worst) + " V)");
+            };
+            same("nested subcircuits == flattened",
+                 "* h\nV1 1 0 DC 5\nXP 1 2 PAIR\n.subckt PAIR p q\nX1 p n DIV\nX2 n q DIV\nRL q 0 47k\n.ends\n"
+                 ".subckt DIV a b\nR1 a mid 1k\nR2 mid b 1k\nR3 b 0 10k\n.ends\n.op\n",
+                 "* f\nV1 1 0 DC 5\nRL 2 0 47k\nR1a 1 m1 1k\nR2a m1 n 1k\nR3a n 0 10k\n"
+                 "R1b n m2 1k\nR2b m2 2 1k\nR3b 2 0 10k\n.op\n", 2, 0, 0);
+            same("RC ladder in subcircuits == flattened (transient)",
+                 "* h\nV1 1 0 PULSE(0 5 0 1u 1u 1m 2m)\nX1 1 2 RC\nX2 2 3 RC\nX3 3 4 RC\n"
+                 ".subckt RC in out\nR1 in out 1k\nC1 out 0 100n\n.ends\n",
+                 "* f\nV1 1 0 PULSE(0 5 0 1u 1u 1m 2m)\nR1 1 2 1k\nC1 2 0 100n\nR2 2 3 1k\n"
+                 "C2 3 0 100n\nR3 3 4 1k\nC3 4 0 100n\n", 4, 1e-5, 2e-3);
+            r = run(mode, "* e\nV1 1 0 1\nX1 1 0 NOPE\nR1 1 0 1k\n.op\n");
+            check(!r.converged && r.errorDetail.find("unknown subcircuit") != std::string::npos,
+                  "unknown subcircuit is a parse error");
+        }
+
+        // Fix 2: RC transient at dt = tau/100 terminates and is accurate
+        r = run(mode, "* rc\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.tran 1e-5 1e-3 uic\n", 1e-5, 1e-3);
+        double expect = 5.0 * (1.0 - std::exp(-1.0));
+        check(r.converged && near(V(r, 2), expect, 1e-3) &&
+              near(r.waveformPoints.back().timeS, 1e-3, 1e-12),
+              "RC transient (uic) reaches t=1ms with V(2)=" + std::to_string(V(r, 2)) +
+              " (analytic " + std::to_string(expect) + ")");
+
+        // Phase 2.1: without UIC the transient starts at the DC operating point
+        // (it used to start from zero state: the RC above charged from 0 V)
+        r = run(mode, "* rc op\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.tran 1e-5 1e-3\n", 1e-5, 1e-3);
+        check(r.converged && near(r.waveformPoints.front().nodeVoltages[1], 5.0, 1e-6) && near(V(r, 2), 5.0, 1e-6),
+              "RC without uic stays at its DC operating point 5 V (V(2)=" + std::to_string(V(r, 2)) + ")");
+        r = run(mode, "* rl op\nV1 1 0 DC 1\nR1 1 2 1k\nL1 2 0 1m\n.tran 1e-8 1e-6\n", 1e-8, 1e-6);
+        check(r.converged && std::abs(r.waveformPoints.front().nodeVoltages[1]) < 1e-5,
+              "RL without uic starts with I_L = 1 mA (V(2)(0+)=" +
+              std::to_string(r.waveformPoints.front().nodeVoltages[1]) + ", zero start gives 0.99)");
+        // IC= with UIC, and .ic (forced during the DC bias, or initial with UIC):
+        // all four give v(t) = 5 - 3 exp(-t/RC)
+        const double expectIC = 5.0 - 3.0 * std::exp(-1.0);
+        for (const char* nl : {"* c ic\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u IC=2\n.tran 1e-5 1e-3 uic\n",
+                               "* .ic\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.ic v(2)=2\n.tran 1e-5 1e-3\n",
+                               "* .ic uic\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.ic v(2)=2\n.tran 1e-5 1e-3 uic\n"}) {
+            r = run(mode, nl, 1e-5, 1e-3);
+            check(r.converged && near(V(r, 2), expectIC, 1e-3),
+                  std::string(nl).substr(2, std::string(nl).find('\n') - 2) + ": V(2)(1ms)=" +
+                  std::to_string(V(r, 2)) + " (analytic " + std::to_string(expectIC) + ")");
+        }
+        r = run(mode, "* l ic\nV1 1 0 DC 1\nR1 1 2 1k\nL1 2 0 1m IC=1m\n.tran 1e-8 1e-6 uic\n", 1e-8, 1e-6);
+        check(r.converged && std::abs(r.waveformPoints.front().nodeVoltages[1]) < 1e-5,
+              "L IC=1m with uic starts in steady state (V(2)(0+)=" +
+              std::to_string(r.waveformPoints.front().nodeVoltages[1]) + ")");
+        r = run(mode, "* bad ic\nV1 1 0 5\nR1 1 0 1k\n.ic v(nope)=1\n.tran 1u 1m\n", 1e-6, 1e-3);
+        check(!r.converged && r.errorDetail.find("unknown node") != std::string::npos,
+              ".ic on an unknown node is a parse error");
+
+        // Waveform sources on the default path (were stuck at 0 V / DC)
+        r = run(mode, "* sin\nV1 1 0 SIN(0 1 1k)\nR1 1 0 1k\n", 1e-5, 2.5e-4);
+        check(r.converged && near(V(r, 1), 1.0, 2e-3),
+              "SIN source peaks at 1 V at t=T/4 (V=" + std::to_string(V(r, 1)) + ")");
+        r = run(mode, "* pulse rc\nV1 1 0 PULSE(0 5 0 1n 1n 1 2)\nR1 1 2 1k\nC1 2 0 1u\n", 1e-5, 1e-3);
+        check(r.converged && near(V(r, 2), expect, 2e-3),
+              "PULSE-driven RC matches analytic (V=" + std::to_string(V(r, 2)) + ")");
+
+        // Fix 5: parser
+        r = run(mode, "* ac then sin\nV1 1 0 AC 1 SIN(0 1 1k)\nR1 1 0 1k\n.op\n");
+        check(r.converged && near(V(r, 1), 0.0, 1e-4),
+              "AC + SIN source: DC value is SIN's t=0 value, not 1000 V");
+        r = run(mode, "* param\n.param RV=1k\nV1 1 0 DC 5\nR1 1 2 {RV}\nR2 2 0 1k\n.op\n");
+        check(r.converged && near(V(r, 2), 2.5, 1e-3), ".param {RV} is substituted");
+        r = run(mode, "* late pnp model\nVCC 1 0 DC 5\nRE 1 2 1k\nVB 3 0 DC 3\nQ1 4 3 2 QP\n"
+                      "RC 4 0 1k\n.model QP PNP(IS=1e-15 BF=100)\n.op\n");
+        // Hand: Ie~(5-Ve)/1k, Ic=Ie*100/101, Vbe=0.02585*ln(Ic/1e-15)=0.7205 -> Ve=3.7205
+        // (an NPN would not conduct at all; ignoring IS from the card gives 3.662)
+        check(r.converged && near(V(r, 2), 3.7205, 2e-3),
+              ".model after the device still makes it a PNP (V(e)=" + std::to_string(V(r, 2)) + ")");
+        r = run(mode, "* unknown\nV1 1 0 5\nZ1 1 0 5\n.op\n");
+        check(!r.converged && r.errorDetail.find("unknown element") != std::string::npos,
+              "unknown element is a parse error: " + r.errorDetail);
+        // MNA branch currents: F/H read V1's branch current (1e-6 tolerance: every
+        // node carries a 1e-12 S GMIN, a 1e-9 relative effect here). SPICE convention:
+        // I(V1) flows + -> source -> -, so V1 driving 1k gives I(V1) = -1 mA.
+        r = run(mode, "* cccs\nV1 1 0 1\nR1 1 0 1k\nF1 0 2 V1 10\nR2 2 0 1k\n.op\n");
+        check(r.converged && near(V(r, 2), -10.0, 1e-6), "F source: 10 * I(V1) into 1k = -10 V (V=" + std::to_string(V(r, 2)) + ")");
+        r = run(mode, "* ccvs\nV1 1 0 1\nR1 1 0 1k\nH1 2 0 V1 1k\nR2 2 0 1k\n.op\n");
+        check(r.converged && near(V(r, 2), -1.0, 1e-6), "H source: 1k * I(V1) = -1 V (V=" + std::to_string(V(r, 2)) + ")");
+        r = run(mode, "* exact source\nV1 1 0 DC 5\nR1 1 0 1\n.op\n");
+        check(r.converged && near(V(r, 1), 5.0, 1e-12), "V source exact at 5 A load (was 1 mOhm Norton: 5 mV low)");
+
+        // MOSFET level 1, linear region: Ids = K(2*Vov*Vds - Vds^2)(1 + lambda*Vds)
+        // (lambda was only applied in saturation). Drain held near 0.3 V via 1 ohm.
+        r = run(mode, "* nmos linear\nVD 1 0 DC 0.3\nR1 1 2 1\nM1 2 3 0 0 NM W=10u L=1u\nVG 3 0 DC 2\n"
+                      ".model NM NMOS(VTO=0.7 KP=200u LAMBDA=0.02)\n.op\n");
+        {
+            double K = 0.5 * 200e-6 * 10.0, vov = 2.0 - 0.7, vd = 0.3;
+            for (int it = 0; it < 100; ++it)
+                vd = 0.3 - 1.0 * K * (2 * vov * vd - vd * vd) * (1 + 0.02 * vd);
+            check(r.converged && near(V(r, 2), vd, 1e-9),
+                  "NMOS linear region includes lambda (Vd=" + std::to_string(V(r, 2)) + ", hand " + std::to_string(vd) + ")");
+        }
+
+        // Transient inductor (failed to converge before: history never written back)
+        // RL step, tau = L/R = 1 us: v_R(5 us) = 1 - e^-5
+        r = run(mode, "* rl step\nV1 1 0 DC 1\nL1 1 2 1m\nR1 2 0 1k\n.tran 1e-8 5e-6 uic\n", 1e-8, 5e-6);
+        check(r.converged && near(V(r, 2), 1.0 - std::exp(-5.0), 1e-4),
+              "RL step transient matches 1 - e^-t/tau (V=" + std::to_string(V(r, 2)) + ")");
+        // Mutual inductance, open secondary: v2/v1 = M/L1 = k = 0.99
+        r = run(mode, "* xfmr\nV1 1 0 SIN(0 1 1k)\nR1 1 2 1\nL1 2 0 1m\nL2 3 0 1m\nK1 L1 L2 0.99\n"
+                      "R2 3 0 1MEG\n.tran 1e-6 2.5e-4\n", 1e-6, 2.5e-4);
+        check(r.converged && std::abs(V(r, 2)) > 0.1 && near(V(r, 3) / V(r, 2), 0.99, 1e-3),
+              "K coupling: open-circuit v2/v1 = 0.99 (ratio=" + std::to_string(V(r, 3) / V(r, 2)) + ")");
+
+        // Fix 2: an invalid timestep is an error, not an infinite loop; 0 means automatic
+        r = run(mode, "* rc\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n", -1e-6, 1e-3);
+        check(!r.converged && !r.errorDetail.empty(), "negative timestep returns an error");
+        r = run(mode, "* rc\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.tran 0 1m uic\n", 0.0, 1e-3);
+        check(r.converged && near(r.waveformPoints.back().timeS, 1e-3, 1e-12) && near(V(r, 2), 5.0 * (1.0 - std::exp(-1.0)), 5e-3),
+              ".tran 0 tstop runs with an automatic step (V(2)=" + std::to_string(V(r, 2)) + ")");
+    }
+
+    // Phase 2.3: native .dc (netlist card or DCConfigDTO); unsupported forms are errors
+    for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
+        auto r = run(mode, "* dc sweep\nV1 1 0 DC 0\nR1 1 2 1k\nR2 2 0 3k\n.dc V1 0 2 0.5\n");
+        bool ok = r.converged && r.waveformPoints.size() == 5;
+        for (size_t k = 0; ok && k < 5; ++k)
+            ok = near(r.waveformPoints[k].timeS, 0.5 * k, 1e-12) &&
+                 near(r.waveformPoints[k].nodeVoltages[1], 0.375 * k, 1e-6);
+        check(ok, ".dc V1 0 2 0.5: 5 points, V(2) = 0.75*V1");
+        auto engine = ISimulationEngine::create();
+        engine->setPrecisionMode(mode);
+        SimulationRequestDTO req;
+        req.source.payload = "* dto sweep\nI1 0 1 DC 0\nR1 1 0 2k\n.op\n";
+        req.dc = {"i1", 0.0, 1e-3, 1e-3};
+        EngineCallbacks cb;
+        r = engine->createSession()->runDC(req, cb);
+        check(r.converged && r.waveformPoints.size() == 2 && near(r.waveformPoints[1].nodeVoltages[0], 2.0, 1e-6),
+              "DCConfigDTO sweep of a current source: V(1) = 2 V at 1 mA");
+        r = run(mode, "* nested\nV1 1 0 1\nV2 2 0 1\nR1 1 2 1k\n.dc V1 0 1 0.5 V2 0 1 0.5\n");
+        check(!r.converged && r.errorDetail.find("one source") != std::string::npos, "nested .dc is a parse error");
+        r = run(mode, "* missing\nV1 1 0 1\nR1 1 0 1k\n.dc V9 0 1 0.5\n");
+        check(!r.converged && r.errorDetail.find("not found") != std::string::npos, ".dc of an unknown source is an error");
+    }
+
+    // Phase 2.4: AC (G + jwC from the DC Jacobian) and noise through the session
+    for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
+        auto engine = ISimulationEngine::create();
+        engine->setPrecisionMode(mode);
+        EngineCallbacks cb;
+        SimulationRequestDTO req;
+        req.source.payload = "* rc corner\nV1 1 0 AC 1\nR1 1 2 1k\nC1 2 0 1u\n.ac lin 1 159.15494309189535 159.15494309189535\n";
+        auto r = engine->createSession()->runAC(req, cb);
+        bool ok = r.converged && r.waveformPoints.size() == 1;
+        const double re = ok ? r.waveformPoints[0].nodeVoltages[1] : NAN, im = ok ? r.waveformPoints[0].nodeVoltagesImag[1] : NAN;
+        check(ok && near(std::hypot(re, im), std::sqrt(0.5), 1e-9) && near(std::atan2(im, re), -M_PI / 4, 1e-9),
+              "AC: RC at f = 1/(2 pi RC) gives 1/sqrt(2) at -45 deg");
+        req.source.payload = "* no sweep\nV1 1 0 AC 1\nR1 1 0 1k\n";
+        r = engine->createSession()->runAC(req, cb);
+        check(!r.converged && !r.errorDetail.empty(), "AC without a sweep is an error");
+        req.source.payload = "* divider noise\nV1 1 0 DC 0 AC 1\nR1 1 2 1k\nR2 2 0 1k\n.noise v(2) V1 lin 2 1 2\n";
+        r = engine->createSession()->runNoise(req, cb);
+        const double expect = std::sqrt(4 * 1.380649e-23 * 300.15 * 500.0);  // 1k || 1k thermal
+        ok = r.converged && r.extended.noise.onoise.size() == 2;
+        check(ok && near(r.extended.noise.onoise[0], expect, 1e-6 * expect) &&
+                  near(r.extended.noise.inoise[0], 2 * expect, 2e-6 * expect) &&
+                  near(r.extended.noise.onoiseTotal, expect, 1e-6 * expect),  // white: total over 1 Hz
+              "noise: 1k/1k divider gives sqrt(4kT*500) out, x2 input-referred, white total");
+    }
+
+    // No node gmin: a node with no DC path must fail closed and be named (the
+    // contraction solver left a root front's pivot-less rows at x = 0 and the
+    // solve "converged" — series caps gave V(2)=0, an undriven gate -5 V), and a
+    // linear circuit converging on the direct attempt must not report GMIN stepping
+    for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
+        auto r = run(mode, "* series caps\nV1 1 0 DC 5\nC1 1 2 1u\nC2 2 0 1u\nR1 1 0 1k\n.op\n");
+        check(!r.converged && r.errorDetail.find("check node 2") != std::string::npos,
+              "floating node fails closed: " + r.errorDetail.substr(0, 40));
+    }
+    {
+        CircuitSim sim;
+        TensorNetlist d;
+        d.numGlobalNodes = 2;
+        d.addVoltageSource(1, 0, 1.0); d.addResistor("R1", 1, 2, 1e3); d.addResistor("R2", 2, 0, 1e3);
+        SolverStep s = sim.solveDC(d);
+        check(s.stats.converged && !s.stats.gminSteppingUsed, "linear divider: no GMIN stepping reported");
+    }
+
+    // Phase 3 MOS1: SPICE card defaults (KP 2e-5, VTO 0, W = L = 100u) give
+    // Id = 0.5*2e-5*1^2 = 10 uA at Vgs = 1 V (saturation); M=3 triples it
+    for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
+        auto r = run(mode, "* mos defaults\nVDD 1 0 DC 5\nVG 2 0 DC 1\nRD 1 3 1k\nM1 3 2 0 0 NM\n.model NM NMOS\n.op\n");
+        check(r.converged && near(V(r, 3), 5.0 - 1e3 * 1e-5, 1e-6),
+              "MOS1 card defaults: V(drain) = 4.99 (" + std::to_string(V(r, 3)) + ")");
+        r = run(mode, "* mos M\nVDD 1 0 DC 5\nVG 2 0 DC 1\nRD 1 3 1k\nM1 3 2 0 0 NM M=3\n.model NM NMOS\n.op\n");
+        check(r.converged && near(V(r, 3), 5.0 - 3e3 * 1e-5, 1e-6),
+              "MOS1 M=3 triples the current: V(drain) = 4.97 (" + std::to_string(V(r, 3)) + ")");
+        r = run(mode, "* mos NF\nVDD 1 0 DC 5\nM1 1 1 0 0 NM NF=2\n.model NM NMOS\n.op\n");
+        check(!r.converged && r.errorDetail.find("NF") != std::string::npos, "MOS1 NF=2 is an explicit error");
+        r = run(mode, "* mos LD\nVDD 1 0 DC 5\nM1 1 1 0 0 NM L=1u\n.model NM NMOS LD=0.5u\n.op\n");
+        check(!r.converged && r.errorDetail.find("LD") != std::string::npos, "MOS1 Leff <= 0 is an explicit error");
+        // TOX without KP: KP = UO * 1e-4 * 3.9 eps0 / TOX (ngspice), here 500 cm^2/Vs and 20 nm
+        const double kp = 500e-4 * 3.9 * 8.854214871e-12 / 20e-9;
+        r = run(mode, "* mos tox\nVDD 1 0 DC 5\nVG 2 0 DC 1\nRD 1 3 1k\nM1 3 2 0 0 NM\n.model NM NMOS TOX=20n UO=500\n.op\n");
+        check(r.converged && near(V(r, 3), 5.0 - 1e3 * 0.5 * kp, 1e-6),
+              "MOS1 KP from UO and TOX: V(drain) = " + std::to_string(5.0 - 0.5e3 * kp) + " (" + std::to_string(V(r, 3)) + ")");
+        r = run(mode, "* mos mj\nVDD 1 0 DC 5\nM1 1 1 0 0 NM\n.model NM NMOS CJ=1e-4 MJ=1\n.op\n");
+        check(!r.converged && r.errorDetail.find("MJ") != std::string::npos, "MOS1 MJ >= 1 is an explicit error");
+    }
+
+    // The CSR pattern cache must not trust the canonical topology hash: it ignores
+    // sources and node numbering, so a reused CircuitSim kept a stale pattern and
+    // silently dropped the moved source's stamps.
+    {
+        CircuitSim sim;
+        TensorNetlist a, b;
+        a.numGlobalNodes = b.numGlobalNodes = 2;
+        a.addVoltageSource(1, 0, 1.0); a.addResistor("R1", 1, 2, 1e3); a.addResistor("R2", 2, 0, 1e3);
+        b.addVoltageSource(2, 0, 1.0); b.addResistor("R1", 1, 2, 1e3); b.addResistor("R2", 2, 0, 1e3);
+        sim.solveDC(a);
+        SolverStep s = sim.solveDC(b);
+        check(s.stats.converged && s.nodeVoltages.size() == 2 && near(s.nodeVoltages[0], 1.0, 1e-9) &&
+              near(s.nodeVoltages[1], 1.0, 1e-9),
+              "reused CircuitSim: moved source gives V1 = V2 = 1 (got " +
+              (s.nodeVoltages.size() == 2 ? std::to_string(s.nodeVoltages[0]) + ", " + std::to_string(s.nodeVoltages[1]) : "none") + ")");
+    }
+
+    // Linear-time canonicalRelabel must reproduce the original (std::map, O(n^2)
+    // BFS) hash: golden DB entries and cached traces store it. Value from the old code.
+    {
+        std::vector<GraphCanonical::CanonicalEdge> e;
+        for (auto x : {std::array<int, 3>{0, 3, 0}, {3, 7, 1}, {3, 7, 0}, {7, 7, 2}, {7, 0, 3},
+                       {5, 9, 0}, {9, 5, 4}, {2, 0, 5}})
+            e.emplace_back(x[0], x[1], x[2]);
+        check(GraphCanonical::computeTopologyHash(e, 0) == 3977363823923051078ULL,
+              "topology hash unchanged by the linear-time relabel");
+    }
+
+    std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");
+    return g_fail ? 1 : 0;
+}
