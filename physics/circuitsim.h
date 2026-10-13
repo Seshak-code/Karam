@@ -585,78 +585,35 @@ public:
   }
 
   void stampMosfet(const Mosfet& m, int nD, int nG, int nS, int nB,
-                   double v_d, double v_g, double v_s, double v_b,
-                   MatrixConstructor& mb, std::vector<double>& rhs) {
-      double vgs = v_g - v_s;
-      double vds = v_d - v_s;
-
-      MosfetParams<double> p;
-
-      // Look up model card by name (falls back to defaults)
-      const ModelCard* card = currentModelCards ?
-          currentModelCards->count(m.modelName) ? &currentModelCards->at(m.modelName) : nullptr
-          : nullptr;
-
-      bool isPMOS = false;
-      if (card) {
-          isPMOS = (card->type == "PMOS");
-          p.Kp     = card->get("KP", isPMOS ? 100e-6 : 200e-6);
-          p.Vth    = card->get("VTO", isPMOS ? -0.7 : 0.7);
-          p.lambda = card->get("LAMBDA", 0.02);
-      } else {
-          isPMOS = (m.modelName.find("P") != std::string::npos ||
-                    m.modelName.find("p") != std::string::npos);
-          p.Kp = isPMOS ? 100e-6 : 200e-6;
-          p.Vth = isPMOS ? -0.7 : 0.7;
-          p.lambda = 0.02;
-      }
-      p.W = m.w;
-      p.L = m.l;
-      
-      // Calculate GM (dId/dVgs)
-      Dual<double> ids_vgs = mosfet_ids(Dual<double>(vgs, 1.0), Dual<double>(vds, 0.0), p);
-      double gm = ids_vgs.grad;
-      
-      // Calculate GDS (dId/dVds)
-      Dual<double> ids_vds = mosfet_ids(Dual<double>(vgs, 0.0), Dual<double>(vds, 1.0), p);
-      double gds = ids_vds.grad;
-      
-      double ids = ids_vgs.val; 
-      double gmb = 0.0; // Body effect placeholder
-      double i_eq = ids - (gm * vgs + gmb * 0.0 + gds * vds);
-
-      stampMosfetMatrix(nD, nG, nS, nB, gm, gmb, gds, i_eq, mb, rhs);
+                   const std::vector<double>& v, MatrixConstructor& mb, std::vector<double>& rhs) {
+      stampMos1({nD, nG, nS, nB}, mos1Params(m, currentModelCards), v, mb, rhs);
   }
 
-  void stampMosfetMatrix(int d, int g, int s, int b,
-                         double gm, double gmb, double gds, double i_eq,
-                         MatrixConstructor& mb, std::vector<double>& rhs) {
-      // Linearized Model:
-      // I_ds = gm*Vgs + gmb*Vbs + gds*Vds + I_eq
-      
-      // Gds (Drain-Source Conductance)
-      if (d!=0 && s!=0) {
-           mb.add(d-1, d-1,  gds);
-           mb.add(s-1, s-1,  gds);
-           mb.add(d-1, s-1, -gds);
-           mb.add(s-1, d-1, -gds);
-      } else if (d!=0) mb.add(d-1, d-1, gds);
-      else if (s!=0)   mb.add(s-1, s-1, gds);
-
-      // Gm (Transconductance)
-      if (d!=0) {
-           if (g!=0) mb.add(d-1, g-1,  gm);
-           if (s!=0) mb.add(d-1, s-1, -gm);
+  // Newton stamp of mos1_currents() at v. The Jacobian comes from Dual (one pass
+  // per terminal), so it is the exact derivative of the currents the KCL audit
+  // checks: gm, gds, gmbs, both bulk junctions, either drain/source orientation.
+  void stampMos1(const std::array<int, 4>& n, const Mos1Params<double>& p,
+                 const std::vector<double>& v, MatrixConstructor& mb, std::vector<double>& rhs) {
+      auto V = [&](int k) { return n[k] > 0 && n[k] <= (int)v.size() ? v[n[k] - 1] : 0.0; };
+      double I[3] = {0, 0, 0}, J[3][4];
+      for (int u = 0; u < 4; ++u) {
+          auto x = [&](int k) { return Dual<double>(V(k), k == u ? 1.0 : 0.0); };
+          const auto c = mos1_currents(x(0), x(1), x(2), x(3), p);
+          const Dual<double> cur[3] = {c.d, c.s, c.b};
+          for (int t = 0; t < 3; ++t) { I[t] = cur[t].val; J[t][u] = cur[t].grad; }
       }
-      if (s!=0) {
-           if (g!=0) mb.add(s-1, g-1, -gm);
-           if (s!=0) mb.add(s-1, s-1,  gm);
+      const int row[3] = {n[0], n[2], n[3]};  // drain, source, bulk (the gate carries no current)
+      for (int t = 0; t < 3; ++t) {
+          if (row[t] <= 0) continue;
+          double ieq = I[t];
+          for (int u = 0; u < 4; ++u) {
+              ieq -= J[t][u] * V(u);
+              if (n[u] > 0 && J[t][u] != 0.0) mb.add(row[t] - 1, n[u] - 1, J[t][u]);
+          }
+          rhs[row[t] - 1] -= ieq;
       }
-
-      // RHS
-      if (d!=0) rhs[d-1] -= i_eq;
-      if (s!=0) rhs[s-1] += i_eq;
   }
+
 
   void stampBJT(const BJT& bjt, int nC, int nB, int nE, int nS,
                 double v_c, double v_b, double v_e, double v_s,
@@ -1017,16 +974,8 @@ public:
   }
   int systemSize(const TensorNetlist &nl) const { int t = 0; branchSlots(nl, t); return t; }
 
-  // Kernel-form device parameters shared by the KCL audit and noise analysis.
-  // MOSFET: sign = -1 for PMOS; kernels take the NMOS-equivalent threshold
-  // sign*VTO (PMOS -0.45 -> +0.45). BJT: thermal scaling as stampBJT.
-  static MosfetParams<double> mosfetKernelParams(const TensorNetlist &nl, const Mosfet &m, double &sign) {
-    const MosfetModel mm = mosfetModel(m, &nl.modelCards);
-    sign = mm.pmos ? -1.0 : 1.0;
-    MosfetParams<double> p;
-    p.Kp = mm.kp; p.Vth = sign * mm.vth; p.lambda = mm.lambda; p.W = m.w; p.L = m.l;
-    return p;
-  }
+  // BJT kernel parameters shared by the KCL audits and noise (thermal scaling as stampBJT).
+
   static BJTParams<double> bjtKernelParams(const TensorNetlist &nl, const BJT &q) {
     BJTParams<double> p = {q.saturationCurrent_I_S_A, q.betaF, q.betaR, q.thermalVoltage_V_T_V};
     const double ts = nl.environment.ambient_temp_K / 300.15;
@@ -1277,16 +1226,11 @@ public:
     // 3.55 MOSFET Audit (uses .model card parameters when available — must
     // match the solver's stamping exactly, otherwise false KCL residuals)
     for (const auto &m : netlist.globalBlock.mosfets) {
-        double v_d = getV(m.drain);
-        double v_g = getV(m.gate);
-        double v_s = getV(m.source);
-        
-        double sign;
-        const MosfetParams<double> p = mosfetKernelParams(netlist, m, sign);
-        double ids = sign * mosfet_ids(sign * (v_g - v_s), sign * (v_d - v_s), p);
-        
-        addRes(m.drain, -ids);
-        addRes(m.source, ids);
+        const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
+                                     mos1Params(m, &netlist.modelCards));
+        addRes(m.drain, -c.d);
+        addRes(m.source, -c.s);
+        addRes(m.body, -c.b);
     }
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
@@ -1418,16 +1362,12 @@ public:
 
         // MOSFETs (Instance)
         for (const auto &m : block.mosfets) {
-            double v_d = getV(mapNode(m.drain));
-            double v_g = getV(mapNode(m.gate));
-            double v_s = getV(mapNode(m.source));
-            
-            double sign;
-            const MosfetParams<double> p = mosfetKernelParams(netlist, m, sign);
-            double ids = sign * mosfet_ids(sign * (v_g - v_s), sign * (v_d - v_s), p);
-            
-            addRes(mapNode(m.drain), -ids);
-            addRes(mapNode(m.source), ids);
+            const auto c = mos1_currents(getV(mapNode(m.drain)), getV(mapNode(m.gate)),
+                                         getV(mapNode(m.source)), getV(mapNode(m.body)),
+                                         mos1Params(m, &netlist.modelCards));
+            addRes(mapNode(m.drain), -c.d);
+            addRes(mapNode(m.source), -c.s);
+            addRes(mapNode(m.body), -c.b);
         }
 
         // BJTs (Instance)
@@ -1657,14 +1597,13 @@ public:
 
     // MOSFETs
     for (const auto &m : netlist.globalBlock.mosfets) {
-      double vd = getV(m.drain), vg = getV(m.gate), vs = getV(m.source);
-      MosfetParams<double> p;
-      p.Kp = 200e-6; p.Vth = 0.7; p.lambda = 0.02; p.W = m.w; p.L = m.l;
-      double ids = mosfet_ids(vg - vs, vd - vs, p);
-      addRes(m.drain, -ids);
-      addRes(m.source, ids);
+      const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
+                                   mos1Params(m, &netlist.modelCards));
+      addRes(m.drain, -c.d);
+      addRes(m.source, -c.s);
+      addRes(m.body, -c.b);
       attributions.push_back({m.instanceName, "MOSFET",
-          {{m.drain, -ids}, {m.source, ids}}});
+          {{m.drain, -c.d}, {m.source, -c.s}, {m.body, -c.b}}});
     }
 
     // JFETs
@@ -1835,25 +1774,19 @@ public:
               if (index < 0 || index >= (int)netlist.globalBlock.mosfets.size()) return {};
               const auto& m = netlist.globalBlock.mosfets[index];
 
-              double vgs = getV(m.gate) - getV(m.source);
-              double vds = getV(m.drain) - getV(m.source);
-              
-              MosfetParams<Dual<double>> p;
-              // Hardcoded model params for now, ideally fetch from model library
-              // But 'W' and 'L' are instance params
-              p.Kp = Dual<double>(200e-6); 
-              p.Vth = Dual<double>(0.7, (paramName == "Vth" ? 1.0 : 0.0));
-              p.lambda = Dual<double>(0.02);
-              p.W = Dual<double>(m.w, (paramName == "W" ? 1.0 : 0.0));
-              p.L = Dual<double>(m.l, (paramName == "L" ? 1.0 : 0.0));
-              
-              Dual<double> ids = mosfet_ids(Dual<double>(vgs), Dual<double>(vds), p);
-              double didp = ids.grad; // dIds / dp
-              
-              // I_drain leaves (positive in F_drain)
-              if (m.drain > 0) b_sens[m.drain-1] -= didp;
-               // I_source enters (negative in F_source)
-               if (m.source > 0) b_sens[m.source-1] += didp;
+              // dI/dp of the same mos1_currents() the solve used: Vth (VTO), W, L
+              const Mos1Params<double> p = mos1Params(m, &netlist.modelCards);
+              Mos1Params<Dual<double>> pd{p.polarity, p.beta, p.vto, p.lambda, p.gamma, p.phi, p.isat, p.vt};
+              const auto card = netlist.modelCards.find(m.modelName);
+              const double leff = m.l - 2.0 * (card != netlist.modelCards.end() ? card->second.get("LD", 0.0) : 0.0);
+              if (paramName == "Vth") pd.vto.grad = 1.0;
+              if (paramName == "W") pd.beta.grad = p.beta / m.w;
+              if (paramName == "L") pd.beta.grad = -p.beta / leff;
+              const auto c = mos1_currents(Dual<double>(getV(m.drain)), Dual<double>(getV(m.gate)),
+                                           Dual<double>(getV(m.source)), Dual<double>(getV(m.body)), pd);
+              if (m.drain > 0) b_sens[m.drain-1] -= c.d.grad;
+              if (m.source > 0) b_sens[m.source-1] -= c.s.grad;
+              if (m.body > 0) b_sens[m.body-1] -= c.b.grad;
           }
           // CAPACITOR SENSITIVITY (DC: dI/dC = 0, AC needs omega)
           else if (type == ComponentType::CAPACITOR) {
@@ -2127,7 +2060,6 @@ public:
     }
     // 1. Batch Compute Physics (Updates internal state: v_d, i_d, g_d, etc.)
     batchDiodePhysics(block.diodes, v_guess);
-    batchMosfetPhysics(block.mosfets, v_guess);
     batchBJTPhysics(block.bjts, v_guess);
 
     // 2. Batch Stamp (Iterate over contiguous arrays)
@@ -2181,83 +2113,9 @@ public:
 
 
     
-    // MOSFETs
-    // MOSFETs
-    size_t nM = block.mosfets.size();
-    if (nM > 0) {
-        std::vector<int> rows, cols;
-        std::vector<double> vals;
-        // Estimate size: 4 nodes * 3 connections approx? 
-        // gm: ID vs VGS -> (D,G), (S,G)
-        // gds: ID vs VDS -> (D,D), (D,S), (S,D), (S,S)
-        rows.reserve(nM * 12);
-        cols.reserve(nM * 12);
-        vals.reserve(nM * 12);
-        
-        for (size_t i=0; i<nM; ++i) {
-             int d = block.mosfets.drains[i];
-             int g = block.mosfets.gates[i];
-             int s = block.mosfets.sources[i];
-             int b = block.mosfets.bodies[i];
-             
-             double gm = block.mosfets.gm[i];
-             double gmb = block.mosfets.gmb[i];
-             double gds = block.mosfets.gds[i];
-             double ids = block.mosfets.ids[i];
-             double vgs = block.mosfets.vgs[i];
-             double vds = block.mosfets.vds[i];
-             double vbs = (b != 0) ? (v_guess[b-1] - (s != 0 ? v_guess[s-1] : 0.0)) : 0.0;
-             double i_eq = ids - (gm * vgs + gmb * vbs + gds * vds);
-             
-             // Stamping Gds (Conductance between Drain and Source)
-             if (d!=0 && s!=0) {
-                 rows.push_back(d-1); cols.push_back(d-1); vals.push_back(gds);
-                 rows.push_back(s-1); cols.push_back(s-1); vals.push_back(gds);
-                 rows.push_back(d-1); cols.push_back(s-1); vals.push_back(-gds);
-                 rows.push_back(s-1); cols.push_back(d-1); vals.push_back(-gds);
-             } else if (d!=0) {
-                 rows.push_back(d-1); cols.push_back(d-1); vals.push_back(gds);
-             } else if (s!=0) {
-                 rows.push_back(s-1); cols.push_back(s-1); vals.push_back(gds);
-             }
-             
-             // Stamping Gm (VGS control)
-             if (d!=0) {
-                 if (g!=0) { rows.push_back(d-1); cols.push_back(g-1); vals.push_back(gm); }
-                 if (s!=0) { rows.push_back(d-1); cols.push_back(s-1); vals.push_back(-gm); }
-             }
-             if (s!=0) {
-                 if (g!=0) { rows.push_back(s-1); cols.push_back(g-1); vals.push_back(-gm); }
-                 if (s!=0) { rows.push_back(s-1); cols.push_back(s-1); vals.push_back(gm); }
-             }
-
-             // Stamping Gmb (VBS control)
-             if (d!=0) {
-                 if (b!=0) { rows.push_back(d-1); cols.push_back(b-1); vals.push_back(gmb); }
-                 if (s!=0) { rows.push_back(d-1); cols.push_back(s-1); vals.push_back(-gmb); }
-             }
-             if (s!=0) {
-                 if (b!=0) { rows.push_back(s-1); cols.push_back(b-1); vals.push_back(-gmb); }
-                 if (s!=0) { rows.push_back(s-1); cols.push_back(s-1); vals.push_back(gmb); }
-             }
-             
-             // RHS
-             // I_d_total = I_eq + ...
-             // KCL DrainNode: Isum = 0 -> ... + I_d_leaving = 0 -> ... + I_eq = 0 -> RHS = -I_eq
-             // I_d leaving drain
-             if (d!=0) rhsVector[d-1] -= i_eq;
-             if (s!=0) rhsVector[s-1] += i_eq;
-        }
-        matrixBuilder.addBatch(rows, cols, vals);
-
-        // GPU Hook (Future Integration)
-        /*
-        if (activeBackend == Backend::WEBGPU) {
-             gpuAssembler.upload(block.mosfets.gds_buffer, block.mosfets.gds);
-             gpuAssembler.dispatchStamping("mosfet_stamp_kernel");
-        }
-        */
-    }
+    // MOSFETs: Newton stamp of mos1_currents() (one definition, see stampMos1)
+    for (size_t i = 0; i < block.mosfets.size(); ++i)
+        stampMos1(block.mosfets.nodes[i], block.mosfets.params[i], v_guess, matrixBuilder, rhsVector);
 
 
     
@@ -2370,14 +2228,8 @@ public:
 
     // 2. MOSFETs
     for (const auto &m : block.mosfets) {
-      int nD = mapNode(m.drain);
-      int nG = mapNode(m.gate);
-      int nS = mapNode(m.source);
-      int nB = mapNode(m.body);
-
-      stampMosfet(m, nD, nG, nS, nB,
-                  getV(nD), getV(nG), getV(nS), getV(nB),
-                  matrixBuilder, rhsVector);
+      stampMosfet(m, mapNode(m.drain), mapNode(m.gate), mapNode(m.source), mapNode(m.body),
+                  v_guess, matrixBuilder, rhsVector);
     }
 
     // 3. BJTs

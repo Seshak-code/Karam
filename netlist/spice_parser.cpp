@@ -403,7 +403,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     };
     auto resolveBlock = [&](TensorBlock& blk) {
         for (const auto& m : blk.mosfets)
-            if (const ModelCard* c = card(m.modelName)) supported(c, {"KP", "VTO", "LAMBDA"});
+            if (const ModelCard* c = card(m.modelName)) supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD"});
         for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
             supported(c, {"IS", "N"});
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
@@ -636,10 +636,13 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.source = nodeIndex(tok[3]);
     m.body   = nodeIndex(tok[4]);
     m.modelName = tok[5];
+    m.w = m.l = 100e-6;  // SPICE DEFW / DEFL
 
-    // tokenize() turns "W=4u" into ["W", "4u"]
-    for (size_t i = 6; i + 1 < tok.size(); ++i) {
+    // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS/NRD/NRS only act
+    // through CJ/CJSW/JS/RSH, which the model check still rejects.
+    for (size_t i = 6; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
+        if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")        m.w = parseValue(tok[++i]);
         else if (upper == "L")   m.l = parseValue(tok[++i]);
         else if (upper == "AD")  m.geo.ad = parseValue(tok[++i]);
@@ -648,9 +651,13 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
         else if (upper == "PS")  m.geo.ps = parseValue(tok[++i]);
         else if (upper == "NRD") m.geo.nrd = parseValue(tok[++i]);
         else if (upper == "NRS") m.geo.nrs = parseValue(tok[++i]);
-        else if (upper == "NF")  m.extra.nf = static_cast<int>(parseValue(tok[++i]));
-        else if (upper == "M")   m.extra.mult = static_cast<int>(parseValue(tok[++i]));
+        else if (upper == "NF") {
+            if (parseValue(tok[++i]) != 1.0) throw std::runtime_error(tok[0] + ": NF is not supported yet");
+        }
+        else if (upper == "M")   m.extra.mult = parseValue(tok[++i]);
+        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
+    if (!(m.l > 0.0) || !(m.w > 0.0)) throw std::runtime_error(tok[0] + ": W and L must be > 0");
     blk.mosfets.push_back(m);
 }
 

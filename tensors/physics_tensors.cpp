@@ -52,62 +52,6 @@ void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& v
     }
 }
 
-void batchMosfetPhysics_generic(MosfetTensor& tensor, const std::vector<double>& voltages) {
-    size_t n = tensor.size();
-    
-    for (size_t i = 0; i < n; ++i) {
-        int nD = tensor.drains[i];
-        int nG = tensor.gates[i];
-        int nS = tensor.sources[i];
-        
-        double v_d_orig = (nD > 0 && nD <= (int)voltages.size()) ? voltages[nD - 1] : 0.0;
-        double v_g_orig = (nG > 0 && nG <= (int)voltages.size()) ? voltages[nG - 1] : 0.0;
-        double v_s_orig = (nS > 0 && nS <= (int)voltages.size()) ? voltages[nS - 1] : 0.0;
-        
-        bool isPMOS = tensor.isPMOS[i];
-        double sign = isPMOS ? -1.0 : 1.0;
-        
-        // PMOS equivalent: flip all voltages relative to source?
-        // Actually legacy flips: Vgs'=-Vgs, Vds'=-Vds, Vth'=-Vth
-        double v_g = isPMOS ? v_g_orig : v_g_orig;
-        double v_s = isPMOS ? v_s_orig : v_s_orig;
-        double v_d = isPMOS ? v_d_orig : v_d_orig;
-
-        tensor.vgs[i] = v_g - v_s;
-        tensor.vds[i] = v_d - v_s;
-        
-        double local_vgs = sign * tensor.vgs[i];
-        double local_vds = sign * tensor.vds[i];
-        double local_vth = sign * tensor.Vth[i];
-        
-        double K = 0.5 * tensor.Kp[i] * (tensor.W[i] / tensor.L[i]);
-        double vov = local_vgs - local_vth;
-        
-        if (vov <= 0.0) {
-            // Cutoff
-            tensor.ids[i] = 0.0;
-            tensor.gm[i] = 0.0;
-            tensor.gds[i] = 1e-12; // GMIN
-        } else if (local_vds < vov) {
-            // Linear region. SPICE level 1 applies (1 + lambda*Vds) in the linear region too; without it
-            // the current jumps at Vds = Vov (ngspice inverters were off by up to 14 mV)
-            double clm = 1.0 + tensor.lambda[i] * local_vds;
-            double core = K * (2.0 * vov * local_vds - local_vds * local_vds);
-            tensor.ids[i] = sign * core * clm;
-            tensor.gm[i] = 2.0 * K * local_vds * clm;
-            tensor.gds[i] = 2.0 * K * (vov - local_vds) * clm + core * tensor.lambda[i];
-        } else {
-            // Saturation
-            double lam = tensor.lambda[i];
-            tensor.ids[i] = sign * K * vov * vov * (1.0 + lam * local_vds);
-            tensor.gm[i] = 2.0 * K * vov * (1.0 + lam * local_vds);
-            tensor.gds[i] = K * vov * vov * lam;
-        }
-        
-        if (tensor.gds[i] < 1e-12) tensor.gds[i] = 1e-12;
-    }
-}
-
 void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
     const double GMIN = PhysicsConstants::JUNCTION_GMIN;
@@ -192,9 +136,6 @@ void batchDiodePhysics(DiodeTensor& tensor, const std::vector<double>& voltages)
     KernelDispatcher::get().batch_diode_physics(tensor, voltages);
 }
 
-void batchMosfetPhysics(MosfetTensor& tensor, const std::vector<double>& voltages) {
-    KernelDispatcher::get().batch_mosfet_physics(tensor, voltages);
-}
 
 void batchBJTPhysics(BJTTensor& tensor, const std::vector<double>& voltages) {
     KernelDispatcher::get().batch_bjt_physics(tensor, voltages);
@@ -239,11 +180,7 @@ TensorizedBlock tensorizeBlock(const TensorBlock& block,
     // Convert MOSFETs (with model card lookup)
     result.mosfets.reserve(block.mosfets.size());
     for (const auto& m : block.mosfets) {
-        const MosfetModel mm = mosfetModel(m, modelCards);
-        result.mosfets.push(m.drain, m.gate, m.source, m.body,
-                           m.w, m.l,
-                           mm.kp, mm.vth, mm.lambda,
-                           mm.pmos, m.temperature_K);
+        result.mosfets.push(m.drain, m.gate, m.source, m.body, mos1Params(m, modelCards));
     }
     
     // Convert BJTs
@@ -277,7 +214,7 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
     // BUCKETING STAGING AREA: Group devices by model to maximize SIMD efficiency
     // -------------------------------------------------------------------------
     struct DiodeJob { int a, c; double is, n, vt; std::string model; };
-    struct MosfetJob { int d, g, s, b; double w, l, kp, vth, lam; bool pmos; std::string model; };
+    struct MosfetJob { int d, g, s, b; Mos1Params<double> p; };
     struct BjtJob { int c, b, e; double is, bf, br, vt; bool npn; std::string model; };
 
     std::map<std::string, std::vector<DiodeJob>> diodeBuckets;
@@ -388,9 +325,8 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
         }
         // Collect MOSFETs
         for (const auto& m : block.mosfets) {
-            const MosfetModel mm = mosfetModel(m, cards);
             mosfetBuckets[m.modelName].push_back({remap(m.drain), remap(m.gate), remap(m.source), remap(m.body),
-                                                 m.w, m.l, mm.kp, mm.vth, mm.lambda, mm.pmos, m.modelName});
+                                                 mos1Params(m, cards)});
         }
         // Collect BJTs
         for (const auto& q : block.bjts) {
@@ -436,7 +372,7 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
         for (auto& d : bucket) result.diodes.push(d.a, d.c, d.is, d.n, d.vt, 0.0, netlist.environment.ambient_temp_K);
     }
     for (auto& [model, bucket] : mosfetBuckets) {
-        for (auto& m : bucket) result.mosfets.push(m.d, m.g, m.s, m.b, m.w, m.l, m.kp, m.vth, m.lam, m.pmos, netlist.environment.ambient_temp_K);
+        for (auto& m : bucket) result.mosfets.push(m.d, m.g, m.s, m.b, m.p);
     }
     for (auto& [model, bucket] : bjtBuckets) {
         for (auto& q : bucket) result.bjts.push(q.c, q.b, q.e, q.is, q.bf, q.br, q.vt, q.npn, netlist.environment.ambient_temp_K);

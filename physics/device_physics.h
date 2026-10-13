@@ -191,64 +191,50 @@ inline T compute_vcrit(T vt, T Is) {
 // MOSFET (LEVEL 1 SHICHMAN-HODGES) PHYSICS
 // ============================================================================
 
-template <typename T>
-struct MosfetParams 
-{
-    T Kp;     // Process transconductance [A/V^2] at Tnom
-    T Vth;    // Threshold Voltage [V]
-    T lambda; // Channel Length Modulation [1/V]
-    T W;      // Channel Width [m]
-    T L;      // Channel Length [m]
-    
-    // Thermal
-    T Temp;
-    T Tnom;
+// SPICE level 1 (ngspice mos1load.c, DC): source/drain exchange when Vds < 0,
+// body effect (GAMMA, PHI), channel-length modulation, and the bulk-drain /
+// bulk-source junctions (diode_model_pair: same GMIN and exp cap as every
+// junction). Returns the currents flowing INTO the device at drain, source and
+// bulk (the gate draws none). The one MOSFET definition: stamps (via Dual),
+// KCL audits, sensitivity and noise all evaluate this function.
+template <typename P>
+struct Mos1Params {
+    P polarity = 1.0;   // +1 NMOS, -1 PMOS
+    P beta = 2e-5;      // KP * W / (L - 2 LD) * M
+    P vto = 0.0;        // VTO as on the card (PMOS negative)
+    P lambda = 0.0, gamma = 0.0, phi = 0.6;
+    P isat = 1e-14;     // bulk junction saturation current, IS * M
+    P vt = PhysicsConstants::V_THERMAL_300K;
 };
 
-enum class MosfetRegion { CUTOFF, LINEAR, SATURATION };
+template <typename T> struct Mos1Currents { T d, s, b; };
 
-/**
- * mosfet_region
- * Determines operating region from terminal voltages. (NMOS)
- * For Dual types, this uses the primal value for comparisons.
- */
 template <typename T, typename P>
-inline MosfetRegion mosfet_region(T vgs, T vds, const MosfetParams<P>& p) 
+inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>& p)
 {
-    T vov = vgs - p.Vth;
-    if (vov <= 0.0) return MosfetRegion::CUTOFF;
-    if (vds < vov)  return MosfetRegion::LINEAR;
-    return MosfetRegion::SATURATION;
-}
+    using std::sqrt;
+    const P type = p.polarity;
+    const T vgs = type * (vg - vs), vds = type * (vd - vs), vbs = type * (vb - vs);
+    const T vbd = vbs - vds, vgd = vgs - vds;
+    const DiodeParams<P> junction = {p.isat, P(1.0), p.vt};
+    const T cbs = diode_model_pair(vbs, junction).first;
+    const T cbd = diode_model_pair(vbd, junction).first;
 
-/**
- * mosfet_ids
- * Level 1 Drain-Source Current (NMOS).
- */
-template <typename T, typename P>
-inline T mosfet_ids(T vgs, T vds, const MosfetParams<P>& p) 
-{
-    T K = 0.5 * p.Kp * (p.W / p.L);
-    T vov = vgs - p.Vth;
-
-    if (vov <= 0.0) 
-        return 0.0; // Cutoff
-
-    // We can just rely on vds < vov check, or call mosfet_region.
-    // Re-evaluating condition for branchless-ish optimization if T is SIMD?
-    // For scalar/dual, straightforward if-else is fine.
-    
-    if (vds < vov) 
-    {
-        // Linear Region: Ids = K * (2*Vov*Vds - Vds^2) * (1 + lambda*Vds)
-        // (SPICE level 1 applies channel-length modulation in both regions)
-        return K * (2.0 * vov * vds - vds * vds) * (1.0 + p.lambda * vds);
-    } 
-    else 
-    {
-        // Saturation: Ids = K * Vov^2 * (1 + lambda * Vds)
-        return K * vov * vov * (1.0 + p.lambda * vds);
+    const bool normal = vds >= P(0.0);          // mode: the higher terminal is the drain
+    const T vbx = normal ? vbs : vbd;
+    const P sphi = sqrt(p.phi);
+    T sarg = vbx <= P(0.0) ? sqrt(p.phi - vbx) : sphi - vbx / (2.0 * sphi);
+    if (sarg < P(0.0)) sarg = T(0.0);
+    const T vgst = (normal ? vgs : vgd) - (type * p.vto + p.gamma * (sarg - sphi));
+    const T vdsm = normal ? vds : -vds;         // |Vds|
+    T cdrain(0.0);
+    if (vgst > P(0.0)) {
+        const T betap = p.beta * (1.0 + p.lambda * vdsm);
+        cdrain = vgst <= vdsm ? 0.5 * betap * vgst * vgst                // saturation
+                              : betap * vdsm * (vgst - 0.5 * vdsm);      // linear
     }
+    const T chan = normal ? cdrain : -cdrain;   // into the drain terminal
+    return {type * (chan - cbd), type * (-chan - cbs), type * (cbs + cbd)};
 }
 
 // ============================================================================

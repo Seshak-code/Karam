@@ -559,7 +559,7 @@ struct Mosfet {
     // Advanced Params
     struct Params {
         int nf = 1;      // Number of fingers
-        int mult = 1;    // Multiplier
+        double mult = 1.0;  // Multiplier (M=): scales beta and the junctions
     } extra;
 
     // Noise Parameters
@@ -569,25 +569,6 @@ struct Mosfet {
 
     double temperature_K = 300.15;
 };
-
-// MOSFET level-1 parameters: the .model card when found (its type decides PMOS),
-// else SPICE defaults chosen by model name. vth keeps the card's sign (PMOS < 0).
-// The one definition used by tensorizeNetlist, the KCL audit and noise analysis.
-struct MosfetModel { bool pmos; double kp, vth, lambda; };
-inline MosfetModel mosfetModel(const Mosfet& m, const std::map<std::string, ModelCard>* cards) {
-    if (cards) {
-        auto it = cards->find(m.modelName);
-        if (it != cards->end()) {
-            const bool p = it->second.type == "PMOS";
-            return {p, it->second.get("KP", p ? 100e-6 : 200e-6), it->second.get("VTO", p ? -0.7 : 0.7),
-                    it->second.get("LAMBDA", 0.02)};
-        }
-    }
-    const bool p = m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos;
-    return {p, p ? 100e-6 : 200e-6, p ? -0.7 : 0.7, 0.02};
-}
-
-
 
 struct BJT {
     std::string instanceName;

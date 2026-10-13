@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include "../infrastructure/model_registry.h"
 #include "../netlist/circuit.h"
+#include "../physics/device_physics.h"
+#include <array>
 
 /*
  * physics_tensors.h - Structure-of-Arrays (SoA) Tensor Data Structures
@@ -87,82 +89,42 @@ struct DiodeTensor {
 // MOSFET TENSOR  
 // ============================================================================
 
+// One entry per device: nodes (1-based, 0 = ground) and the level-1 parameters
+// mos1_currents() evaluates. No per-kernel copies of the model any more.
 struct MosfetTensor {
-    // Node indices
-    std::vector<int> drains;
-    std::vector<int> gates;
-    std::vector<int> sources;
-    std::vector<int> bodies;
-    
-    // Device parameters
-    std::vector<double> W;       // Channel width [m]
-    std::vector<double> L;       // Channel length [m]
-    std::vector<double> Kp;      // Transconductance parameter [A/V²]
-    std::vector<double> Vth;     // Threshold voltage [V]
-    std::vector<double> lambda;  // Channel length modulation [1/V]
-    std::vector<bool> isPMOS; 
-    
-    // Thermal parameters
-    std::vector<double> Temp;    // Operating temperature [K]
-    
-    // Iteration state
-    std::vector<double> vgs;     // Gate-source voltage [V]
-    std::vector<double> vds;     // Drain-source voltage [V]
-    std::vector<double> ids;     // Drain current [A]
-    std::vector<double> gm;      // Transconductance [S] (dId/dVgs)
-    std::vector<double> gmb;     // Body transconductance [S] (dId/dVbs)
-    std::vector<double> gds;     // Output conductance [S] (dId/dVds)
-    
-    // Design Rule Validation Masks (GPU-compatible uint8)
-    std::vector<uint8_t> dr_validity;
-    static constexpr uint8_t DR_OK = 0;
-    static constexpr uint8_t DR_FLOATING_GATE = 1 << 0;
-    static constexpr uint8_t DR_OPEN_DRAIN = 1 << 1;
-    static constexpr uint8_t DR_THERMAL_VIOLATION = 1 << 2;
-    
-    size_t size() const { return drains.size(); }
-    
-    void reserve(size_t n) {
-        drains.reserve(n); gates.reserve(n); sources.reserve(n); bodies.reserve(n);
-        W.reserve(n); L.reserve(n); Kp.reserve(n); Vth.reserve(n); lambda.reserve(n);
-        isPMOS.reserve(n);
-        Temp.reserve(n);
-        vgs.reserve(n); vds.reserve(n); ids.reserve(n); gm.reserve(n); gmb.reserve(n); gds.reserve(n);
-        dr_validity.reserve(n);
-    }
-    
-    void clear() {
-        drains.clear(); gates.clear(); sources.clear(); bodies.clear();
-        W.clear(); L.clear(); Kp.clear(); Vth.clear(); lambda.clear();
-        isPMOS.clear();
-        Temp.clear();
-        vgs.clear(); vds.clear(); ids.clear(); gm.clear(); gmb.clear(); gds.clear();
-        dr_validity.clear();
-    }
-    
-    void push(int d, int g, int s, int b, double w, double l, 
-              double kp = 200e-6, double vth = 0.7, double lam = 0.02, 
-              bool pmos = false, double temp = 300.0) {
-        drains.push_back(d);
-        gates.push_back(g);
-        sources.push_back(s);
-        bodies.push_back(b);
-        W.push_back(w);
-        L.push_back(l);
-        Kp.push_back(kp);
-        Vth.push_back(vth);
-        lambda.push_back(lam);
-        isPMOS.push_back(pmos);
-        Temp.push_back(temp);
-        vgs.push_back(0.0);
-        vds.push_back(0.0);
-        ids.push_back(0.0);
-        gm.push_back(0.0);
-        gmb.push_back(0.0);
-        gds.push_back(1e-12); // MOSFET GMIN
-        dr_validity.push_back(DR_OK);
+    std::vector<std::array<int, 4>> nodes;        // drain, gate, source, bulk
+    std::vector<Mos1Params<double>> params;
+
+    size_t size() const { return nodes.size(); }
+    void reserve(size_t n) { nodes.reserve(n); params.reserve(n); }
+    void clear() { nodes.clear(); params.clear(); }
+    void push(int d, int g, int s, int b, const Mos1Params<double>& p) {
+        nodes.push_back({d, g, s, b});
+        params.push_back(p);
     }
 };
+
+// Level-1 parameters of a MOSFET instance from its .model card: SPICE defaults
+// for missing keys (KP 2e-5, VTO 0, LAMBDA 0, GAMMA 0, PHI 0.6, IS 1e-14, LD 0).
+// No card (only the GUI's Verilog-A path) keeps the engine's 200u/0.7 V/0.02 NMOS
+// and 100u/-0.7 V/0.02 PMOS, chosen by model name.
+inline Mos1Params<double> mos1Params(const Mosfet& m, const std::map<std::string, ModelCard>* cards) {
+    Mos1Params<double> p;
+    const ModelCard* c = nullptr;
+    if (cards) { auto it = cards->find(m.modelName); if (it != cards->end()) c = &it->second; }
+    const bool pmos = c ? c->type == "PMOS"
+                        : m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos;
+    p.polarity = pmos ? -1.0 : 1.0;
+    const double kp = c ? c->get("KP", 2e-5) : (pmos ? 100e-6 : 200e-6);
+    p.vto    = c ? c->get("VTO", 0.0) : (pmos ? -0.7 : 0.7);
+    p.lambda = c ? c->get("LAMBDA", 0.0) : 0.02;
+    p.gamma  = c ? c->get("GAMMA", 0.0) : 0.0;
+    p.phi    = c ? c->get("PHI", 0.6) : 0.6;
+    const double mult = m.extra.mult;
+    p.beta = kp * m.w / (m.l - 2.0 * (c ? c->get("LD", 0.0) : 0.0)) * mult;
+    p.isat = (c ? c->get("IS", 1e-14) : 1e-14) * mult;
+    return p;
+}
 
 // ============================================================================
 // BJT TENSOR
@@ -455,12 +417,6 @@ TensorizedBlock tensorizeNetlist(const class TensorNetlist& netlist);
  * Updates: i_d, g_d arrays in place.
  */
 void batchDiodePhysics(DiodeTensor& tensor, const std::vector<double>& voltages);
-
-/**
- * Batch MOSFET Physics - Evaluates all MOSFETs in a tensor simultaneously.
- * Updates: ids, gm, gds arrays in place.
- */
-void batchMosfetPhysics(MosfetTensor& tensor, const std::vector<double>& voltages);
 
 /**
  * Batch BJT Physics - Evaluates all BJTs in a tensor simultaneously.

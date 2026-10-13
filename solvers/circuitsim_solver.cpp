@@ -866,11 +866,10 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
       gens.push_back({b, e, q2 * std::abs(I.Ib)});
     }
     for (const auto &m : blk.mosfets) {
-      const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source);
-      double sign;
-      const auto p = mosfetKernelParams(netlist, m, sign);
-      const double gm = mosfet_ids(Dual<double>(sign * (V(g) - V(s)), 1.0),
-                                   Dual<double>(sign * (V(d) - V(s)), 0.0), p).grad;
+      const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source), b = sl.map(m.body);
+      // channel gm = dI_drain/dV_gate (the bulk junctions do not see the gate)
+      const double gm = mos1_currents(Dual<double>(V(d)), Dual<double>(V(g), 1.0), Dual<double>(V(s)),
+                                      Dual<double>(V(b)), mos1Params(m, &netlist.modelCards)).d.grad;
       gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
     }
     for (const auto &j : blk.jfets) {

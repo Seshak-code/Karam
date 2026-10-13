@@ -15,7 +15,6 @@
 
 // Forward declare the generic kernels (implemented in physics_tensors.cpp)
 void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& voltages);
-void batchMosfetPhysics_generic(MosfetTensor& tensor, const std::vector<double>& voltages);
 void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& voltages);
 
 // Forward declare AVX kernels
@@ -25,13 +24,11 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
 
 #ifdef __AVX2__
 void batchDiodePhysics_avx2(DiodeTensor& tensor, const std::vector<double>& voltages);
-void batchMosfetPhysics_avx2(MosfetTensor& tensor, const std::vector<double>& voltages);
 #endif
 
 // Forward declare NEON kernels
 #ifdef __aarch64__
 void batchDiodePhysics_neon(DiodeTensor& tensor, const std::vector<double>& voltages);
-void batchMosfetPhysics_neon(MosfetTensor& tensor, const std::vector<double>& voltages);
 void batchBJTPhysics_neon(BJTTensor& tensor, const std::vector<double>& voltages);
 #endif
 
@@ -51,7 +48,6 @@ void KernelDispatcher::detectCpuAndBind() {
     // Default to Generic
     architecture = SimdArch::Generic;
     batch_diode_physics = batchDiodePhysics_generic;
-    batch_mosfet_physics = batchMosfetPhysics_generic;
     batch_bjt_physics = batchBJTPhysics_generic;
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -84,7 +80,6 @@ void KernelDispatcher::detectCpuAndBind() {
         std::cout << "[INFO] Compute: Detected AVX2. Using AVX2 kernels." << std::endl;
         #ifdef __AVX2__
         batch_diode_physics = batchDiodePhysics_avx2;
-        batch_mosfet_physics = batchMosfetPhysics_avx2;
         #else
         std::cout << "[WARN] Compute: AVX2 detected but binary compiled without AVX2 support." << std::endl;
         #endif
@@ -93,7 +88,6 @@ void KernelDispatcher::detectCpuAndBind() {
 #elif defined(__aarch64__)
     architecture = SimdArch::Neon;
     batch_diode_physics = batchDiodePhysics_neon;
-    batch_mosfet_physics = batchMosfetPhysics_neon;
     batch_bjt_physics = batchBJTPhysics_neon;
     std::cout << "[INFO] Compute: Detected ARM Neon. Using NEON f64x2 kernels." << std::endl;
 #endif
