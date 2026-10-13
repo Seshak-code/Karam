@@ -29,7 +29,7 @@ inline __m512d _mm512_exp_pd_fallback(__m512d v) {
 
 void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
-    const double GMIN = 1e-12;
+    const double GMIN = PhysicsConstants::JUNCTION_GMIN;
     
     const __m512d v_gmin = _mm512_set1_pd(GMIN);
     const __m512d v_zero = _mm512_setzero_pd();

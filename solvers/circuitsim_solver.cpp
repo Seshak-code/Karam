@@ -225,6 +225,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   int total_iterations = 0;
   double final_kcl_error = 0.0;
   bool singularMatrixDetected = false;
+  int singularRow = -1;  // unknown with no pivot (ngspice: "singular matrix: check node N")
   std::vector<ConvergenceStep> convergenceHistory;
   // Phase 2.9: Numerical Intelligence state
   bool stagnationDetected = false;
@@ -251,13 +252,11 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     // carries NO node gmin (junction GMIN in the device models keeps floating
     // junction nodes referenced, like ngspice) — a node-to-ground leak settles
     // them differently (aac_10_bridge).
-    gmin_factor = std::pow(10.0, -(3.0 + gmin_step * 0.5));
-    if (gmin_factor <= 1e-12)
-      gmin_factor = 0.0;
+    gmin_factor = gmin_step == GMIN_STEPS - 1 ? 0.0 : std::pow(10.0, -(3.0 + gmin_step * 0.5));
     bool gmin_converged = false;
 
     // Phase 2.9: Track regularization
-    if (gmin_factor > 1e-12) {
+    if (gmin_factor > 0.0) {
       regulInfo.applied = true;
       regulInfo.gminValue = gmin_factor;
       regulInfo.injections = static_cast<uint32_t>(netlist.numGlobalNodes);
@@ -320,6 +319,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
             << iteration << "\n";
         final_kcl_error = 1e9; // Flag as bad residual
         singularMatrixDetected = true;
+        singularRow = result.rankDeficientRow;
         // If singular, retrying with same Jacobian won't help. Abort this GMIN
         // step.
         total_iterations += iteration + 1;
@@ -503,11 +503,17 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   stats.iterations = total_iterations;
   stats.residual = final_kcl_error;
   stats.converged = converged;
+  if (!converged && singularRow >= 0)
+    details = (singularRow < netlist.numGlobalNodes
+                   ? "Singular matrix: check node " + std::to_string(singularRow + 1) +
+                         " (no DC path to ground?)"
+                   : "Singular matrix: check branch " + std::to_string(singularRow - netlist.numGlobalNodes + 1) +
+                         " (a loop of voltage sources or inductors?)") +
+              (details.empty() ? "" : "\n" + details);
   stats.error_detail = details;
   stats.method = "Newton-Raphson";
   stats.integrationMethod = ""; // DC has no integration
-  stats.gminSteppingUsed =
-      (gmin_factor < 1e-3);         // If we progressed past initial steps
+  stats.gminSteppingUsed = gminSchedule.size() > 1;  // the direct attempt failed: ladder walked
   stats.sourceSteppingUsed = false; // Not implemented yet
   stats.failureType = failureType;
   stats.convergenceHistory = std::move(convergenceHistory);

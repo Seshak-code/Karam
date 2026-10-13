@@ -585,6 +585,13 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
             }
         });
         for (int id : level) {  // reduce per-front results after the level
+            // A root front has no parent to delay to: un-eliminated fully-summed rows
+            // mean no pivot exists (e.g. a node with no DC path). They used to be left
+            // silently at x = 0 and the solve reported success.
+            if (plan.fronts[id].parent < 0 && F[id].e < F[id].full && !F[id].singular) {
+                F[id].singular = true;
+                res.rankDeficientRow = plan.rowOfVar[F[id].rowLab[F[id].e]];
+            }
             singular = singular || F[id].singular;
             smallestPivot = std::min(smallestPivot, F[id].minPivot);
         }

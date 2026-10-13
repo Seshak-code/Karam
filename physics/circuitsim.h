@@ -1045,6 +1045,39 @@ public:
   // (empty vector if no source has that name).
   std::vector<std::complex<double>> acExcitation(const TensorNetlist &nl, const std::string &unit = "") const;
 
+  // used[n]: some element (any block, mapped to global nodes) touches node n.
+  // Recomputed per call, O(elements): a cache keyed on counts went stale when a
+  // CircuitSim was reused on a differently wired netlist.
+  std::vector<char> usedNodes(const TensorNetlist &nl) const {
+    int total = 0;
+    std::vector<char> used(nl.numGlobalNodes + 1, 0);
+    for (const auto &sl : branchSlots(nl, total)) {
+      auto mark = [&](std::initializer_list<int> ns) {
+        for (int local : ns) { int g = sl.map(local); if (g > 0 && g <= nl.numGlobalNodes) used[g] = 1; }
+      };
+      const auto &b = *sl.blk;
+      for (const auto &e : b.resistors) mark({e.nodeTerminal1, e.nodeTerminal2});
+      for (const auto &e : b.capacitors) mark({e.nodePlate1, e.nodePlate2});
+      for (const auto &e : b.inductors) mark({e.nodeCoil1, e.nodeCoil2});
+      for (const auto &e : b.voltageSources) mark({e.nodePositive, e.nodeNegative});
+      for (const auto &e : b.currentSources) mark({e.nodePositive, e.nodeNegative});
+      for (const auto &e : b.diodes) mark({e.anode, e.cathode});
+      for (const auto &e : b.schottkyDiodes) mark({e.anode, e.cathode});
+      for (const auto &e : b.zenerDiodes) mark({e.anode, e.cathode});
+      for (const auto &e : b.mosfets) mark({e.drain, e.gate, e.source, e.body});
+      for (const auto &e : b.bjts) mark({e.nodeCollector, e.base, e.emitter});
+      for (const auto &e : b.jfets) mark({e.drain, e.gate, e.source});
+      for (const auto &e : b.voltageControlledVoltageSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
+      for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
+      for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
+      for (const auto &e : b.currentControlledCurrentSources) mark({e.outPos, e.outNeg});
+      for (const auto &e : b.powerRails) mark({e.nodeRail});
+      for (const auto &e : b.parasiticResistors) mark({e.node1, e.node2});
+      for (const auto &e : b.parasiticCapacitors) mark({e.node1, e.node2});
+    }
+    return used;
+  }
+
   // flux[a] = {(b, L_ab)}: self inductance plus K couplings M = k*sqrt(La*Lb).
   // Shared by the transient branch rows and the AC reactive matrix.
   static std::vector<std::vector<std::pair<int, double>>> fluxLinks(const TensorBlock &blk) {
@@ -1747,7 +1780,7 @@ public:
       if ((int)lastSolution_.size() == nTot) x_converged = lastSolution_;  // with branch currents
       x_converged.resize(nTot, 0.0);
       stampAllElements(netlist, 0.0, x_converged, 0.0); // h=0, time=0 for DC sensitivity
-      addDiagonalConditioning(netlist.numGlobalNodes);
+      // (no node gmin: the Jacobian of the converged OP has only junction GMIN)
       Csr_matrix J = matrixBuilder.createCsr(); /* Explicitly J */
       
       // 2. Build RHS vector b = - dF/dp
@@ -2453,6 +2486,16 @@ public:
     // Branch-current elements (V, L+K, E, F, H): one implementation for both paths
     stampBranchSystem(netlist, h, time);
 
+    // A node no element touches is not a circuit node (ngspice drops it after
+    // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it
+    // to 0 V. A real floating node (series caps, an undriven gate) still fails.
+    // ponytail: skipped when D2A ports exist (they stamp nodes of their own).
+    if (!digitalEngine_.hasOutputPorts()) {
+      const std::vector<char> used = usedNodes(netlist);
+      for (int n = 1; n <= netlist.numGlobalNodes; ++n)
+        if (!used[n]) matrixBuilder.add(n - 1, n - 1, 1.0);
+    }
+
     // ─── Gap 2: Digital Event Engine — D2A Stamping ──────────────────────
     if (digitalEngine_.hasOutputPorts()) {
         digitalEngine_.stampD2A(matrixBuilder, rhsVector, netlist.numGlobalNodes, h);
@@ -2460,7 +2503,7 @@ public:
   }
 
 
-  void addDiagonalConditioning(int n, double gmin = 1e-12) {
+  void addDiagonalConditioning(int n, double gmin) {
     // gmin <= 0: no node-to-ground conditioning. Like ngspice, once converged
     // the only gmin is the 1e-12 S across each junction (device models); a
     // node-to-ground leak settles floating junction nodes differently

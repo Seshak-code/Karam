@@ -81,7 +81,7 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
     // convergence; ngspice has none once converged). It lives here in the
     // junction model so the SoA kernels, the AoS stamps and both KCL audits
     // all carry it consistently.
-    T GMIN = T(1e-12); 
+    T GMIN = T(PhysicsConstants::JUNCTION_GMIN);
 
     // Linear Continuation Region
     if (arg > T(max_arg)) {
@@ -477,7 +477,7 @@ inline T zener_current(T vd, const ZenerParams<P>& p)
         }
     }
     
-    return i_fwd + i_rev + T(1e-12) * vd;  // ngspice GMIN: parallel junction conductance (same as diode_model_pair)
+    return i_fwd + i_rev + T(PhysicsConstants::JUNCTION_GMIN) * vd;  // as diode_model_pair
 }
 
 // ============================================================================

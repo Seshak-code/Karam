@@ -108,6 +108,10 @@ constexpr int MAX_NR_ITER = 50;
 /** Maximum PCG iterations */
 constexpr int MAX_PCG_ITER = 1000;
 
+/** ngspice GMIN: 1e-12 S in parallel with every PN junction (diode, BJT, zener),
+ *  in the AoS models, every SoA kernel and both KCL audits. Never node-to-ground. */
+constexpr double JUNCTION_GMIN = 1e-12;
+
 /** GMIN stepping stages */
 constexpr int GMIN_STEPS = 10;
 

@@ -19,7 +19,7 @@ using namespace acutesim::compute;
 
 void batchDiodePhysics_generic(DiodeTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
-    const double GMIN = 1e-12;
+    const double GMIN = PhysicsConstants::JUNCTION_GMIN;
     
     for (size_t i = 0; i < n; ++i) {
         int nA = tensor.node_a[i];
@@ -110,7 +110,7 @@ void batchMosfetPhysics_generic(MosfetTensor& tensor, const std::vector<double>&
 
 void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
-    const double GMIN = 1e-12;
+    const double GMIN = PhysicsConstants::JUNCTION_GMIN;
     
     for (size_t i = 0; i < n; ++i) {
         int nC = tensor.collectors[i];
@@ -139,13 +139,10 @@ void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& volta
             double exp_val = std::exp(arg_clamped);
             double i_base = Is * (exp_val - 1.0);
             double g_base = (Is / Vt) * exp_val;
-            // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
-            double g_clamped = g_base + GMIN;
-            
+            // continuation with the junction's own slope, plus the parallel GMIN —
+            // exactly diode_model_pair()
             double delta = std::max(0.0, v_j - Vcrit);
-            double i_ext = g_clamped * delta; // Use clamped slope
-            
-            return {i_base + i_ext + GMIN * v_j, g_clamped};
+            return {i_base + g_base * delta + GMIN * v_j, g_base + GMIN};
         };
         
         auto [i_f, g_f] = linear_continuation_diode(v_be);
@@ -182,12 +179,8 @@ void batchBJTPhysics_generic(BJTTensor& tensor, const std::vector<double>& volta
         tensor.g_ec[i] = -dIe_dVbc;
         tensor.g_eb[i] = dIe_dVbe + dIe_dVbc;
         tensor.g_ee[i] = -dIe_dVbe;
-        
-        // CRITICAL: Add GMIN to diagonal terms to prevent singular Jacobian
-        // This is essential for convergence when BJT is in cutoff/low current
-        tensor.g_cc[i] = std::max(tensor.g_cc[i], GMIN);
-        tensor.g_bb[i] = std::max(tensor.g_bb[i], GMIN);
-        tensor.g_ee[i] = std::max(tensor.g_ee[i], GMIN);
+        // (no max(g, GMIN) floors: the junction GMIN above keeps the matrix
+        // regular, and a floor would be conductance with no matching current)
     }
 }
 
