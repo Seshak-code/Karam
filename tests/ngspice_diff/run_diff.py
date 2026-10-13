@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Differential test: Karam (acutesim_engine_dump) vs ngspice on the same SPICE netlists.
+"""Differential test: TreeSPICE (acutesim_engine_dump) vs ngspice on the same SPICE netlists.
 Stdlib only. Usage: python3 tests/ngspice_diff/run_diff.py [-k substr] [--modes cpu,gpu] [-v]
 Exit status is non-zero if any netlist FAILs (or ngspice itself errors)."""
 import argparse, atexit, bisect, glob, math, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-# The standalone Karam build, else AcuteSim's build when Karam is its acutesim_engine/ submodule.
+# The standalone TreeSPICE build, else AcuteSim's build when TreeSPICE is its acutesim_engine/ submodule.
 ENGINE = next((p for p in (os.path.join(ROOT, "build", "acutesim_engine_dump"),
                            os.path.join(ROOT, "..", "build", "acutesim_engine", "acutesim_engine_dump"))
                if os.access(p, os.X_OK)), os.path.join(ROOT, "build", "acutesim_engine_dump"))

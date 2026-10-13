@@ -1,18 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ===========================================================================
-# Karam (acutesim_engine) — SPICE-equivalent circuit simulation engine
+# TreeSPICE (acutesim_engine) — SPICE-equivalent circuit simulation engine
 # ===========================================================================
 # Builds standalone (this directory is the top level: library, tools, tests)
-# or as a subdirectory of AcuteSim/CuteApp (git submodule at acutesim_engine/),
+# or as a subdirectory of OpenVLSI (git submodule at acutesim_engine/),
 # which consumes it through engine_api/ and the netlist data model.
 #
 # Build pattern: OBJECT → STATIC (future: SHARED/PLUGIN without recompilation)
 # ===========================================================================
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(Karam LANGUAGES C CXX)
-    set(KARAM_STANDALONE ON)
+    project(TreeSPICE LANGUAGES C CXX)
+    set(TREESPICE_STANDALONE ON)
     if(NOT CMAKE_BUILD_TYPE)
         set(CMAKE_BUILD_TYPE Release)
     endif()
@@ -167,7 +167,7 @@ target_link_libraries(acutesim_engine_dump PRIVATE acutesim_engine)
 #   python3 tests/ngspice_diff/run_diff.py — vs ngspice (needs ngspice on PATH)
 #   python3 tests/xyce_diff.py, tests/ibmpg_diff.py — need datasets/ (git-ignored)
 # ---------------------------------------------------------------------------
-if(KARAM_STANDALONE)
+if(TREESPICE_STANDALONE)
     enable_testing()
     foreach(t test_engine_fixes test_contraction_solver test_convergence_engine)
         add_executable(${t} tests/${t}.cpp)

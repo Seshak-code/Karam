@@ -1,13 +1,14 @@
 # TreeSPICE (Tensor Recursive Elimination Engine)
 
-**A SPICE-equivalent circuit simulation engine built on a contraction-tree direct solver.**
+**TREE — Tensor Recursive Elimination Engine.** A SPICE-equivalent circuit simulation engine built
+on a contraction-tree direct solver. (Formerly *Karam*.)
 
 > **Status: in development.** TreeSPICE solves standard SPICE netlists (DC, sweeps, transient,
 > AC, noise) and is checked against ngspice and Xyce on every change. It is not yet a
 > production simulator: device-model coverage stops at MOSFET level 1, and the GPU path is
 > still being built. Everything below marked *planned* or *open* does not exist yet.
 
-TreeSPICE is the simulation kernel of the AcuteSim / CuteApp design environment, developed here as a standalone library. Its long-term
+TreeSPICE is the simulation kernel of the OpenVLSI chip-design environment, developed here as a standalone library. Its long-term
 goal is one application where you can design an SoC, attach RAM, run firmware on it and see
 the program's output, with transistor-level simulation available wherever it matters.
 
@@ -240,7 +241,7 @@ build/acutesim_engine_dump <netlist> cpu tran <step> <stop>   # machine-readable
 
 The public API is `engine_api/`: `ISimulationEngine`, sessions, request/response DTOs and callbacks.
 The netlist data model (`netlist/circuit.h`, `netlist/spice_parser.h`) is also public for now.
-Everything else is internal and may change. AcuteSim/CuteApp consumes TreeSPICE as a git submodule
+Everything else is internal and may change. OpenVLSI consumes TreeSPICE as a git submodule
 at `acutesim_engine/`, using `add_subdirectory(acutesim_engine)` and linking `acutesim_engine`.
 
 ## Repository layout
