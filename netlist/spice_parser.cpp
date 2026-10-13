@@ -403,7 +403,11 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     };
     auto resolveBlock = [&](TensorBlock& blk) {
         for (const auto& m : blk.mosfets)
-            if (const ModelCard* c = card(m.modelName)) supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD"});
+            if (const ModelCard* c = card(m.modelName)) {
+                supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD"});
+                if (!(m.l - 2.0 * c->get("LD", 0.0) > 0.0))
+                    throw std::runtime_error(m.instanceName + ": L - 2*LD must be > 0");
+            }
         for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
             supported(c, {"IS", "N"});
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
