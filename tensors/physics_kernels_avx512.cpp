@@ -40,11 +40,6 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
     // Process 8 diodes at a time
     for (; i + 7 < n; i += 8) {
         // 1. Gather Voltages (Scatter/Gather is slow pre-IceLake, but necessary for indirect access)
-        // Load Anode/Cathode Indices
-        // tensor.anodes is int (32-bit). We need to load them into __m256i.
-        __m256i idx_a = _mm256_loadu_si256((__m256i*)&tensor.anodes[i]);
-        __m256i idx_c = _mm256_loadu_si256((__m256i*)&tensor.cathodes[i]);
-        
         // Manual Gather (Portable) vs _mm512_i32gather_pd
         // We do manual gather because voltages is std::vector checking bounds in loop might be needed
         // But for kernel speed we assume valid indices or 0.
@@ -57,8 +52,8 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         size_t v_size = voltages.size();
         
         for(int k=0; k<8; ++k) {
-            int ia = tensor.anodes[i+k];
-            int ic = tensor.cathodes[i+k];
+            int ia = tensor.node_a[i+k];
+            int ic = tensor.node_c[i+k];
             va_vals[k] = (ia > 0 && ia <= (int)v_size) ? v_ptr[ia-1] : 0.0;
             vc_vals[k] = (ic > 0 && ic <= (int)v_size) ? v_ptr[ic-1] : 0.0;
         }
@@ -114,8 +109,8 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
     
     // Process remaining elements (Tail)
     for (; i < n; ++i) {
-        int nA = tensor.anodes[i];
-        int nC = tensor.cathodes[i];
+        int nA = tensor.node_a[i];
+        int nC = tensor.node_c[i];
         
         double v_a = (nA > 0 && nA <= (int)voltages.size()) ? voltages[nA - 1] : 0.0;
         double v_c = (nC > 0 && nC <= (int)voltages.size()) ? voltages[nC - 1] : 0.0;
