@@ -235,24 +235,24 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   double smallestPivotOverall = 1e300;
   RegularizationInfo regulInfo;
 
-  // GMIN Stepping: Start with large parallel conductances, reduce each pass
-  // This prevents singular matrices for cold-start BJT circuits
-  // Use half-decade steps for better convergence at extreme temperatures
-  double gmin_factor = 1.0;
-  const int GMIN_STEPS = 19; // 1e-3 to 1e-12 in half-decade steps
-
-  // SPICE order: plain Newton at nominal GMIN first; the GMIN ladder runs only
-  // if that fails. (The ladder used to run unconditionally: ~19 full solves
-  // even for a linear circuit, which dominated large-circuit DC time.)
+  // SPICE order: plain Newton with NO node gmin first (junction GMIN in the
+  // device models keeps floating junction nodes referenced, like ngspice — a
+  // node-to-ground leak settles them differently: aac_10_bridge). Only if that
+  // fails, ngspice's dynamic gmin stepping (cktop.c dynamic_gmin): node gmin from
+  // 1e-3 down to 1e-12, the step factor grown after easy steps and shrunk after
+  // hard ones, and a failed step restarts from the last good solution with a
+  // smaller decrement; then a final plain Newton at gmin = 0. The fixed ladder it
+  // replaces gave up at the first failed step, so long inverter chains (>= 50
+  // stages), which ngspice solves this way, never converged.
+  constexpr int ITL1 = 100;               // ngspice: plain/final DC Newton limit
+  constexpr int ITL2 = MAX_NR_ITER;       // ngspice: per gmin step (50)
+  constexpr double GMIN_FACTOR = 10.0, GMIN_TARGET = 1e-12;
+  double gmin_factor = 0.0;               // current node gmin (0 = plain Newton)
+  double stepFactor = GMIN_FACTOR, oldGmin = 1e-2;
+  bool finalStep = true, gminSteppingUsed = false;
   const std::vector<double> seededGuess = voltageEstimate;
-  std::vector<int> gminSchedule{GMIN_STEPS - 1};
-  for (size_t si = 0; si < gminSchedule.size(); ++si) {
-    const int gmin_step = gminSchedule[si];
-    // Scale GMIN: start at 1e-3, reduce by sqrt(10) each step; the final step
-    // carries NO node gmin (junction GMIN in the device models keeps floating
-    // junction nodes referenced, like ngspice) — a node-to-ground leak settles
-    // them differently (aac_10_bridge).
-    gmin_factor = gmin_step == GMIN_STEPS - 1 ? 0.0 : std::pow(10.0, -(3.0 + gmin_step * 0.5));
+  std::vector<double> lastGood;
+  for (int si = 0; si < 1000; ++si) {  // ponytail: hard cap; ngspice has none (factor -> 1 ends it)
     bool gmin_converged = false;
 
     // Phase 2.9: Track regularization
@@ -263,7 +263,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     }
 
     int iteration = 0; // Declare outside loop for scope access
-    for (; iteration < MAX_NR_ITER; ++iteration) {
+    for (; iteration < (finalStep ? ITL1 : ITL2); ++iteration) {
       // Unified Stamping (Phase 1: Structural Abstraction)
       scheduler.schedule(netlist);
       matrixBuilder.clear();
@@ -403,8 +403,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
       // During GMIN stepping, we relax the KCL check because GMIN itself adds
       // residual. We only enforce strict KCL at the final (nominal GMIN) step.
-      double effective_kcl_tol =
-          (gmin_step == GMIN_STEPS - 1) ? PhysicsConstants::KCL_TOL : 1.0;
+      double effective_kcl_tol = finalStep ? PhysicsConstants::KCL_TOL : 1.0;
 
       if (checkConvergence(v_new, voltageEstimate, kcl_error,
                            effective_kcl_tol)) {
@@ -422,34 +421,42 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       total_iterations += iteration + 1;
     }
 
-    // Only the final GMIN step should mark the overall simulation as converged
-    if (gmin_step == GMIN_STEPS - 1 && gmin_converged) {
+    // Only a gmin = 0 solve marks the simulation as converged
+    if (finalStep && gmin_converged) {
       converged = true;
       break;
     }
+    if (finalStep && gminSteppingUsed) break;  // final solve after the ladder failed
 
-    // Direct attempt failed: restart from the seed and walk the full ladder
-    if (si == 0) {
-      voltageEstimate = seededGuess;
+    if (!gminSteppingUsed) {  // direct attempt failed: start from the seed
+      gminSteppingUsed = true;
+      voltageEstimate = lastGood = seededGuess;
       stagnationDetected = divergenceDetected = false;
-      for (int g = 0; g < GMIN_STEPS; ++g) gminSchedule.push_back(g);
-      continue;
-    }
-
-    // If we failed to converge a single GMIN step, check if we're making
-    // progress. If residual is within a reasonable range, continue stepping as
-    // the current solution may be a good starting point for the next (tighter)
-    // GMIN step.
-    if (!gmin_converged) {
-      if (final_kcl_error < 1.0) {
-        // Making progress — continue GMIN stepping
-        std::cerr << "  -> GMIN step did not fully converge (res="
-                  << final_kcl_error << "), continuing...\n";
+      gmin_factor = oldGmin / stepFactor;
+    } else if (gmin_converged) {
+      const int iters = iteration + 1;
+      lastGood = voltageEstimate;
+      if (gmin_factor <= GMIN_TARGET) {
+        gmin_factor = 0.0;
       } else {
-        break;
+        if (iters <= ITL2 / 4) stepFactor = std::min(stepFactor * std::sqrt(stepFactor), GMIN_FACTOR);
+        if (iters > 3 * ITL2 / 4) stepFactor = std::sqrt(stepFactor);
+        oldGmin = gmin_factor;
+        if (gmin_factor < stepFactor * GMIN_TARGET) {
+          stepFactor = gmin_factor / GMIN_TARGET;
+          gmin_factor = GMIN_TARGET;
+        } else {
+          gmin_factor /= stepFactor;
+        }
       }
+    } else if (stepFactor < 1.00005) {
+      gmin_factor = 0.0;  // ladder failed: ngspice still tries the final solve
+    } else {              // back off: smaller decrement from the last good point
+      stepFactor = std::sqrt(std::sqrt(stepFactor));
+      gmin_factor = oldGmin / stepFactor;
+      voltageEstimate = lastGood;
     }
-
+    finalStep = gmin_factor == 0.0;
   } // End GMIN stepping loop
 
   // Phase 2.9: Final per-node residual for RMS + worst-node tracking
@@ -513,7 +520,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   stats.error_detail = details;
   stats.method = "Newton-Raphson";
   stats.integrationMethod = ""; // DC has no integration
-  stats.gminSteppingUsed = gminSchedule.size() > 1;  // the direct attempt failed: ladder walked
+  stats.gminSteppingUsed = gminSteppingUsed;  // the direct attempt failed: ladder walked
   stats.sourceSteppingUsed = false; // Not implemented yet
   stats.failureType = failureType;
   stats.convergenceHistory = std::move(convergenceHistory);
