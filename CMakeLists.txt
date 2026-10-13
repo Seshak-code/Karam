@@ -51,6 +51,14 @@ target_compile_definitions(acutesim_engine_objects PRIVATE
     ACUTESIM_ENGINE_INTERNAL=1
 )
 
+# Tree levels factor on std::thread workers (math/contraction_solver.cpp). The
+# app defined this globally, so the standalone build silently ran serial.
+if(NOT EMSCRIPTEN)
+    find_package(Threads REQUIRED)
+    target_compile_definitions(acutesim_engine_objects PRIVATE ACUTESIM_THREADS_ENABLED)
+    target_link_libraries(acutesim_engine_objects PUBLIC Threads::Threads)
+endif()
+
 # ---------------------------------------------------------------------------
 # Include directories
 # ---------------------------------------------------------------------------
@@ -174,4 +182,14 @@ if(TREESPICE_STANDALONE)
         target_link_libraries(${t} PRIVATE acutesim_engine)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
+
+    # Solver benchmark vs SuiteSparse KLU (bench/klu_bench.py); built only if KLU is installed
+    # (plain find_*: Homebrew's SuiteSparse CMake package demands OpenMP, which Apple clang lacks)
+    find_path(KLU_INCLUDE_DIR klu.h PATH_SUFFIXES suitesparse)
+    find_library(KLU_LIBRARY klu)
+    if(KLU_INCLUDE_DIR AND KLU_LIBRARY)
+        add_executable(klu_bench bench/klu_bench.cpp)
+        target_include_directories(klu_bench PRIVATE ${KLU_INCLUDE_DIR})
+        target_link_libraries(klu_bench PRIVATE acutesim_engine ${KLU_LIBRARY})
+    endif()
 endif()
