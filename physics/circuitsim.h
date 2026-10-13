@@ -8,6 +8,7 @@
 #include <cmath>
 #include <complex>
 #include <functional>
+#include <type_traits>
 #include <vector>
 
 /*
@@ -447,11 +448,6 @@ public:
   std::function<void(int, double)> onConvergenceStep;
   std::function<void(float)>       onProgress;
 
-  // Phase 2.10: Expose cached pattern for AC solver fast-path
-
-  // Model card library pointer (set before stamping, for per-model parameter lookup)
-  const std::map<std::string, ModelCard>* currentModelCards = nullptr;
-
   CircuitSim() {
     integrator = std::make_unique<TrapezoidalIntegration>();
   }
@@ -584,33 +580,74 @@ public:
       stampTwoTerminalNonLinear(nA, nC, g_eq, i_src, mb, rhs);
   }
 
-  void stampMosfet(const Mosfet& m, int nD, int nG, int nS, int nB,
-                   const std::vector<double>& v, MatrixConstructor& mb, std::vector<double>& rhs) {
-      stampMos1({nD, nG, nS, nB}, mos1Params(m, currentModelCards), v, mb, rhs);
+  // MOSFET charge branches gs, gd, gb, bd, bs (mos1_charges) as terminal
+  // pairs (d=0, g=1, s=2, b=3): q flows into `from` and out of `to`.
+  static constexpr int mosFrom[5] = {1, 1, 1, 3, 3}, mosTo[5] = {2, 0, 3, 0, 2};
+
+  // Terminal currents (d, g, s, b) into a MOSFET at x: DC (mos1_currents) plus,
+  // in transient, the currents of its charges integrated from the last accepted
+  // step `st` (TRAP, else BE: ngspice NIintegrate). One definition for the Newton
+  // stamp (T = Dual), the KCL audit and the history update (next != null).
+  // ponytail: GEAR_2 (never chosen by runTransient) integrates the charges with BE.
+  template <typename T>
+  std::array<T, 4> mosCurrents(const std::array<T, 4> &x, const Mos1Params<double> &p,
+                               const BlockState::MosfetCharge *st, double h,
+                               BlockState::MosfetCharge *next = nullptr) const {
+      const auto dc = mos1_currents(x[0], x[1], x[2], x[3], p);
+      std::array<T, 4> I{dc.d, T(0.0), dc.s, dc.b};
+      if (!p.caps || !st || !(h > 1e-15) || !integrator) return I;
+      const auto c = mos1_charges(x[0], x[1], x[2], x[3], p, st->v[0], st->q, st->half);
+      if constexpr (std::is_same_v<T, double>)
+          if (next) {  // shift the voltage history (next may alias st)
+              std::copy(st->v[1], st->v[1] + 5, next->v[2]);
+              std::copy(st->v[0], st->v[0] + 5, next->v[1]);
+          }
+      const bool trap = integrator->getType() == IntegrationType::TRAPEZOIDAL;
+      for (int k = 0; k < 5; ++k) {
+          const T i = trap ? (2.0 / h) * (c.q[k] - st->q[k]) - st->i[k] : (c.q[k] - st->q[k]) / h;
+          I[mosFrom[k]] += p.polarity * i;
+          I[mosTo[k]] -= p.polarity * i;
+          if constexpr (std::is_same_v<T, double>)
+              if (next) { next->v[0][k] = c.v[k]; next->q[k] = c.q[k]; next->i[k] = i; }
+      }
+      if constexpr (std::is_same_v<T, double>)
+          if (next) std::copy(c.half, c.half + 3, next->half);
+      return I;
   }
 
-  // Newton stamp of mos1_currents() at v. The Jacobian comes from Dual (one pass
+  // Every MOSFET of the flattened netlist with its global nodes (d, g, s, b) and
+  // charge history (null when the block state is not sized, e.g. GUI-built).
+  template <class F> void forEachMosfet(const TensorNetlist &nl, F &&f) const {
+      int total = 0;
+      for (const auto &sl : branchSlots(nl, total))
+          for (size_t i = 0; i < sl.blk->mosfets.size(); ++i) {
+              const Mosfet &m = sl.blk->mosfets[i];
+              f(m, std::array<int, 4>{sl.map(m.drain), sl.map(m.gate), sl.map(m.source), sl.map(m.body)},
+                i < sl.st->mosfetState.size() ? &sl.st->mosfetState[i] : nullptr);
+          }
+  }
+
+  // Newton stamp of mosCurrents() at v. The Jacobian comes from Dual (one pass
   // per terminal), so it is the exact derivative of the currents the KCL audit
-  // checks: gm, gds, gmbs, both bulk junctions, either drain/source orientation.
+  // checks: gm, gds, gmbs, the junctions and charges, either orientation.
   void stampMos1(const std::array<int, 4>& n, const Mos1Params<double>& p,
-                 const std::vector<double>& v, MatrixConstructor& mb, std::vector<double>& rhs) {
+                 const BlockState::MosfetCharge* st, double h, const std::vector<double>& v) {
       auto V = [&](int k) { return n[k] > 0 && n[k] <= (int)v.size() ? v[n[k] - 1] : 0.0; };
-      double I[3] = {0, 0, 0}, J[3][4];
+      double I[4], J[4][4];
       for (int u = 0; u < 4; ++u) {
-          auto x = [&](int k) { return Dual<double>(V(k), k == u ? 1.0 : 0.0); };
-          const auto c = mos1_currents(x(0), x(1), x(2), x(3), p);
-          const Dual<double> cur[3] = {c.d, c.s, c.b};
-          for (int t = 0; t < 3; ++t) { I[t] = cur[t].val; J[t][u] = cur[t].grad; }
+          std::array<Dual<double>, 4> x;
+          for (int k = 0; k < 4; ++k) x[k] = Dual<double>(V(k), k == u ? 1.0 : 0.0);
+          const auto cur = mosCurrents(x, p, st, h);
+          for (int t = 0; t < 4; ++t) { I[t] = cur[t].val; J[t][u] = cur[t].grad; }
       }
-      const int row[3] = {n[0], n[2], n[3]};  // drain, source, bulk (the gate carries no current)
-      for (int t = 0; t < 3; ++t) {
-          if (row[t] <= 0) continue;
+      for (int t = 0; t < 4; ++t) {
+          if (n[t] <= 0) continue;
           double ieq = I[t];
           for (int u = 0; u < 4; ++u) {
               ieq -= J[t][u] * V(u);
-              if (n[u] > 0 && J[t][u] != 0.0) mb.add(row[t] - 1, n[u] - 1, J[t][u]);
+              if (n[u] > 0 && J[t][u] != 0.0) matrixBuilder.add(n[t] - 1, n[u] - 1, J[t][u]);
           }
-          rhs[row[t] - 1] -= ieq;
+          rhsVector[n[t] - 1] -= ieq;
       }
   }
 
@@ -1223,15 +1260,13 @@ public:
         addRes(q.emitter, -currents.Ie);
     }
 
-    // 3.55 MOSFET Audit (uses .model card parameters when available — must
-    // match the solver's stamping exactly, otherwise false KCL residuals)
-    for (const auto &m : netlist.globalBlock.mosfets) {
-        const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
-                                     mos1Params(m, &netlist.modelCards));
-        addRes(m.drain, -c.d);
-        addRes(m.source, -c.s);
-        addRes(m.body, -c.b);
-    }
+    // 3.55 MOSFETs, global block and every instance: the stamped mosCurrents()
+    forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &t,
+                               const BlockState::MosfetCharge *st) {
+        const auto I = mosCurrents<double>({getV(t[0]), getV(t[1]), getV(t[2]), getV(t[3])},
+                                           mos1Params(m), st, h);
+        for (int k = 0; k < 4; ++k) addRes(t[k], -I[k]);
+    });
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
     
@@ -1358,16 +1393,6 @@ public:
             double i_vccs = vccs.gm * v_ctrl;
             addRes(mapNode(vccs.outPos), -i_vccs);
             addRes(mapNode(vccs.outNeg), i_vccs);
-        }
-
-        // MOSFETs (Instance)
-        for (const auto &m : block.mosfets) {
-            const auto c = mos1_currents(getV(mapNode(m.drain)), getV(mapNode(m.gate)),
-                                         getV(mapNode(m.source)), getV(mapNode(m.body)),
-                                         mos1Params(m, &netlist.modelCards));
-            addRes(mapNode(m.drain), -c.d);
-            addRes(mapNode(m.source), -c.s);
-            addRes(mapNode(m.body), -c.b);
         }
 
         // BJTs (Instance)
@@ -1598,7 +1623,7 @@ public:
     // MOSFETs
     for (const auto &m : netlist.globalBlock.mosfets) {
       const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
-                                   mos1Params(m, &netlist.modelCards));
+                                   mos1Params(m));
       addRes(m.drain, -c.d);
       addRes(m.source, -c.s);
       addRes(m.body, -c.b);
@@ -1775,10 +1800,9 @@ public:
               const auto& m = netlist.globalBlock.mosfets[index];
 
               // dI/dp of the same mos1_currents() the solve used: Vth (VTO), W, L
-              const Mos1Params<double> p = mos1Params(m, &netlist.modelCards);
+              const Mos1Params<double> p = mos1Params(m);
               Mos1Params<Dual<double>> pd{p.polarity, p.beta, p.vto, p.lambda, p.gamma, p.phi, p.isat, p.vt};
-              const auto card = netlist.modelCards.find(m.modelName);
-              const double leff = m.l - 2.0 * (card != netlist.modelCards.end() ? card->second.get("LD", 0.0) : 0.0);
+              const double leff = m.l - 2.0 * m.card.ld;
               if (paramName == "Vth") pd.vto.grad = 1.0;
               if (paramName == "W") pd.beta.grad = p.beta / m.w;
               if (paramName == "L") pd.beta.grad = -p.beta / leff;
@@ -2112,10 +2136,7 @@ public:
     }
 
 
-    
-    // MOSFETs: Newton stamp of mos1_currents() (one definition, see stampMos1)
-    for (size_t i = 0; i < block.mosfets.size(); ++i)
-        stampMos1(block.mosfets.nodes[i], block.mosfets.params[i], v_guess, matrixBuilder, rhsVector);
+    // MOSFETs: stampAllElements() (stampMos1, both paths)
 
 
     
@@ -2226,12 +2247,6 @@ public:
       stampSchottky(sd, nA, nC, getV(nA) - getV(nC), temp_K, matrixBuilder, rhsVector);
     }
 
-    // 2. MOSFETs
-    for (const auto &m : block.mosfets) {
-      stampMosfet(m, mapNode(m.drain), mapNode(m.gate), mapNode(m.source), mapNode(m.body),
-                  v_guess, matrixBuilder, rhsVector);
-    }
-
     // 3. BJTs
     for (const auto &q : block.bjts) {
         int nC = mapNode(q.nodeCollector);
@@ -2271,9 +2286,6 @@ public:
    */
   void stampAllElements(const TensorNetlist &netlist, double h,
                         const std::vector<double> &v_guess, double time) {
-    // Set model card pointer for per-model parameter lookup
-    currentModelCards = &netlist.modelCards;
-
     if (execMode == ExecutionMode::LEGACY_AOS) {
         // A. Global Block
         auto identityMap = [](int n) { return n; };
@@ -2335,8 +2347,10 @@ public:
         }
     }
 
-    // Branch-current elements (V, L+K, E, F, H): one implementation for both paths
+    // Branch-current elements (V, L+K, E, F, H) and MOSFETs: one implementation for both paths
     stampBranchSystem(netlist, h, time);
+    forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
+                               const BlockState::MosfetCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
 
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it

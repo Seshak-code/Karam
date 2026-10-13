@@ -85,44 +85,34 @@ struct DiodeTensor {
     }
 };
 
-// ============================================================================
-// MOSFET TENSOR  
-// ============================================================================
-
-// One entry per device: nodes (1-based, 0 = ground) and the level-1 parameters
-// mos1_currents() evaluates. No per-kernel copies of the model any more.
-struct MosfetTensor {
-    std::vector<std::array<int, 4>> nodes;        // drain, gate, source, bulk
-    std::vector<Mos1Params<double>> params;
-
-    size_t size() const { return nodes.size(); }
-    void reserve(size_t n) { nodes.reserve(n); params.reserve(n); }
-    void clear() { nodes.clear(); params.clear(); }
-    void push(int d, int g, int s, int b, const Mos1Params<double>& p) {
-        nodes.push_back({d, g, s, b});
-        params.push_back(p);
-    }
-};
-
-// Level-1 parameters of a MOSFET instance from its .model card: SPICE defaults
-// for missing keys (KP 2e-5, VTO 0, LAMBDA 0, GAMMA 0, PHI 0.6, IS 1e-14, LD 0).
-// No card (only the GUI's Verilog-A path) keeps the engine's 200u/0.7 V/0.02 NMOS
-// and 100u/-0.7 V/0.02 PMOS, chosen by model name.
-inline Mos1Params<double> mos1Params(const Mosfet& m, const std::map<std::string, ModelCard>* cards) {
+// Level-1 parameters of a MOSFET instance from its parser-resolved .model card
+// (Mosfet::card). An unresolved card (the GUI's Verilog-A path) keeps the
+// engine's 200u/0.7 V/0.02 NMOS and 100u/-0.7 V/0.02 PMOS by model name, no caps.
+inline Mos1Params<double> mos1Params(const Mosfet& m) {
+    const auto& c = m.card;
     Mos1Params<double> p;
-    const ModelCard* c = nullptr;
-    if (cards) { auto it = cards->find(m.modelName); if (it != cards->end()) c = &it->second; }
-    const bool pmos = c ? c->type == "PMOS"
-                        : m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos;
+    const bool pmos = c.resolved ? c.pmos
+                                 : m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos;
     p.polarity = pmos ? -1.0 : 1.0;
-    const double kp = c ? c->get("KP", 2e-5) : (pmos ? 100e-6 : 200e-6);
-    p.vto    = c ? c->get("VTO", 0.0) : (pmos ? -0.7 : 0.7);
-    p.lambda = c ? c->get("LAMBDA", 0.0) : 0.02;
-    p.gamma  = c ? c->get("GAMMA", 0.0) : 0.0;
-    p.phi    = c ? c->get("PHI", 0.6) : 0.6;
-    const double mult = m.extra.mult;
-    p.beta = kp * m.w / (m.l - 2.0 * (c ? c->get("LD", 0.0) : 0.0)) * mult;
-    p.isat = (c ? c->get("IS", 1e-14) : 1e-14) * mult;
+    const double M = m.extra.mult, leff = m.l - 2.0 * c.ld;
+    if (!c.resolved) {
+        p.vto = pmos ? -0.7 : 0.7;
+        p.lambda = 0.02;
+        p.beta = (pmos ? 100e-6 : 200e-6) * m.w / m.l * M;
+        p.isat = 1e-14 * M;
+        return p;
+    }
+    p.vto = c.vto; p.lambda = c.lambda; p.gamma = c.gamma; p.phi = c.phi;
+    p.beta = c.kp * m.w / leff * M;
+    p.isat = c.is * M;
+    p.cox = c.tox > 0.0 ? 3.9 * 8.854214871e-12 / c.tox * m.w * leff * M : 0.0;
+    p.cgso = c.cgso * m.w * M; p.cgdo = c.cgdo * m.w * M; p.cgbo = c.cgbo * leff * M;
+    // CBD/CBS win over CJ * area (ngspice mos1temp)
+    p.czbd = (c.cbd > 0.0 ? c.cbd : c.cj * m.geo.ad) * M; p.czbdsw = c.cjsw * m.geo.pd * M;
+    p.czbs = (c.cbs > 0.0 ? c.cbs : c.cj * m.geo.as) * M; p.czbssw = c.cjsw * m.geo.ps * M;
+    p.mj = c.mj; p.mjsw = c.mjsw; p.pb = c.pb; p.fc = c.fc;
+    p.caps = p.cox > 0.0 || p.cgso > 0.0 || p.cgdo > 0.0 || p.cgbo > 0.0 ||
+             p.czbd > 0.0 || p.czbdsw > 0.0 || p.czbs > 0.0 || p.czbssw > 0.0;
     return p;
 }
 
@@ -345,7 +335,6 @@ struct TensorizedBlock {
     VoltageSourceTensor voltageSources;
     CurrentSourceTensor currentSources;
     DiodeTensor diodes;
-    MosfetTensor mosfets;
     BJTTensor bjts;
     
     // Dynamic Models (Type-Erased)
@@ -363,7 +352,6 @@ struct TensorizedBlock {
         voltageSources.clear();
         currentSources.clear();
         diodes.clear();
-        mosfets.clear();
         bjts.clear();
         
         // Clear dynamic tensors
@@ -389,16 +377,11 @@ struct TensorizedBlock {
 // Forward declaration: TensorBlock is defined in circuit.h
 struct TensorBlock;
 
-// Forward declaration
-struct ModelCard;
-
 /**
  * Convert a TensorBlock (AoS) to TensorizedBlock (SoA).
  * This enables efficient batch processing on the solver side.
- * @param modelCards Optional pointer to model card library for per-device parameter lookup.
  */
-TensorizedBlock tensorizeBlock(const struct TensorBlock& block,
-                                const std::map<std::string, ModelCard>* modelCards = nullptr);
+TensorizedBlock tensorizeBlock(const struct TensorBlock& block);
 
 /**
  * Convert a full TensorNetlist (Hierarchical) to a single TensorizedBlock (Flat SoA).

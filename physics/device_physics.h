@@ -3,6 +3,7 @@
 #include "physics_constants.h"
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 /*
  * device_physics.h - Pure Constitutive Equations for Semiconductor Devices
@@ -205,7 +206,25 @@ struct Mos1Params {
     P lambda = 0.0, gamma = 0.0, phi = 0.6;
     P isat = 1e-14;     // bulk junction saturation current, IS * M
     P vt = PhysicsConstants::V_THERMAL_300K;
+    // Charge storage (mos1_charges), scaled by W, Leff and M like ngspice mos1temp
+    bool caps = false;                       // any capacitance below is non-zero
+    P cox = 0.0;                             // Meyer: COX * W * Leff * M (0 without TOX)
+    P cgso = 0.0, cgdo = 0.0, cgbo = 0.0;    // overlap: CGSO*W*M, CGDO*W*M, CGBO*Leff*M
+    P czbd = 0.0, czbdsw = 0.0;              // bulk-drain zero-bias bottom, sidewall
+    P czbs = 0.0, czbssw = 0.0;              // bulk-source
+    P mj = 0.5, mjsw = 0.5, pb = 0.8, fc = 0.5;
 };
+
+// Threshold (type domain) at bulk bias vbx: VBS in normal mode, VBD reversed.
+template <typename T, typename P>
+inline T mos1_von(T vbx, const Mos1Params<P>& p)
+{
+    using std::sqrt;
+    const P sphi = sqrt(p.phi);
+    T sarg = vbx <= P(0.0) ? sqrt(p.phi - vbx) : sphi - vbx / (2.0 * sphi);
+    if (sarg < P(0.0)) sarg = T(0.0);
+    return p.polarity * p.vto + p.gamma * (sarg - sphi);
+}
 
 template <typename T> struct Mos1Currents { T d, s, b; };
 
@@ -221,11 +240,7 @@ inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>
     const T cbd = diode_model_pair(vbd, junction).first;
 
     const bool normal = vds >= P(0.0);          // mode: the higher terminal is the drain
-    const T vbx = normal ? vbs : vbd;
-    const P sphi = sqrt(p.phi);
-    T sarg = vbx <= P(0.0) ? sqrt(p.phi - vbx) : sphi - vbx / (2.0 * sphi);
-    if (sarg < P(0.0)) sarg = T(0.0);
-    const T vgst = (normal ? vgs : vgd) - (type * p.vto + p.gamma * (sarg - sphi));
+    const T vgst = (normal ? vgs : vgd) - mos1_von(normal ? vbs : vbd, p);
     const T vdsm = normal ? vds : -vds;         // |Vds|
     T cdrain(0.0);
     if (vgst > P(0.0)) {
@@ -235,6 +250,77 @@ inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>
     }
     const T chan = normal ? cdrain : -cdrain;   // into the drain terminal
     return {type * (chan - cbd), type * (-chan - cbs), type * (cbs + cbd)};
+}
+
+// Meyer gate half-capacitances {gs, gd, gb} (ngspice DEVqmeyer). vgs/vgd are in
+// the device's orientation (the caller swaps them, and the results, when reversed).
+template <typename T, typename P>
+inline std::array<T, 3> mos1_meyer(T vgs, T vgd, T von, T vdsat, P phi, P cox)
+{
+    const T vgst = vgs - von, vds = vgs - vgd;
+    if (vdsat < 0.025) vdsat = T(0.025);  // MAGIC_VDS
+    if (vgst <= -phi) return {T(0.0), T(0.0), T(cox / 2)};
+    if (vgst <= -phi / 2) return {T(0.0), T(0.0), -vgst * cox / (2 * phi)};
+    const T full = vgst <= P(0.0) ? vgst * cox / (1.5 * phi) + cox / 3 : T(cox / 3);
+    const T gb = vgst <= P(0.0) ? -vgst * cox / (2 * phi) : T(0.0);
+    if (vds >= vdsat) return {full, T(0.0), gb};
+    const T vddif = 2.0 * vdsat - vds, vddif1 = vdsat - vds, vddif2 = vddif * vddif;
+    return {full * (1.0 - vddif1 * vddif1 / vddif2), full * (1.0 - vdsat * vdsat / vddif2), gb};
+}
+
+// Depletion charge of a junction with zero-bias capacitance cz and grading m:
+// C = cz (1 - v/pb)^-m below fc*pb, linearised above it (ngspice f2/f3/f4).
+template <typename T, typename P>
+inline T depletion_charge(T v, P cz, P m, P pb, P fc)
+{
+    using std::exp; using std::log;
+    if (cz == P(0.0)) return T(0.0);
+    const P v0 = fc * pb, a0 = 1.0 - fc;
+    if (v < v0) return pb * cz * (1.0 - exp((1.0 - m) * log(1.0 - v / pb))) / (1.0 - m);
+    const P c0 = cz * exp(-m * log(a0)), c1 = c0 * m / (pb * a0);
+    const P q0 = pb * cz * (1.0 - exp((1.0 - m) * log(a0))) / (1.0 - m);
+    const T dv = v - v0;
+    return q0 + dv * (c0 + 0.5 * c1 * dv);
+}
+
+// Charges of the five capacitive branches gs, gd, gb, bd, bs (type domain,
+// ngspice mos1load). The Meyer gate charges advance from the previous accepted
+// step (vPrev, qPrev, halfPrev) by C*dv, C = half-capacitance now + then +
+// overlap; the bulk junctions carry their depletion charge. half: the Meyer
+// half-capacitances at v (the next step's halfPrev).
+template <typename T> struct Mos1Charges { T v[5], q[5], half[3]; };
+
+// Branch voltages gs, gd, gb, bd, bs (type domain) of the charges above.
+template <typename T>
+inline std::array<T, 5> mos1_branches(T vd, T vg, T vs, T vb, double type)
+{
+    return {type * (vg - vs), type * (vg - vd), type * (vg - vb), type * (vb - vd), type * (vb - vs)};
+}
+
+template <typename T>
+inline Mos1Charges<T> mos1_charges(T vd, T vg, T vs, T vb, const Mos1Params<double>& p,
+                                   const double* vPrev, const double* qPrev, const double* halfPrev)
+{
+    const double type = p.polarity;
+    Mos1Charges<T> c;
+    const auto br = mos1_branches(vd, vg, vs, vb, type);
+    for (int k = 0; k < 5; ++k) c.v[k] = br[k];
+    const T vgs = br[0], vgd = br[1], vbd = br[3], vbs = br[4];
+    const bool normal = vgs >= vgd;  // vds >= 0
+    const T von = mos1_von(normal ? vbs : vbd, p);
+    T vdsat = (normal ? vgs : vgd) - von;
+    if (vdsat < 0.0) vdsat = T(0.0);
+    const auto h = normal ? mos1_meyer(vgs, vgd, von, vdsat, p.phi, p.cox)
+                          : mos1_meyer(vgd, vgs, von, vdsat, p.phi, p.cox);
+    c.half[0] = normal ? h[0] : h[1];
+    c.half[1] = normal ? h[1] : h[0];
+    c.half[2] = h[2];
+    const double ov[3] = {p.cgso, p.cgdo, p.cgbo};
+    for (int k = 0; k < 3; ++k)
+        c.q[k] = qPrev[k] + (c.half[k] + halfPrev[k] + ov[k]) * (c.v[k] - vPrev[k]);
+    c.q[3] = depletion_charge(vbd, p.czbd, p.mj, p.pb, p.fc) + depletion_charge(vbd, p.czbdsw, p.mjsw, p.pb, p.fc);
+    c.q[4] = depletion_charge(vbs, p.czbs, p.mj, p.pb, p.fc) + depletion_charge(vbs, p.czbssw, p.mjsw, p.pb, p.fc);
+    return c;
 }
 
 // ============================================================================

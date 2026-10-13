@@ -611,6 +611,11 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     }
   };
   update(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
+  // MOSFET charges: the state mosCurrents() integrated at v (netlist is non-const here)
+  forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::MosfetCharge *st) {
+    if (st) mosCurrents<double>({getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3])}, mos1Params(m), st, h,
+                                const_cast<BlockState::MosfetCharge *>(st));
+  });
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);
@@ -650,6 +655,17 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     }
   };
   seed(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
+  // MOSFET charges at x, zero current (Meyer charges count from here: only their change matters)
+  forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::MosfetCharge *st) {
+    if (!st) return;
+    const double zero[5] = {};
+    const auto c = mos1_charges(getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3]), mos1Params(m), zero, zero, zero);
+    auto *s = const_cast<BlockState::MosfetCharge *>(st);  // netlist is non-const here
+    *s = {};
+    for (auto &vh : s->v) std::copy(c.v, c.v + 5, vh);
+    std::copy(c.q, c.q + 5, s->q);
+    std::copy(c.half, c.half + 3, s->half);
+  });
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);
@@ -767,6 +783,26 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
     for (size_t a = 0; a < flux.size(); ++a)
       for (auto [j, Laj] : flux[a]) addC(sl.ind + (int)a, sl.ind + j, -Laj);
   }
+  // MOSFETs: C_tu = dQ_t/dV_u of the terminal charges at the operating point
+  // (Meyer 2*half + overlap, junction dq/dv: ngspice mos1acld), from Dual.
+  forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::MosfetCharge *) {
+    const auto p = mos1Params(m);
+    if (!p.caps) return;
+    auto V = [&](int k) { return n[k] > 0 ? lastSolution_[n[k] - 1] : 0.0; };
+    const double zero[5] = {};
+    const auto op = mos1_charges(V(0), V(1), V(2), V(3), p, zero, zero, zero);
+    for (int u = 0; u < 4; ++u) {
+      std::array<Dual<double>, 4> x;
+      for (int k = 0; k < 4; ++k) x[k] = Dual<double>(V(k), k == u ? 1.0 : 0.0);
+      const auto c = mos1_charges(x[0], x[1], x[2], x[3], p, op.v, zero, op.half);
+      double Q[4] = {};
+      for (int k = 0; k < 5; ++k) {
+        Q[mosFrom[k]] += p.polarity * c.q[k].grad;
+        Q[mosTo[k]] -= p.polarity * c.q[k].grad;
+      }
+      for (int t = 0; t < 4; ++t) if (Q[t] != 0.0) addC(n[t] - 1, n[u] - 1, Q[t]);
+    }
+  });
   return true;
 }
 
@@ -869,7 +905,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
       const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source), b = sl.map(m.body);
       // channel gm = dI_drain/dV_gate (the bulk junctions do not see the gate)
       const double gm = mos1_currents(Dual<double>(V(d)), Dual<double>(V(g), 1.0), Dual<double>(V(s)),
-                                      Dual<double>(V(b)), mos1Params(m, &netlist.modelCards)).d.grad;
+                                      Dual<double>(V(b)), mos1Params(m)).d.grad;
       gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
     }
     for (const auto &j : blk.jfets) {

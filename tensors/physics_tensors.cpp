@@ -145,8 +145,7 @@ void batchBJTPhysics(BJTTensor& tensor, const std::vector<double>& voltages) {
 // AOS -> SOA CONVERSION
 // ============================================================================
 
-TensorizedBlock tensorizeBlock(const TensorBlock& block,
-                               const std::map<std::string, ModelCard>* modelCards) {
+TensorizedBlock tensorizeBlock(const TensorBlock& block) {
     TensorizedBlock result;
     
     // Convert Resistors
@@ -177,12 +176,6 @@ TensorizedBlock tensorizeBlock(const TensorBlock& block,
                            d.temperature_K);
     }
     
-    // Convert MOSFETs (with model card lookup)
-    result.mosfets.reserve(block.mosfets.size());
-    for (const auto& m : block.mosfets) {
-        result.mosfets.push(m.drain, m.gate, m.source, m.body, mos1Params(m, modelCards));
-    }
-    
     // Convert BJTs
     result.bjts.reserve(block.bjts.size());
     for (const auto& q : block.bjts) {
@@ -207,18 +200,15 @@ TensorizedBlock tensorizeBlock(const TensorBlock& block,
 
 TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
     // 1. Start with the flattened global block (standard components)
-    const auto* cards = netlist.modelCards.empty() ? nullptr : &netlist.modelCards;
-    TensorizedBlock result = tensorizeBlock(netlist.globalBlock, cards);
+    TensorizedBlock result = tensorizeBlock(netlist.globalBlock);
     
     // -------------------------------------------------------------------------
     // BUCKETING STAGING AREA: Group devices by model to maximize SIMD efficiency
     // -------------------------------------------------------------------------
     struct DiodeJob { int a, c; double is, n, vt; std::string model; };
-    struct MosfetJob { int d, g, s, b; Mos1Params<double> p; };
     struct BjtJob { int c, b, e; double is, bf, br, vt; bool npn; std::string model; };
 
     std::map<std::string, std::vector<DiodeJob>> diodeBuckets;
-    std::map<std::string, std::vector<MosfetJob>> mosfetBuckets;
     std::map<std::string, std::vector<BjtJob>> bjtBuckets;
 
     std::map<std::string, size_t> typeCounts;
@@ -323,11 +313,6 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
             diodeBuckets[d.modelName].push_back({remap(d.anode), remap(d.cathode), 
                                                 d.saturationCurrent_I_S_A, d.emissionCoefficient_N, vts, d.modelName});
         }
-        // Collect MOSFETs
-        for (const auto& m : block.mosfets) {
-            mosfetBuckets[m.modelName].push_back({remap(m.drain), remap(m.gate), remap(m.source), remap(m.body),
-                                                 mos1Params(m, cards)});
-        }
         // Collect BJTs
         for (const auto& q : block.bjts) {
             double vts = q.thermalVoltage_V_T_V * (netlist.environment.ambient_temp_K / 300.15);
@@ -370,9 +355,6 @@ TensorizedBlock tensorizeNetlist(const TensorNetlist& netlist) {
     // 3. Flush Buckets (Deterministic sort by model name)
     for (auto& [model, bucket] : diodeBuckets) {
         for (auto& d : bucket) result.diodes.push(d.a, d.c, d.is, d.n, d.vt, 0.0, netlist.environment.ambient_temp_K);
-    }
-    for (auto& [model, bucket] : mosfetBuckets) {
-        for (auto& m : bucket) result.mosfets.push(m.d, m.g, m.s, m.b, m.p);
     }
     for (auto& [model, bucket] : bjtBuckets) {
         for (auto& q : bucket) result.bjts.push(q.c, q.b, q.e, q.is, q.bf, q.br, q.vt, q.npn, netlist.environment.ambient_temp_K);

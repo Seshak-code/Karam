@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <algorithm>
 #include <deque>
+#include <iterator>
 #include "../netlist/circuit.h"
+#include "../tensors/physics_tensors.h"
 #include "../math/integration_method.h"
 
 /**
@@ -96,8 +98,8 @@ public:
         const double t3 = (stepHistory_.size() > 1) ? t2 - stepHistory_[1] : t2;
 
         // y0 = value now, h[0..2] = previous accepted values (most recent first)
-        auto lteOf = [&](double y0, const std::vector<double>& h) -> double {
-            if (h.size() < needSteps + 1) return 0.0;
+        auto lteOf = [&](double y0, const auto& h) -> double {
+            if (std::size(h) < needSteps + 1) return 0.0;
             double d01 = (y0 - h[0]) / (t0 - t1);
             double d12 = (h[0] - h[1]) / (t1 - t2);
             double d012 = (d01 - d12) / (t0 - t2);
@@ -114,7 +116,7 @@ public:
             return v_curr[nodeIdx - 1];
         };
 
-        // Capacitors and inductors of the global block AND every subcircuit
+        // Capacitors, inductors and MOSFET charge branches of the global block AND every subcircuit
         // instance (instance devices were skipped, so hierarchical designs ran
         // with no LTE step control). Inductors use branch voltage: the solver
         // does not write back inductor current history, so hist.i is unusable.
@@ -137,6 +139,23 @@ public:
                     result.maxLTE = lte_v;
                     result.worstElementIndex = static_cast<int>(i);
                     result.worstIsCapacitor = false;
+                }
+            }
+            for (size_t i = 0; i < blk.mosfets.size() && i < st.mosfetState.size(); ++i) {
+                const auto& m = blk.mosfets[i];
+                const auto p = mos1Params(m);
+                if (!p.caps) continue;  // no charge, no history
+                const auto& vh = st.mosfetState[i].v;
+                const auto br = mos1_branches(getV(mapNode(m.drain)), getV(mapNode(m.gate)),
+                                              getV(mapNode(m.source)), getV(mapNode(m.body)), p.polarity);
+                for (int k = 0; k < 5; ++k) {
+                    const double hist[3] = {vh[0][k], vh[1][k], vh[2][k]};
+                    const double lte_v = lteOf(br[k], hist);
+                    if (lte_v > result.maxLTE) {
+                        result.maxLTE = lte_v;
+                        result.worstElementIndex = static_cast<int>(i);
+                        result.worstIsCapacitor = true;
+                    }
                 }
             }
         };

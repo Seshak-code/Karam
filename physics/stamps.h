@@ -166,42 +166,6 @@ inline void stampInductorTrapezoidal(int nodeI, int nodeJ, double L, double h,
 
 
 
-/**
- * stampMosfet - 4-Terminal PDK-Ready MOSFET Stamp
- * Supports Body Effect (Bulk terminal) and NR Linearization.
- * 
- * i_d = I_eq + gm*vgs + gmb*vbs + gds*vds
- * I_eq = I_drain_actual - (gm*vgs_op + gmb*vbs_op + gds*vds_op)
- */
-inline void stampMosfet(int d, int g, int s, int b, 
-                        double gm, double gmb, double gds, double i_eq, 
-                        MatrixConstructor& mat, std::vector<double>& rhs) 
-{
-    auto add = [&](int r, int c, double val) 
-    {
-        if (r != 0 && c != 0) 
-            mat.add(r-1, c-1, val);
-    };
-    
-    // 1. Conductance Matrix (G)
-    
-    // gm (VGS control)
-    add(d, g, gm);   add(d, s, -gm);
-    add(s, g, -gm);  add(s, s, gm);
-    
-    // gmb (VBS control)
-    add(d, b, gmb);  add(d, s, -gmb);
-    add(s, b, -gmb); add(s, s, gmb);
-    
-    // gds (VDS control)
-    add(d, d, gds);  add(d, s, -gds);
-    add(s, d, -gds); add(s, s, gds);
-    
-    // 2. RHS Vector (Equivalent Current)
-    if (d != 0) rhs[d-1] -= i_eq; // current leaving drain
-    if (s != 0) rhs[s-1] += i_eq; // current entering source
-}
-
 inline void stampDiode(int anode, int cathode, double g_d, double i_d, double v_d, 
                        MatrixConstructor& mat, std::vector<double>& rhs) {
     // Linearization: I = I_eq + G_eq * V

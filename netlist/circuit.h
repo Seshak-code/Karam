@@ -559,8 +559,20 @@ struct Mosfet {
     // Advanced Params
     struct Params {
         int nf = 1;      // Number of fingers
-        double mult = 1.0;  // Multiplier (M=): scales beta and the junctions
+        double mult = 1.0;  // Multiplier (M=): scales beta, the junctions and every capacitance
     } extra;
+
+    // SPICE level-1 .model values, resolved by the parser (SPICE defaults for
+    // missing keys). resolved = false (the GUI's Verilog-A path, no cards):
+    // engine defaults chosen by model name, no capacitances.
+    struct Card {
+        bool resolved = false, pmos = false;
+        double kp = 2e-5, vto = 0.0, lambda = 0.0, gamma = 0.0, phi = 0.6, is = 1e-14, ld = 0.0;
+        double tox = 0.0;                                   // > 0: Meyer gate capacitance
+        double cgso = 0.0, cgdo = 0.0, cgbo = 0.0;          // overlap [F/m]
+        double cbd = 0.0, cbs = 0.0, cj = 0.0, cjsw = 0.0;  // bulk junctions [F, F/m^2, F/m]
+        double mj = 0.5, mjsw = 0.33, pb = 0.8, fc = 0.5;
+    } card;
 
     // Noise Parameters
     double KF = 0.0;     // Flicker noise coefficient
@@ -1090,12 +1102,18 @@ struct BlockState {
         void resize(size_t n) { v.resize(n, 0.0); i.resize(n, 0.0); }
     };
 
-    struct MosfetOP { double vgs=0, vds=0, vbs=0; };
+    // MOSFET charge history after the last accepted step, per branch
+    // gs, gd, gb (Meyer + overlap) and bd, bs (bulk junctions), actual polarity.
+    struct MosfetCharge {
+        double v[3][5] = {};  // branch voltages, last three accepted steps (v[0] latest; LTE)
+        double q[5] = {}, i[5] = {};
+        double half[3] = {};  // Meyer half-capacitances gs, gd, gb (ngspice averages two)
+    };
 
     std::vector<History> capacitorState;
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
-    std::vector<MosfetOP> mosfetState;
+    std::vector<MosfetCharge> mosfetState;
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
 

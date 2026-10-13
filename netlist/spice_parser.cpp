@@ -402,11 +402,27 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
         }
     };
     auto resolveBlock = [&](TensorBlock& blk) {
-        for (const auto& m : blk.mosfets)
+        for (auto& m : blk.mosfets)
             if (const ModelCard* c = card(m.modelName)) {
-                supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD"});
-                if (!(m.l - 2.0 * c->get("LD", 0.0) > 0.0))
+                supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
+                              "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC"});
+                auto& k = m.card;
+                k.resolved = true;
+                k.pmos = c->type == "PMOS";
+                k.tox = c->get("TOX", 0.0);
+                // No KP with TOX: KP = UO[cm^2/Vs] * COX (ngspice mos1temp)
+                k.kp = c->get("KP", k.tox > 0.0 ? c->get("UO", c->get("U0", 600.0)) * 1e-4 * 3.9 * 8.854214871e-12 / k.tox
+                                                : 2e-5);
+                k.vto = c->get("VTO", 0.0); k.lambda = c->get("LAMBDA", 0.0); k.gamma = c->get("GAMMA", 0.0);
+                k.phi = c->get("PHI", 0.6); k.is = c->get("IS", 1e-14); k.ld = c->get("LD", 0.0);
+                k.cgso = c->get("CGSO", 0.0); k.cgdo = c->get("CGDO", 0.0); k.cgbo = c->get("CGBO", 0.0);
+                k.cbd = c->get("CBD", 0.0); k.cbs = c->get("CBS", 0.0); k.cj = c->get("CJ", 0.0);
+                k.cjsw = c->get("CJSW", 0.0); k.mj = c->get("MJ", 0.5); k.mjsw = c->get("MJSW", 0.5);
+                k.pb = c->get("PB", 0.8); k.fc = c->get("FC", 0.5);
+                if (!(m.l - 2.0 * k.ld > 0.0))
                     throw std::runtime_error(m.instanceName + ": L - 2*LD must be > 0");
+                if (!(k.mj < 1.0 && k.mjsw < 1.0 && k.pb > 0.0 && k.fc < 1.0))
+                    throw std::runtime_error("model " + c->name + ": needs MJ, MJSW < 1, PB > 0, FC < 1");
             }
         for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
             supported(c, {"IS", "N"});
@@ -642,8 +658,8 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.modelName = tok[5];
     m.w = m.l = 100e-6;  // SPICE DEFW / DEFL
 
-    // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS/NRD/NRS only act
-    // through CJ/CJSW/JS/RSH, which the model check still rejects.
+    // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS act through CJ/CJSW;
+    // NRD/NRS only through RSH, which the model check rejects.
     for (size_t i = 6; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
