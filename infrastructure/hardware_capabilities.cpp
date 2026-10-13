@@ -76,6 +76,10 @@ static HardwareCapabilities::SIMDTier detectSIMDTier() {
 
 static void probeGPU(HardwareCapabilities& caps) {
 #ifdef ACUTESIM_GPU_PROBE_AVAILABLE
+    // The wgpu* C calls below dispatch through dawn_proc's table, which is null
+    // until set. AcuteSim's main() probes before GPUContextManager::initialize()
+    // installs it, so the first wgpuAdapterGetInfo jumped to address 0.
+    dawnProcSetProcs(&dawn::native::GetProcs());
     dawn::native::Instance dawnInst;
     // EnumerateAdapters replaces DiscoverDefaultAdapters+GetAdapters (Dawn chromium/6943+)
     auto adapters = dawnInst.EnumerateAdapters(); // uses default wgpu::RequestAdapterOptions* = nullptr
