@@ -1,6 +1,6 @@
 # ngspice differential tests
 
-Runs every `netlists/*.cir` through Karam (`acutesim_engine_dump`, cpu and gpu modes) and through
+Runs every `netlists/*.cir` through TreeSPICE (`acutesim_engine_dump`, cpu and gpu modes) and through
 ngspice, then compares all top-level node voltages. Statuses: PASS, FAIL, SKIPPED (an analysis form the
 harness cannot emulate), ENGINE-UNSUPPORTED (engine rejects the card, e.g. F/H/T/PWL/EXP/AREA). Exit code is 1 on any FAIL.
 

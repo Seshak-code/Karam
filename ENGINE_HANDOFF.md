@@ -1,6 +1,6 @@
-# Engine Handoff — Karam (acutesim_engine)
+# Engine Handoff — TreeSPICE (acutesim_engine; formerly Karam)
 
-*Since 2026-10-13 Karam is a standalone repository. CuteApp consumes it as the submodule `acutesim_engine/`.*
+*Since 2026-10-13 TreeSPICE (then named Karam) is a standalone repository. OpenVLSI (formerly CuteApp) consumes it as the submodule `acutesim_engine/`.*
 
 *Written 2026-10-12 at the end of the engine-review session. Read this first, then `CLAUDE.md`,
 then the two Roadmap sections it points to. Everything below was verified by running it.*
@@ -164,9 +164,9 @@ Key invariants (each was a real bug when broken):
 
 ## 3. How to build and verify (run all of these after any engine change)
 
-Karam is its own repository (Seshak-code/Karam). AcuteSim/CuteApp mounts it as the git submodule
-`acutesim_engine/`. Engine work happens here: commit and push in Karam, then bump the submodule
-pointer in CuteApp and run CuteApp's integration suites there.
+TreeSPICE is its own repository (Seshak-code/TreeSPICE). OpenVLSI mounts it as the git submodule
+`acutesim_engine/`. Engine work happens here: commit and push in TreeSPICE, then bump the submodule
+pointer in OpenVLSI and run its integration suites there.
 
 ```bash
 cmake -S . -B build && cmake --build build -j10
@@ -175,7 +175,7 @@ TMPDIR=/private/tmp/claude-502 python3 tests/ngspice_diff/run_diff.py   # ~2 min
 python3 tests/xyce_diff.py              # 0 FAIL expected; needs datasets/xyce
 python3 tests/ibmpg_diff.py -k ibmpg2   # needs datasets/ibmpg
 ```
-Integration suites that need the app layers stay in CuteApp: run them there with the submodule at the
+Integration suites that need the app layers stay in OpenVLSI: run them there with the submodule at the
 new commit. They include test_regression (the CI gate, run from the CuteApp root),
 test_engine_parity, test_hierarchy_headless, test_std_cells, test_soa_bridge, test_physics_kernels,
 test_headless_orchestrator, test_analysis_registry, test_determinism_xclient, test_veriloga_roundtrip,

@@ -1,21 +1,22 @@
-# Karam
+# TreeSPICE
 
-**A SPICE-equivalent circuit simulation engine built on a contraction-tree direct solver.**
+**TREE — Tensor Recursive Elimination Engine.** A SPICE-equivalent circuit simulation engine built
+on a contraction-tree direct solver. (Formerly *Karam*.)
 
-> **Status: in development.** Karam solves standard SPICE netlists (DC, sweeps, transient,
+> **Status: in development.** TreeSPICE solves standard SPICE netlists (DC, sweeps, transient,
 > AC, noise) and is checked against ngspice and Xyce on every change. It is not yet a
 > production simulator: device-model coverage stops at MOSFET level 1, and the GPU path is
 > still being built. Everything below marked *planned* or *open* does not exist yet.
 
-Karam is the simulation kernel of the AcuteSim / CuteApp design environment, developed here as a standalone library. Its long-term
+TreeSPICE is the simulation kernel of the OpenVLSI chip-design environment, developed here as a standalone library. Its long-term
 goal is one application where you can design an SoC, attach RAM, run firmware on it and see
 the program's output, with transistor-level simulation available wherever it matters.
 
 ---
 
-## What Karam is
+## What TreeSPICE is
 
-Karam solves the same equations as SPICE. Each Newton step of a modified nodal analysis
+TreeSPICE solves the same equations as SPICE. Each Newton step of a modified nodal analysis
 (MNA) system is linearised and solved exactly. The **way** that linear system is solved is
 the project's core idea.
 
@@ -44,14 +45,14 @@ The circuit graph is split recursively by nested dissection into a tree:
 In numerical linear algebra this is a **multifrontal factorization**. It is also the same
 object as a tensor-network contraction tree: both are a tree decomposition of the circuit
 graph, and cotengra-style contraction planners use the same recursive bipartitioning as
-nested dissection. Karam schedules elimination as a contraction tree. That tree is the
+nested dissection. TreeSPICE schedules elimination as a contraction tree. That tree is the
 backbone every scaling technique on the roadmap builds on: latency reuse, isomorphism
 reuse, PDN factor caching, compressed separators and batched GPU fronts.
 
-**What "contraction" does *not* mean here.** Each intermediate in Karam is a dense
+**What "contraction" does *not* mean here.** Each intermediate in TreeSPICE is a dense
 *w × w* Schur complement over a separator of *w* unknowns. That costs O(w²) memory and
 O(w³) flops. It is **not** an O(2ʷ) tensor as in quantum-circuit simulation. Ideas built for
-discrete tensor networks therefore do not carry over to Karam: index slicing, tensor-train
+discrete tensor networks therefore do not carry over to TreeSPICE: index slicing, tensor-train
 Jacobians, and tensor decision diagrams. Their real counterparts are out-of-core
 factorization, low-rank (Sherman–Morrison–Woodbury) updates, and instancing (see
 [References](#references)).
@@ -109,7 +110,7 @@ The scale target is stated honestly:
   order of a day.
 - No commercial tool claims flat SPICE accuracy at that size. The largest documented
   near-SPICE run is HSIM's 284-million-transistor DRAM, which relied on hierarchy.
-- Karam's billion-scale goal is therefore **10⁹ device instances through hierarchy,
+- TreeSPICE's billion-scale goal is therefore **10⁹ device instances through hierarchy,
   isomorphism and exact reuse on the elimination tree**. Accuracy is checked against flat
   simulation on 10⁷-scale subsets.
 - Firmware runs on RTL and gate-level models. SPICE handles the blocks that need it: SRAM,
@@ -142,7 +143,7 @@ waveform corners, all running through one transient loop shared by the API and t
 | `.lib` sections and process corners (PDK ingestion) | Established |
 | Dynamic gmin stepping (ngspice `dynamic_gmin`) | ✅ done |
 | Source stepping | Established |
-| **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so Karam must win there too, not only on resistor grids | Established techniques, open outcome |
+| **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so TreeSPICE must win there too, not only on resistor grids | Established techniques, open outcome |
 | **Condition-number survey** of real MNA matrices, with and without gmin and scaling. This decides whether low-precision factors are viable | Open: no published data |
 | Per-front dirty flags with exact reuse of an unchanged subtree's Schur complement (CPU prototype) | Open integration |
 
@@ -164,7 +165,7 @@ circuit set, or the gap explained with front-size data.
 | Code generation from OpenVAF IR to GPU kernels for compact models | Open |
 
 **Gate:** a 10⁷-element post-layout netlist fits on one 24–32 GB GPU. End-to-end transient
-runs at least 3× faster than Karam's own multicore CPU path on the same machine. Waveforms
+runs at least 3× faster than TreeSPICE's own multicore CPU path on the same machine. Waveforms
 stay within RELTOL of ngspice. Fewer than 1 % of solves fall back to FP64. A 10⁸-element run
 completes, and memory and time per element are reported.
 
@@ -182,12 +183,12 @@ completes, and memory and time per element are reported.
 
 **Gate:** "hello world" firmware runs on a reference SoC, with SRAM timing taken from SPICE
 characterisation. A 10⁹-instance design runs a non-trivial transient on one workstation. On
-10⁷-scale flat subsets, the hierarchical results match flat Karam and ngspice within stated
+10⁷-scale flat subsets, the hierarchical results match flat TreeSPICE and ngspice within stated
 tolerances. The accuracy cost of isomorphic state-matching is measured, not asserted.
 
 ### Research directions
 
-These are ranked by fit with Karam's architecture. Each is publishable only with measurements.
+These are ranked by fit with TreeSPICE's architecture. Each is publishable only with measurements.
 
 1. **Latency-aware multifrontal refactorization.** Exact subtree reuse, per-subtree multirate
    steps, and repartitioning as activity moves. Up to 80–90 % of a large circuit is latent
@@ -222,7 +223,7 @@ These are ranked by fit with Karam's architecture. Each is publishable only with
 
 ## Building and testing
 
-Karam is a C++17 CMake project with no required dependencies. Dawn/WebGPU is used when present.
+TreeSPICE is a C++17 CMake project with no required dependencies. Dawn/WebGPU is used when present.
 
 ```bash
 cmake -S . -B build
@@ -236,11 +237,11 @@ build/acutesim_engine_dump <netlist> cpu tran <step> <stop>   # machine-readable
 
 `datasets/` is git-ignored. See `ENGINE_HANDOFF.md` for where to download the Xyce and IBM sets.
 
-### Using Karam from another project
+### Using TreeSPICE from another project
 
 The public API is `engine_api/`: `ISimulationEngine`, sessions, request/response DTOs and callbacks.
 The netlist data model (`netlist/circuit.h`, `netlist/spice_parser.h`) is also public for now.
-Everything else is internal and may change. AcuteSim/CuteApp consumes Karam as a git submodule
+Everything else is internal and may change. OpenVLSI consumes TreeSPICE as a git submodule
 at `acutesim_engine/`, using `add_subdirectory(acutesim_engine)` and linking `acutesim_engine`.
 
 ## Repository layout
