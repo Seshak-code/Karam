@@ -2,8 +2,8 @@
 // ============================================================================
 // precision.h — IEEE-754 Precision Control Macros
 // ============================================================================
-// The engine builds with -ffast-math for performance. This is SAFE because
-// critical precision paths use EmulatedF64 (hi-lo pair splitting).
+// The engine builds WITHOUT -ffast-math (it silently removed NaN/Inf checks).
+// These macros remain for any future file that opts into relaxed FP locally.
 //
 // However, a few functions (pnjlim, LTE, physical residuals) require IEEE
 // strict behavior. Use ACUTESIM_PRECISE_FP_BEGIN/END around those sections.

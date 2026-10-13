@@ -1,7 +1,9 @@
 #pragma once
 #include "gui_boundary_guard.h"
+#include "physics_constants.h"
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 /*
  * device_physics.h - Pure Constitutive Equations for Semiconductor Devices
@@ -70,12 +72,17 @@ inline T diode_current(T vd, const DiodeParams<P>& p)
  * Handles linear continuation for convergence.
  */
 template <typename T, typename P>
-inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double max_arg = 30.0) 
+inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double max_arg = PhysicsConstants::JUNCTION_EXP_ARG_MAX) 
 {
     // NASA Optimization: Keep params as scalars where possible
     auto n_vt = p.N * p.Vt;
     T arg = vd / n_vt;
-    T GMIN = T(1e-12); 
+    // ngspice GMIN: a 1e-12 S conductance in parallel with every PN junction —
+    // never a node-to-ground leak (the solver's node gmin is dropped at
+    // convergence; ngspice has none once converged). It lives here in the
+    // junction model so the SoA kernels, the AoS stamps and both KCL audits
+    // all carry it consistently.
+    T GMIN = T(PhysicsConstants::JUNCTION_GMIN);
 
     // Linear Continuation Region
     if (arg > T(max_arg)) {
@@ -87,16 +94,14 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
         T g_max = (p.Is / n_vt) * exp_max;
         
         T delta = vd - (n_vt * T(max_arg));
-        return {i_max + delta * g_max, g_max};
+        return {i_max + delta * g_max + GMIN * vd, g_max + GMIN};
     }
     
     using std::exp;
     T exp_val = exp(arg);
-    T i_val = p.Is * (exp_val - T(1.0));
-    T g_val = (p.Is / n_vt) * exp_val;
-    
-    // Safety clamp for G
-    if (g_val < GMIN) g_val = GMIN;
+    T i_val = p.Is * (exp_val - T(1.0)) + GMIN * vd;
+    // Additive (g_base >= 0, so g >= GMIN without the old floor)
+    T g_val = (p.Is / n_vt) * exp_val + GMIN;
     
     return {i_val, g_val};
 }
@@ -106,7 +111,7 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
  * Safe version for NR iteration. Clamps exponent to prevent inf/nan.
  */
 template <typename T, typename P>
-inline T diode_current_clamped(T vd, const DiodeParams<P>& p, double max_arg = 30.0) 
+inline T diode_current_clamped(T vd, const DiodeParams<P>& p, double max_arg = PhysicsConstants::JUNCTION_EXP_ARG_MAX) 
 {
     // Delegate to unified model
     return diode_model_pair(vd, p, max_arg).first;
@@ -133,8 +138,10 @@ template <typename T>
 inline T pnjlim(T vnew, T vold, T vt, T vcrit) {
     T vlim = vnew;
     
-    // Bypass limiting if we are in the linear continuation region (defined as > 30*Vt in physics)
-    if (vold > T(30.0) * vt && vnew > T(30.0) * vt) {
+    // Bypass limiting in the linear continuation region (above the model's
+    // exponent cap) — must track JUNCTION_EXP_ARG_MAX or junctions between
+    // the two thresholds go unlimited.
+    if (vold > T(PhysicsConstants::JUNCTION_EXP_ARG_MAX) * vt && vnew > T(PhysicsConstants::JUNCTION_EXP_ARG_MAX) * vt) {
         return vnew;
     }
     
@@ -185,63 +192,135 @@ inline T compute_vcrit(T vt, T Is) {
 // MOSFET (LEVEL 1 SHICHMAN-HODGES) PHYSICS
 // ============================================================================
 
-template <typename T>
-struct MosfetParams 
-{
-    T Kp;     // Process transconductance [A/V^2] at Tnom
-    T Vth;    // Threshold Voltage [V]
-    T lambda; // Channel Length Modulation [1/V]
-    T W;      // Channel Width [m]
-    T L;      // Channel Length [m]
-    
-    // Thermal
-    T Temp;
-    T Tnom;
+// SPICE level 1 (ngspice mos1load.c, DC): source/drain exchange when Vds < 0,
+// body effect (GAMMA, PHI), channel-length modulation, and the bulk-drain /
+// bulk-source junctions (diode_model_pair: same GMIN and exp cap as every
+// junction). Returns the currents flowing INTO the device at drain, source and
+// bulk (the gate draws none). The one MOSFET definition: stamps (via Dual),
+// KCL audits, sensitivity and noise all evaluate this function.
+template <typename P>
+struct Mos1Params {
+    P polarity = 1.0;   // +1 NMOS, -1 PMOS
+    P beta = 2e-5;      // KP * W / (L - 2 LD) * M
+    P vto = 0.0;        // VTO as on the card (PMOS negative)
+    P lambda = 0.0, gamma = 0.0, phi = 0.6;
+    P isat = 1e-14;     // bulk junction saturation current, IS * M
+    P vt = PhysicsConstants::V_THERMAL_300K;
+    // Charge storage (mos1_charges), scaled by W, Leff and M like ngspice mos1temp
+    bool caps = false;                       // any capacitance below is non-zero
+    P cox = 0.0;                             // Meyer: COX * W * Leff * M (0 without TOX)
+    P cgso = 0.0, cgdo = 0.0, cgbo = 0.0;    // overlap: CGSO*W*M, CGDO*W*M, CGBO*Leff*M
+    P czbd = 0.0, czbdsw = 0.0;              // bulk-drain zero-bias bottom, sidewall
+    P czbs = 0.0, czbssw = 0.0;              // bulk-source
+    P mj = 0.5, mjsw = 0.5, pb = 0.8, fc = 0.5;
 };
 
-enum class MosfetRegion { CUTOFF, LINEAR, SATURATION };
-
-/**
- * mosfet_region
- * Determines operating region from terminal voltages. (NMOS)
- * For Dual types, this uses the primal value for comparisons.
- */
+// Threshold (type domain) at bulk bias vbx: VBS in normal mode, VBD reversed.
 template <typename T, typename P>
-inline MosfetRegion mosfet_region(T vgs, T vds, const MosfetParams<P>& p) 
+inline T mos1_von(T vbx, const Mos1Params<P>& p)
 {
-    T vov = vgs - p.Vth;
-    if (vov <= 0.0) return MosfetRegion::CUTOFF;
-    if (vds < vov)  return MosfetRegion::LINEAR;
-    return MosfetRegion::SATURATION;
+    using std::sqrt;
+    const P sphi = sqrt(p.phi);
+    T sarg = vbx <= P(0.0) ? sqrt(p.phi - vbx) : sphi - vbx / (2.0 * sphi);
+    if (sarg < P(0.0)) sarg = T(0.0);
+    return p.polarity * p.vto + p.gamma * (sarg - sphi);
 }
 
-/**
- * mosfet_ids
- * Level 1 Drain-Source Current (NMOS).
- */
+template <typename T> struct Mos1Currents { T d, s, b; };
+
 template <typename T, typename P>
-inline T mosfet_ids(T vgs, T vds, const MosfetParams<P>& p) 
+inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>& p)
 {
-    T K = 0.5 * p.Kp * (p.W / p.L);
-    T vov = vgs - p.Vth;
+    using std::sqrt;
+    const P type = p.polarity;
+    const T vgs = type * (vg - vs), vds = type * (vd - vs), vbs = type * (vb - vs);
+    const T vbd = vbs - vds, vgd = vgs - vds;
+    const DiodeParams<P> junction = {p.isat, P(1.0), p.vt};
+    const T cbs = diode_model_pair(vbs, junction).first;
+    const T cbd = diode_model_pair(vbd, junction).first;
 
-    if (vov <= 0.0) 
-        return 0.0; // Cutoff
-
-    // We can just rely on vds < vov check, or call mosfet_region.
-    // Re-evaluating condition for branchless-ish optimization if T is SIMD?
-    // For scalar/dual, straightforward if-else is fine.
-    
-    if (vds < vov) 
-    {
-        // Linear Region: Ids = K * (2*Vov*Vds - Vds^2)
-        return K * (2.0 * vov * vds - vds * vds);
-    } 
-    else 
-    {
-        // Saturation: Ids = K * Vov^2 * (1 + lambda * Vds)
-        return K * vov * vov * (1.0 + p.lambda * vds);
+    const bool normal = vds >= P(0.0);          // mode: the higher terminal is the drain
+    const T vgst = (normal ? vgs : vgd) - mos1_von(normal ? vbs : vbd, p);
+    const T vdsm = normal ? vds : -vds;         // |Vds|
+    T cdrain(0.0);
+    if (vgst > P(0.0)) {
+        const T betap = p.beta * (1.0 + p.lambda * vdsm);
+        cdrain = vgst <= vdsm ? 0.5 * betap * vgst * vgst                // saturation
+                              : betap * vdsm * (vgst - 0.5 * vdsm);      // linear
     }
+    const T chan = normal ? cdrain : -cdrain;   // into the drain terminal
+    return {type * (chan - cbd), type * (-chan - cbs), type * (cbs + cbd)};
+}
+
+// Meyer gate half-capacitances {gs, gd, gb} (ngspice DEVqmeyer). vgs/vgd are in
+// the device's orientation (the caller swaps them, and the results, when reversed).
+template <typename T, typename P>
+inline std::array<T, 3> mos1_meyer(T vgs, T vgd, T von, T vdsat, P phi, P cox)
+{
+    const T vgst = vgs - von, vds = vgs - vgd;
+    if (vdsat < 0.025) vdsat = T(0.025);  // MAGIC_VDS
+    if (vgst <= -phi) return {T(0.0), T(0.0), T(cox / 2)};
+    if (vgst <= -phi / 2) return {T(0.0), T(0.0), -vgst * cox / (2 * phi)};
+    const T full = vgst <= P(0.0) ? vgst * cox / (1.5 * phi) + cox / 3 : T(cox / 3);
+    const T gb = vgst <= P(0.0) ? -vgst * cox / (2 * phi) : T(0.0);
+    if (vds >= vdsat) return {full, T(0.0), gb};
+    const T vddif = 2.0 * vdsat - vds, vddif1 = vdsat - vds, vddif2 = vddif * vddif;
+    return {full * (1.0 - vddif1 * vddif1 / vddif2), full * (1.0 - vdsat * vdsat / vddif2), gb};
+}
+
+// Depletion charge of a junction with zero-bias capacitance cz and grading m:
+// C = cz (1 - v/pb)^-m below fc*pb, linearised above it (ngspice f2/f3/f4).
+template <typename T, typename P>
+inline T depletion_charge(T v, P cz, P m, P pb, P fc)
+{
+    using std::exp; using std::log;
+    if (cz == P(0.0)) return T(0.0);
+    const P v0 = fc * pb, a0 = 1.0 - fc;
+    if (v < v0) return pb * cz * (1.0 - exp((1.0 - m) * log(1.0 - v / pb))) / (1.0 - m);
+    const P c0 = cz * exp(-m * log(a0)), c1 = c0 * m / (pb * a0);
+    const P q0 = pb * cz * (1.0 - exp((1.0 - m) * log(a0))) / (1.0 - m);
+    const T dv = v - v0;
+    return q0 + dv * (c0 + 0.5 * c1 * dv);
+}
+
+// Charges of the five capacitive branches gs, gd, gb, bd, bs (type domain,
+// ngspice mos1load). The Meyer gate charges advance from the previous accepted
+// step (vPrev, qPrev, halfPrev) by C*dv, C = half-capacitance now + then +
+// overlap; the bulk junctions carry their depletion charge. half: the Meyer
+// half-capacitances at v (the next step's halfPrev).
+template <typename T> struct Mos1Charges { T v[5], q[5], half[3]; };
+
+// Branch voltages gs, gd, gb, bd, bs (type domain) of the charges above.
+template <typename T>
+inline std::array<T, 5> mos1_branches(T vd, T vg, T vs, T vb, double type)
+{
+    return {type * (vg - vs), type * (vg - vd), type * (vg - vb), type * (vb - vd), type * (vb - vs)};
+}
+
+template <typename T>
+inline Mos1Charges<T> mos1_charges(T vd, T vg, T vs, T vb, const Mos1Params<double>& p,
+                                   const double* vPrev, const double* qPrev, const double* halfPrev)
+{
+    const double type = p.polarity;
+    Mos1Charges<T> c;
+    const auto br = mos1_branches(vd, vg, vs, vb, type);
+    for (int k = 0; k < 5; ++k) c.v[k] = br[k];
+    const T vgs = br[0], vgd = br[1], vbd = br[3], vbs = br[4];
+    const bool normal = vgs >= vgd;  // vds >= 0
+    const T von = mos1_von(normal ? vbs : vbd, p);
+    T vdsat = (normal ? vgs : vgd) - von;
+    if (vdsat < 0.0) vdsat = T(0.0);
+    const auto h = normal ? mos1_meyer(vgs, vgd, von, vdsat, p.phi, p.cox)
+                          : mos1_meyer(vgd, vgs, von, vdsat, p.phi, p.cox);
+    c.half[0] = normal ? h[0] : h[1];
+    c.half[1] = normal ? h[1] : h[0];
+    c.half[2] = h[2];
+    const double ov[3] = {p.cgso, p.cgdo, p.cgbo};
+    for (int k = 0; k < 3; ++k)
+        c.q[k] = qPrev[k] + (c.half[k] + halfPrev[k] + ov[k]) * (c.v[k] - vPrev[k]);
+    c.q[3] = depletion_charge(vbd, p.czbd, p.mj, p.pb, p.fc) + depletion_charge(vbd, p.czbdsw, p.mjsw, p.pb, p.fc);
+    c.q[4] = depletion_charge(vbs, p.czbs, p.mj, p.pb, p.fc) + depletion_charge(vbs, p.czbssw, p.mjsw, p.pb, p.fc);
+    return c;
 }
 
 // ============================================================================
@@ -470,7 +549,7 @@ inline T zener_current(T vd, const ZenerParams<P>& p)
         }
     }
     
-    return i_fwd + i_rev;
+    return i_fwd + i_rev + T(PhysicsConstants::JUNCTION_GMIN) * vd;  // as diode_model_pair
 }
 
 // ============================================================================

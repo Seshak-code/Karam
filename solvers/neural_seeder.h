@@ -1,6 +1,5 @@
 #pragma once
 
-#include "../infrastructure/tn_compiler.h"
 #include <algorithm>
 #include <cstdint>
 #include <cmath>

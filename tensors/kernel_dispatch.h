@@ -22,12 +22,10 @@ enum class SimdArch {
 class KernelDispatcher {
 public:
     using DiodeKernel = void(*)(DiodeTensor&, const std::vector<double>&);
-    using MosfetKernel = void(*)(MosfetTensor&, const std::vector<double>&);
     using BJTKernel = void(*)(BJTTensor&, const std::vector<double>&);
 
     SimdArch architecture;  // Best CPU SIMD tier
     DiodeKernel batch_diode_physics;
-    MosfetKernel batch_mosfet_physics;
     BJTKernel batch_bjt_physics;
 
     // GPU capability (probed from Dawn adapters at startup)

@@ -9,7 +9,6 @@
 // ============================================================================
 
 #include "acutesim_engine/solvers/fourier_analysis.h"
-#include "acutesim_engine/solvers/analysis_registry.h"
 #include "engine_api/simulation_dto.h"
 
 #include <cmath>
@@ -138,21 +137,5 @@ SimulationResponseDTO runFourierAnalysis(
 
 } // namespace solvers
 
-namespace {
-
-orchestration::SimulationResponseDTO fourierStub(
-    const orchestration::SimulationRequestDTO&,
-    const TensorNetlist&,
-    CircuitSim&)
-{
-    orchestration::SimulationResponseDTO r;
-    r.success = false;
-    r.errorDetail = "FOURIER: use ISimulationDriver::submitJob with AnalysisTypeDTO::FOURIER";
-    return r;
-}
-
-static RegisterAnalysis<orchestration::AnalysisTypeDTO::FOURIER, &fourierStub> s_reg;
-
-} // anonymous namespace
 } // namespace compute
 } // namespace acutesim

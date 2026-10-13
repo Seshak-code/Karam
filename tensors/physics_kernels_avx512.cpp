@@ -1,4 +1,5 @@
 #include "../tensors/physics_tensors.h"
+#include "../physics/physics_constants.h"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -28,12 +29,12 @@ inline __m512d _mm512_exp_pd_fallback(__m512d v) {
 
 void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& voltages) {
     size_t n = tensor.size();
-    const double GMIN = 1e-12;
+    const double GMIN = PhysicsConstants::JUNCTION_GMIN;
     
     const __m512d v_gmin = _mm512_set1_pd(GMIN);
     const __m512d v_zero = _mm512_setzero_pd();
     const __m512d v_one  = _mm512_set1_pd(1.0);
-    const __m512d v_30   = _mm512_set1_pd(30.0);
+    const __m512d v_argmax   = _mm512_set1_pd(PhysicsConstants::JUNCTION_EXP_ARG_MAX);
     
     size_t i = 0;
     // Process 8 diodes at a time
@@ -77,14 +78,14 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         // n_vt = N * Vt
         __m512d v_nvt = _mm512_mul_pd(v_N, v_Vt);
         
-        // Vcrit = 30.0 * n_vt
-        __m512d v_vcrit = _mm512_mul_pd(v_30, v_nvt);
+        // Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt
+        __m512d v_vcrit = _mm512_mul_pd(v_argmax, v_nvt);
         
         // arg = v_d / n_vt
         __m512d v_arg = _mm512_div_pd(v_d, v_nvt);
         
-        // arg_clamped = min(arg, 30.0)
-        __m512d v_arg_clamped = _mm512_min_pd(v_arg, v_30);
+        // arg_clamped = min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX)
+        __m512d v_arg_clamped = _mm512_min_pd(v_arg, v_argmax);
         
         // exp_arg = exp(arg_clamped)
         __m512d v_exp = _mm512_exp_pd_fallback(v_arg_clamped);
@@ -98,11 +99,13 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         // delta = max(0.0, v_d - Vcrit)
         __m512d v_delta = _mm512_max_pd(v_zero, _mm512_sub_pd(v_d, v_vcrit));
         
-        // i_d = i_base + delta * g_base
+        // i_d = i_base + delta * g_base + GMIN * v_d
+        // (ngspice GMIN: parallel junction conductance — mirrors diode_model_pair())
         __m512d v_id = _mm512_add_pd(v_ibase, _mm512_mul_pd(v_delta, v_gbase));
+        v_id = _mm512_add_pd(v_id, _mm512_mul_pd(v_gmin, v_d));
         
-        // g_d = max(GMIN, g_base)
-        __m512d v_gd = _mm512_max_pd(v_gmin, v_gbase);
+        // g_d = g_base + GMIN  (additive; replaces the max() floor)
+        __m512d v_gd = _mm512_add_pd(v_gbase, v_gmin);
         
         // Store results
         _mm512_storeu_pd(&tensor.i_d[i], v_id);
@@ -123,18 +126,19 @@ void batchDiodePhysics_avx512(DiodeTensor& tensor, const std::vector<double>& vo
         double N = tensor.N[i];
         double Vt = tensor.Vt[i];
         double n_vt = N * Vt;
-        double Vcrit = 30.0 * n_vt;
+        double Vcrit = PhysicsConstants::JUNCTION_EXP_ARG_MAX * n_vt;
         
         double arg = tensor.v_d[i] / n_vt;
-        double arg_clamped = std::min(arg, 30.0);
+        double arg_clamped = std::min(arg, PhysicsConstants::JUNCTION_EXP_ARG_MAX);
         double exp_arg = std::exp(arg_clamped);
         
         double i_base = Is * (exp_arg - 1.0);
         double g_base = (Is / n_vt) * exp_arg;
         
         double delta = std::max(0.0, tensor.v_d[i] - Vcrit);
-        tensor.i_d[i] = i_base + delta * g_base;
-        tensor.g_d[i] = std::max(GMIN, g_base);
+        // ngspice GMIN: parallel junction conductance — mirrors diode_model_pair()
+        tensor.i_d[i] = i_base + delta * g_base + GMIN * tensor.v_d[i];
+        tensor.g_d[i] = g_base + GMIN;  // additive; replaces the max() floor
     }
 }
 
