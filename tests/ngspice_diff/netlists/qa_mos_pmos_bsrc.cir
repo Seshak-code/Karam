@@ -1,0 +1,8 @@
+* QA: PMOS with body tied to the source (no body effect — must differ from qa_mos_pmos_vdd)
+VDD 1 0 DC 5
+VG 2 0 DC 5
+RD 3 0 10k
+M1 3 2 1 1 PM W=20u L=1u
+.model PM PMOS(KP=80u VTO=-0.7 GAMMA=0.5 PHI=0.6 LAMBDA=0.02)
+.dc VG 0 5 0.25
+.end

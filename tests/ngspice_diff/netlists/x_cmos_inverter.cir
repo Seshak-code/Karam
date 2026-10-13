@@ -1,0 +1,10 @@
+CMOS inverter, input sweep
+VDD 1 0 DC 5
+VIN 2 0 DC 0
+M1 3 2 0 0 NM W=10u L=1u
+M2 3 2 1 1 PM W=20u L=1u
+RL 3 0 1MEG
+.model NM NMOS(LEVEL=1 VTO=1 KP=50u LAMBDA=0.02)
+.model PM PMOS(LEVEL=1 VTO=-1 KP=25u LAMBDA=0.02)
+.dc VIN 0 5 0.25
+.end

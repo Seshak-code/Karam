@@ -1,0 +1,11 @@
+* QA: M= scaling of every cap — identical devices, one with M=4; the pulse response delay
+* differs exactly by the cap ratio if gate/overlap/junction caps all scale with M
+VDD 1 0 DC 5
+VG 2 0 PULSE(0 5 1u 1u 1u 8u 20u)
+RD1 3 0 1k
+RD2 4 0 1k
+M1 3 2 0 0 NM W=10u L=1u
+M2 4 2 0 0 NM W=10u L=1u M=4
+.model NM NMOS(KP=100u VTO=0.7 TOX=40n CGSO=2n CGDO=2n CGBO=1n CBD=10f CBS=10f)
+.tran 2u 40u
+.end

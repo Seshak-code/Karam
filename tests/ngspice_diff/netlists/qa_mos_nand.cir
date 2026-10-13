@@ -1,0 +1,11 @@
+* QA: stacked-NMOS inverter (NAND with tied inputs): body effect on the upper stack device
+VDD 1 0 DC 5
+VA 2 0 DC 0
+MP1 1 2 4 1 PM W=20u L=1u
+MP2 1 2 4 1 PM W=20u L=1u
+MN1 4 2 5 0 NM W=10u L=1u
+MN2 5 2 0 0 NM W=10u L=1u
+.model NM NMOS(KP=100u VTO=0.7 GAMMA=0.5 PHI=0.6)
+.model PM PMOS(KP=100u VTO=-0.7 GAMMA=0.5 PHI=0.6)
+.dc VA 0 5 0.25
+.end

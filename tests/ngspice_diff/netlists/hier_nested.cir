@@ -1,0 +1,15 @@
+hier nested subcircuits
+.subckt DIV a b
+R1 a mid 1k
+R2 mid b 1k
+R3 b 0 10k
+.ends
+.subckt PAIR p q
+X1 p n DIV
+X2 n q DIV
+RL q 0 47k
+.ends
+V1 IN 0 DC 5
+XP IN OUT PAIR
+.op
+.end

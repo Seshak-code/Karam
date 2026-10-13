@@ -1,0 +1,8 @@
+* QA: MOS1 LD just below L/2 (Leff = 0.02u — beta boundary, must still solve)
+VDD 1 0 DC 5
+VG 2 0 DC 3
+RD 3 0 1k
+M1 3 2 0 0 NM W=10u L=2u
+.model NM NMOS(KP=100u VTO=0.7 LD=0.99u)
+.op
+.end

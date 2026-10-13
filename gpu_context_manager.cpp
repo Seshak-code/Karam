@@ -1,8 +1,8 @@
 // ============================================================================
 // gpu_context_manager.cpp — GPU Device Pool Implementation
 // ============================================================================
-#include "acutesim_engine/internal/engine_pch.h"
-#include "acutesim_engine/gpu_context_manager.h"
+#include "internal/engine_pch.h"
+#include "gpu_context_manager.h"
 
 #ifdef ACUTESIM_GPU_ENABLED
 #ifndef __EMSCRIPTEN__

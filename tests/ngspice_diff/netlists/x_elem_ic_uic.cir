@@ -1,0 +1,8 @@
+* element IC= with UIC: C starts at 2 V, L at 20 mA
+V1 1 0 DC 5
+R1 1 2 1k
+C1 2 0 1u ic=2
+R2 1 3 100
+L1 3 0 10m ic=20m
+.tran 10u 2m uic
+.end

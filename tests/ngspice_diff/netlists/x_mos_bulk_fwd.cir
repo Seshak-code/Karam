@@ -1,0 +1,9 @@
+* MOS1: forward-biased bulk-source junction (bulk diodes, IS)
+VB 4 0 DC 0
+RB 4 5 1k
+VG 2 0 DC 0
+VD 1 0 DC 1
+M1 1 2 0 5 NM W=10u L=1u
+.model NM NMOS(KP=100u VTO=0.7 IS=1e-13)
+.dc VB -1 1.2 0.1
+.end

@@ -1,0 +1,7 @@
+* RL from its DC operating point (I_L = 5 mA at t=0), then a step
+V1 1 0 PULSE(1 2 2u 10n 10n 5u 20u)
+R1 1 2 100
+L1 2 3 1m
+R2 3 0 100
+.tran 0.1u 10u
+.end

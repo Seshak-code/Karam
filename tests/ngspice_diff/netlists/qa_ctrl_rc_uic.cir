@@ -1,0 +1,8 @@
+* QA control: plain RC with .ic + uic (no MOS) — isolates whether uic/.ic handling itself matches ngspice
+VDD 1 0 DC 5
+VIN 2 0 PULSE(0 5 2u 1u 1u 4u 10u)
+RS 2 3 10k
+C1 3 0 1n
+.ic v(3)=1.5
+.tran 0.5u 30u uic
+.end

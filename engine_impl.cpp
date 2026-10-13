@@ -12,14 +12,14 @@
 // when GPUContextManager::instance().isAvailable() is true.
 // ============================================================================
 
-#include "acutesim_engine/internal/engine_pch.h"
-#include "acutesim_engine/engine_impl.h"
-#include "acutesim_engine/gpu_context_manager.h"
+#include "internal/engine_pch.h"
+#include "engine_impl.h"
+#include "gpu_context_manager.h"
 
 // Engine internal headers (invisible to consumers via -fvisibility=hidden)
-#include "acutesim_engine/physics/circuitsim.h"
-#include "acutesim_engine/infrastructure/simtrace.h"
-#include "acutesim_engine/netlist/circuit.h"
+#include "physics/circuitsim.h"
+#include "infrastructure/simtrace.h"
+#include "netlist/circuit.h"
 
 // engine_api public DTO types
 #include "engine_api/simulation_dto.h"
@@ -35,7 +35,7 @@
 
 // Full SPICE3f5 parser (must be included OUTSIDE any namespace to avoid
 // double-qualification: the parser itself already declares namespace acutesim)
-#include "acutesim_engine/netlist/spice_parser.h"
+#include "netlist/spice_parser.h"
 
 namespace acutesim {
 

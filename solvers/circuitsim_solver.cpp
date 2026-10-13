@@ -17,9 +17,8 @@
 #include "../physics/device_physics.h"
 #include "../physics/physics_constants.h"
 #include "../solvers/convergence_engine.h"
-#include "acutesim_engine/netlist/netlist_export.h"
 #if !defined(__EMSCRIPTEN__) && defined(ACUTESIM_HAS_DAWN_NATIVE)
-#include "acutesim_engine/gpu_context_manager.h"
+#include "gpu_context_manager.h"
 #endif
 
 // Matches SPICE3's dt_init = tstep/100: divides the first transient step into

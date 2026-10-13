@@ -1,0 +1,6 @@
+* RC stepped from a non-zero DC operating point (V(2) starts at 1 V, not 0)
+V1 1 0 PULSE(1 3 1m 1u 1u 5m 10m)
+R1 1 2 1k
+C1 2 0 1u
+.tran 20u 6m
+.end

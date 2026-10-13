@@ -1,0 +1,7 @@
+AC sinewave (title line restored)
+v1 1 0 sin(0 15 60 0 0)
+rload 1 0 10k
+.tran 1m 30m
+.plot tran v(1)
+.four 60 v(1)
+.end

@@ -1,0 +1,8 @@
+* .ic forced during the DC bias (V(2)=4), then released toward 2.5 V
+V1 1 0 DC 5
+R1 1 2 1k
+C1 2 0 1u
+R2 2 0 1k
+.ic v(2)=4
+.tran 20u 4m
+.end

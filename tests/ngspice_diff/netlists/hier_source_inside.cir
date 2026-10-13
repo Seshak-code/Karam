@@ -1,0 +1,9 @@
+hier source inside subcircuit
+XS A REF
+RL A 0 1k
+.subckt REF o
+V1 int 0 DC 2.5
+R1 int o 100
+.ends
+.op
+.end

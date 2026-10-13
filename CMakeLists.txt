@@ -1,13 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ===========================================================================
-# acutesim_engine — Tensor MNA Simulation Library
+# Karam (acutesim_engine) — SPICE-equivalent circuit simulation engine
 # ===========================================================================
-# This is the standalone engine library. ALL simulation, GPU, and physics
-# logic lives here. The rest of AcuteSim is a consumer via engine_api/.
+# Builds standalone (this directory is the top level: library, tools, tests)
+# or as a subdirectory of AcuteSim/CuteApp (git submodule at acutesim_engine/),
+# which consumes it through engine_api/ and the netlist data model.
 #
 # Build pattern: OBJECT → STATIC (future: SHARED/PLUGIN without recompilation)
 # ===========================================================================
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(Karam LANGUAGES C CXX)
+    set(KARAM_STANDALONE ON)
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE Release)
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,11 +56,9 @@ target_compile_definitions(acutesim_engine_objects PRIVATE
 # ---------------------------------------------------------------------------
 target_include_directories(acutesim_engine_objects
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../engine_api>
-        $<INSTALL_INTERFACE:include/engine_api>
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..   # for transitional includes
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>              # "engine_api/x.h", "netlist/circuit.h"
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/engine_api>   # bare "simulation_dto.h"
+        $<INSTALL_INTERFACE:include>
 )
 
 # ---------------------------------------------------------------------------
@@ -104,7 +111,6 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_neon.cpp
 
     # === Netlist ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/netlist/netlist_export.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
 
     # === Physics (Verilog-A model compiler pipeline) ===
@@ -144,10 +150,8 @@ endif()
 # ---------------------------------------------------------------------------
 # CLI — Engine Consumer
 # ---------------------------------------------------------------------------
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cli/engine_cli_main.cpp)
-    add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
-    target_link_libraries(acutesim_engine_cli PRIVATE acutesim_sim_layer acutesim_orchestration acutesim_engine)
-endif()
+add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
+target_link_libraries(acutesim_engine_cli PRIVATE acutesim_engine)
 
 # ---------------------------------------------------------------------------
 # Waveform dump tool — machine-readable output for tests/ngspice_diff
@@ -155,5 +159,19 @@ endif()
 # (node order = first appearance in the netlist, subcircuit bodies excluded)
 # ---------------------------------------------------------------------------
 add_executable(acutesim_engine_dump cli/engine_dump_main.cpp)
-target_include_directories(acutesim_engine_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(acutesim_engine_dump PRIVATE acutesim_engine)
+
+# ---------------------------------------------------------------------------
+# Engine tests (standalone build): C++ checks + differential harnesses
+#   ctest                                  — the C++ suites below
+#   python3 tests/ngspice_diff/run_diff.py — vs ngspice (needs ngspice on PATH)
+#   python3 tests/xyce_diff.py, tests/ibmpg_diff.py — need datasets/ (git-ignored)
+# ---------------------------------------------------------------------------
+if(KARAM_STANDALONE)
+    enable_testing()
+    foreach(t test_engine_fixes test_contraction_solver test_convergence_engine)
+        add_executable(${t} tests/${t}.cpp)
+        target_link_libraries(${t} PRIVATE acutesim_engine)
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
+endif()

@@ -1,0 +1,9 @@
+JFET self-bias
+VDD 1 0 DC 15
+RD 1 2 2k
+RS 3 0 1k
+RG 4 0 1MEG
+J1 2 4 3 JN
+.model JN NJF(VTO=-2 BETA=1m LAMBDA=0.01)
+.op
+.end

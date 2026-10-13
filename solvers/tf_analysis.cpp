@@ -7,9 +7,9 @@
 // Phase 4.5
 // ============================================================================
 
-#include "acutesim_engine/solvers/tf_analysis.h"
+#include "solvers/tf_analysis.h"
 #include "engine_api/simulation_dto.h"
-#include "acutesim_engine/physics/circuitsim.h"
+#include "physics/circuitsim.h"
 #include <complex>
 
 #include <cmath>

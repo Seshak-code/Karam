@@ -1,0 +1,17 @@
+* QA: caps on a MOSFET two .subckt levels deep (X inside a subckt; nested *definitions* are
+* a documented engine parse error, so the levels are separate definitions)
+VDD 1 0 DC 5
+VIN 2 0 PULSE(0 5 1u 1u 1u 4u 10u)
+X1 2 3 1 WRAP
+RL 3 0 100k
+.subckt WRAP IN OUT VP
+XIN IN OUT VP INV2
+.ends WRAP
+.subckt INV2 A B VQ
+MN1 B A 0 0 NMI W=10u L=1u
+MP1 B A VQ VQ PMI W=20u L=1u
+.ends INV2
+.model NMI NMOS(KP=100u VTO=0.7 TOX=40n CGSO=2n CGDO=2n CBD=10f CBS=10f)
+.model PMI PMOS(KP=50u VTO=-0.8 TOX=40n CGSO=2n CGDO=2n CGBO=1n CBD=10f CBS=10f)
+.tran 0.5u 30u
+.end

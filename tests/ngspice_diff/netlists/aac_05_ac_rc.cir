@@ -1,0 +1,7 @@
+Demo of a simple AC circuit
+v1 1 0 ac 12
+r1 1 2 30
+c1 2 0 100u
+.ac lin 1 60 60
+.print ac v(1,2) v(2)
+.end

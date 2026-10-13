@@ -12,8 +12,8 @@
 
 // Must be included before any namespace declarations to avoid namespace
 // pollution from STL headers (do NOT move these inside a namespace block).
-#include "acutesim_engine/netlist/circuit.h"     // TensorNetlist (class definition)
-#include "acutesim_engine/physics/circuitsim.h"     // CircuitSim   (class definition)
+#include "netlist/circuit.h"     // TensorNetlist (class definition)
+#include "physics/circuitsim.h"     // CircuitSim   (class definition)
 
 #include "engine_api/simulation_dto.h"
 #include <functional>

@@ -8,7 +8,7 @@
 // Phase 4.5
 // ============================================================================
 
-#include "acutesim_engine/solvers/fourier_analysis.h"
+#include "solvers/fourier_analysis.h"
 #include "engine_api/simulation_dto.h"
 
 #include <cmath>

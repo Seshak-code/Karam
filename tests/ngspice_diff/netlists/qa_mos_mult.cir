@@ -1,0 +1,10 @@
+* QA: MOS1 multiplier — M=1000 (wide) and M=0.5 (fractional) in one circuit
+VDD 1 0 DC 5
+VG 2 0 DC 2
+RD1 3 0 1k
+RD2 4 0 1k
+M1 3 2 0 0 NM W=10u L=1u M=1000
+M2 4 2 0 0 NM W=10u L=1u M=0.5
+.model NM NMOS(KP=100u VTO=0.7 LAMBDA=0.02)
+.op
+.end
