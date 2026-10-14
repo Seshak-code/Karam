@@ -1,0 +1,11 @@
+* NMOS/PMOS with Vds<0, body effect, sweep drain below source
+VD 1 0 DC 0
+VG 2 0 DC 2
+VS 3 0 DC 0.5
+VB 4 0 DC -1
+MN 1 2 3 4 NB W=10u L=1u
+MP 1 2 3 3 PB W=10u L=1u
+.model NB NMOS(VTO=0.7 KP=80u GAMMA=0.5 PHI=0.7 LAMBDA=0.05 CBD=1f CBS=1f)
+.model PB PMOS(VTO=-0.8 KP=30u GAMMA=0.4 PHI=0.65 LAMBDA=0.04)
+.dc VD -2 3 0.1
+.end

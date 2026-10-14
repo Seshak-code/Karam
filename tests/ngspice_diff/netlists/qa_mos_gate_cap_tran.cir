@@ -1,0 +1,9 @@
+* gate charging through R: Meyer cap crossing cutoff->sat->linear
+VIN 1 0 PULSE(0 3 1n 5n 5n 40n 100n)
+RG 1 2 10k
+M1 3 2 0 0 NM W=20u L=1u
+RD 4 3 1k
+VDD 4 0 DC 3
+.model NM NMOS(VTO=0.7 KP=60u TOX=20n CGSO=3e-10 CGDO=3e-10 CGBO=2e-10)
+.tran 0.1n 100n
+.end

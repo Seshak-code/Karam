@@ -618,6 +618,7 @@ struct BJT {
         double cje = 0.0, vje = 0.75, mje = 0.33, cjc = 0.0, vjc = 0.75, mjc = 0.33, xcjc = 1.0;
         double cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
         double iss = 0.0, ns = 1.0;                        // substrate junction
+        bool lateral = false;  // SUBS = -1: substrate junction on the base, not the collector (PNP default)
         double tf = 0.0, xtf = 0.0, vtf = 0.0, itf = 0.0, tr = 0.0;
     } card;
     double area = 1.0;
@@ -825,7 +826,8 @@ struct TensorBlock {
             // BJT: (C-E) and (B-E) edges
             edges.emplace_back(b.nodeCollector, b.emitter, 5);
             edges.emplace_back(b.base, b.emitter, 5);
-            if (b.substrate != 0) edges.emplace_back(b.nodeCollector, b.substrate, 5);  // C-S junction
+            if (b.substrate != 0)  // substrate junction: C-S (vertical) or B-S (lateral)
+                edges.emplace_back(b.card.lateral ? b.base : b.nodeCollector, b.substrate, 5);
         }
         for (const auto& o : osdiDevices)  // OSDI device: terminal 0 to each other terminal
             for (size_t k = 1; k < o.nodes.size(); ++k) edges.emplace_back(o.nodes[0], o.nodes[k], 6);

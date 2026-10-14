@@ -1,0 +1,7 @@
+* diode high-current with RS, N, IKF absent; sweep to 1A, with AREA/M
+V1 1 0 DC 0
+R1 1 2 0.01
+D1 2 0 DH AREA=2
+.model DH D(IS=1e-12 N=1.4 RS=0.5)
+.dc V1 0 3 0.05
+.end

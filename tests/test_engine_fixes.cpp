@@ -373,6 +373,22 @@ int main() {
             check(!r.converged && r.errorDetail.find("cycle") != std::string::npos,
                   ".include: a cycle is an explicit error (" + r.errorDetail + ")");
         }
+        // QA phase 3 (BUG-2..5): nonsense parameters, OFF/IC and mismatched cards are explicit errors
+        const std::pair<const char*, const char*> bad[] = {
+            {"V1 1 0 DC 3\nR1 1 2 1k\nQ1 2 2 0 QM\n.model QM NPN VAF=-5\n", "VAF must be >= 0"},
+            {"V1 1 0 DC 3\nR1 1 2 1k\nM1 2 2 0 0 MM\n.model MM NMOS GAMMA=1 PHI=0\n", "PHI must be > 0"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D BV=0\n", "BV must be > 0"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D N=0\n", "N must be > 0"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM OFF\n.model DM D\n", "OFF is not supported"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 QM IC=0.6,5\n.model QM NPN\n", "IC is not supported"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 NM\n.model NM NMOS\n", "is NMOS, not a NPN/PNP model"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nM1 2 2 0 NM W=10u\n.model NM NMOS\n", "expected 4 nodes"},
+        };
+        for (const auto &[net, want] : bad) {
+            r = run(mode, std::string("* bad\n") + net + ".op\n");
+            check(!r.converged && r.errorDetail.find(want) != std::string::npos,
+                  std::string("explicit error '") + want + "' (" + r.errorDetail + ")");
+        }
         // OSDI (N devices) fails closed: missing library, no model card, card type not a loaded module
         r = run(mode, "* osdi lib\n.osdi no_such_model.osdi\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
         check(!r.converged && r.errorDetail.find("not found") != std::string::npos,

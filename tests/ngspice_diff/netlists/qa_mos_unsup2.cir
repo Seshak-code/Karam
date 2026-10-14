@@ -1,0 +1,6 @@
+* unsupported MOS params: NSUB, NFS, KF, XJ, TPG, UCRIT
+V1 1 0 DC 1
+M1 1 1 0 0 NM W=10u L=1u
+.model NM NMOS(VTO=0.7 KP=60u NSUB=1e16 KF=1e-25 AF=1 JS=1e-8 XJ=1u)
+.op
+.end

@@ -1,0 +1,17 @@
+* 2-stage amp (NPN CE + PNP CE) .ac, caps incl CJS substrate to ground
+VCC 1 0 DC 12
+VIN 9 0 DC 0 AC 1
+CIN 9 2 1u
+R1 1 2 100k
+R2 2 0 22k
+RC1 1 3 3.3k
+Q1 3 2 4 0 QN
+RE1 4 0 470
+CE1 4 0 47u
+R3 1 5 1k
+Q2 6 3 5 1 QP
+RC2 6 0 2.2k
+.model QN NPN(IS=1e-15 BF=180 VAF=90 RB=100 CJE=2p CJC=1p XCJC=0.5 CJS=3p TF=250p TR=10n)
+.model QP PNP(IS=1e-15 BF=60 VAF=50 CJE=3p CJC=2p CJS=2p TF=400p RB=80)
+.ac dec 10 10 1G
+.end

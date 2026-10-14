@@ -1,0 +1,33 @@
+* QA: same device names (Q1 D1 M1 R1) at every hierarchy level and in sibling instances, different models/areas
+VCC 1 0 DC 5
+VIN 2 0 DC 0.7 AC 1
+R1 1 3 4.7k
+Q1 3 2 0 QA1
+D1 3 7 DM1
+R2 7 0 10k
+X1 3 4 1 STAGE
+X2 4 5 1 STAGE2
+.subckt STAGE a b vdd
+R1 vdd b 2k
+Q1 b a 0 QB
+D1 b 0 DM2
+X1 a b LEAF
+.ends
+.subckt STAGE2 a b vdd
+R1 vdd b 3k
+Q1 b a 0 QC AREA=3
+M1 b a 0 0 NM W=10u L=1u
+.ends
+.subckt LEAF p q
+R1 p q 100k
+D1 q 0 DM1
+Q1 q p 0 QA1
+.ends
+.model QA1 NPN(IS=1e-15 BF=100 CJE=1p CJC=1p TF=0.1n)
+.model QB NPN(IS=2e-15 BF=60 VAF=40 CJE=2p CJC=1p TF=0.2n)
+.model QC NPN(IS=5e-16 BF=200 CJE=0.5p CJC=0.5p)
+.model DM1 D(IS=1e-14 CJO=1p TT=1n)
+.model DM2 D(IS=1e-12 RS=5 CJO=2p)
+.model NM NMOS(VTO=0.7 KP=60u TOX=20n CGSO=3e-10 CGDO=3e-10)
+.ac dec 5 1k 1G
+.end

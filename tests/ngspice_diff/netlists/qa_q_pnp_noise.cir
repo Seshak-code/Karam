@@ -1,0 +1,12 @@
+* QA: PNP CE noise with RB RC RE (no substrate cap)
+VCC 1 0 DC 12
+VIN 6 0 DC 0 AC 1
+CIN 6 2 1u
+R1 2 0 100k
+R2 1 2 22k
+RE 1 4 470
+Q1 3 2 4 QP
+RC 3 0 3.3k
+.model QP PNP(IS=1e-15 BF=70 RB=150 RC=15 RE=4 VAF=50)
+.noise V(3) VIN dec 5 10 1meg
+.end

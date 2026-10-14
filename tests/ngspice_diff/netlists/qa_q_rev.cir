@@ -1,0 +1,8 @@
+* NPN used in reverse (emitter at collector bias), swept
+V1 1 0 DC 0
+RE 1 2 100
+Q1 0 3 2 NR1
+VB 3 0 DC 0.2
+.model NR1 NPN(IS=1e-15 BF=100 BR=8 NR=1.1 VAR=10 IKR=1m ISC=1e-13 NC=1.5)
+.dc V1 -2 3 0.1
+.end

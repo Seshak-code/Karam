@@ -251,19 +251,11 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         smallestPivotOverall = result.smallestPivot;
         rankDeficientRow = result.rankDeficientRow;
       }
-      if (result.rankDeficient && !rankDeficientDetected) {
-        rankDeficientDetected = true;
-        std::cerr << "DC Solver: Near-rank-deficient matrix (pivot="
-                  << result.smallestPivot
-                  << " at row=" << result.rankDeficientRow
-                  << ") — proceeding with GMIN conditioning.\n";
-      }
+      if (result.rankDeficient) rankDeficientDetected = true;
 
       if (!result.converged) {
-        // Matrix is singular - circuit topology error or floating node
-        std::cerr
-            << "DC Solver: Linear solver failed (Singular Matrix) at iter "
-            << iteration << "\n";
+        // Matrix is singular - circuit topology error or floating node (reported
+        // in error_detail if the solve fails; homotopy steps may hit it and recover)
         final_kcl_error = 1e9; // Flag as bad residual
         singularMatrixDetected = true;
         singularRow = result.rankDeficientRow;
@@ -753,6 +745,11 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
       continue;
     }
     const double taken = s.time - t;
+    if (taken < dtMin) {  // accepted, but LTE control cut it below dtMin: no progress (ngspice: delmin)
+      std::ostringstream msg;
+      msg << "Transient timestep too small at t=" << t << " s (" << taken << " s < " << dtMin << " s).";
+      return msg.str();
+    }
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
     if (!onPoint(s)) return "Cancelled.";
@@ -828,7 +825,11 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
       Dual<double> v[5], q[5];
       const int K = junctionCharges(j, x, tempK, v, q);
       double Q[7] = {};
-      for (int k = 0; k < K; ++k) { Q[from[k]] += type * q[k].grad; Q[to[k]] -= type * q[k].grad; }
+      for (int k = 0; k < K; ++k) {
+        const double s = (j.q && k == 3 ? j.subSign : 1.0) * type;  // substrate: to Junction::sub
+        Q[from[k]] += s * q[k].grad;
+        Q[j.q && k == 3 ? j.sub : to[k]] -= s * q[k].grad;
+      }
       for (int t = 0; t < j.terms; ++t) if (Q[t] != 0.0) addC(j.n[t] - 1, j.n[u] - 1, Q[t]);
     }
   });
@@ -959,7 +960,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     if (m.re > 0.0) gens.push_back({j.n[2], j.n[6], kT4 / m.re});
     const double t = m.type;
     const auto e = bjt_gp(t * (V(j.n[5]) - V(j.n[6])), t * (V(j.n[5]) - V(j.n[4])), t * (V(j.n[1]) - V(j.n[4])),
-                          t * (V(j.n[3]) - V(j.n[4])), m);
+                          t * j.subSign * (V(j.n[3]) - V(j.n[j.sub])), m);
     gens.push_back({j.n[4], j.n[6], q2 * std::abs(e.cc)});
     gens.push_back({j.n[5], j.n[6], q2 * std::abs(e.cb)});
   });

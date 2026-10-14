@@ -101,17 +101,17 @@ void SPICEParser::requireFields(const std::vector<std::string>& tok, size_t n) {
                                  std::to_string(n - 1) + " fields after the name");
 }
 
-// Instance fields after a D/Q model name: [area] [AREA=a] [M=m] [OFF] [IC=...].
-// AREA and M both scale the device (currents, capacitances; resistances divide);
-// OFF and IC= only steer the operating-point search / UIC start, as in SPICE.
+// Instance fields after a D/Q model name: [area] [AREA=a] [M=m]. AREA and M both
+// scale the device (currents, capacitances; resistances divide). OFF and IC=
+// steer which operating point SPICE finds (ngspice holds OFF junctions at 0 V
+// through MODEINITFIX) and the UIC start: errors until they are modelled, not dropped.
 double SPICEParser::instanceArea(const std::vector<std::string>& tok, size_t from) const {
     double area = 1.0;
     for (size_t i = from; i < tok.size(); ++i) {
         const std::string k = toUpper(tok[i]);
         if (i == from && isValue(tok[i])) area *= parseValue(tok[i]);
         else if ((k == "AREA" || k == "M") && i + 1 < tok.size() && isValue(tok[i + 1])) area *= parseValue(tok[++i]);
-        else if (k == "OFF") continue;
-        else if (k == "IC") { while (i + 1 < tok.size() && isValue(tok[i + 1])) ++i; }
+        else if (k == "OFF" || k == "IC") throw std::runtime_error(tok[0] + ": " + k + " is not supported yet");
         else throw std::runtime_error(tok[0] + ": parameter " + k + " is not supported yet");
     }
     if (!(area > 0.0)) throw std::runtime_error(tok[0] + ": AREA and M must be > 0");
@@ -490,11 +490,31 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             if (!ok) throw std::runtime_error("model " + c->name + ": parameter " + k + " is not supported yet");
         }
     };
+    // Magnitudes (>= 0) and scales (> 0): a negative value is a sign error, never a
+    // model; it used to be simulated silently (VAF = -5 put 18 V on a 3 V supply).
+    auto bounded = [&](const ModelCard* c, std::initializer_list<const char*> nonNeg,
+                       std::initializer_list<const char*> pos) {
+        for (const char* k : nonNeg)
+            if (c->params.count(k) && !(c->params.at(k) >= 0.0))
+                throw std::runtime_error("model " + c->name + ": " + k + " must be >= 0");
+        for (const char* k : pos)
+            if (c->params.count(k) && !(c->params.at(k) > 0.0))
+                throw std::runtime_error("model " + c->name + ": " + k + " must be > 0");
+    };
+    // The card's type must fit the device (a Q on an NMOS card reported "VTO is not supported")
+    auto kind = [&](const ModelCard* c, const std::string& inst, std::initializer_list<const char*> types) {
+        for (const char* t : types) if (c->type == t) return c;
+        throw std::runtime_error(inst + ": model " + c->name + " is " + c->type + ", not a " +
+                                 std::string(*types.begin()) + "/" + *(types.begin() + 1) + " model");
+    };
     auto resolveBlock = [&](TensorBlock& blk) {
         for (auto& m : blk.mosfets)
-            if (const ModelCard* c = card(m.modelName)) {
+            if (const ModelCard* c = kind(card(m.modelName), m.instanceName, {"NMOS", "PMOS"})) {
                 supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
                               "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC"});
+                bounded(c, {"KP", "LAMBDA", "GAMMA", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO", "CGBO",
+                            "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW"},
+                        {"PHI"});
                 auto& k = m.card;
                 k.resolved = true;
                 k.pmos = c->type == "PMOS";
@@ -519,25 +539,29 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             return def;
         };
         // EG/XTI/XTB only act away from TNOM; the engine runs at TNOM.
-        for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
+        for (auto& d : blk.diodes) if (const ModelCard* c = kind(card(d.modelName), d.instanceName, {"D", "D"})) {
             supported(c, {"IS", "N", "RS", "CJO", "CJ0", "CJ", "VJ", "PB", "M", "MJ", "FC", "TT", "BV", "IBV",
                           "EG", "XTI"});
+            bounded(c, {"IS", "RS", "CJO", "CJ0", "CJ", "M", "MJ", "TT"}, {"N", "BV"});  // ngspice: BV = 0 breaks down at 0 V
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
             d.emissionCoefficient_N   = c->get("N", 1.0);
             auto& k = d.card;
             k.rs = c->get("RS", 0.0); k.cjo = first(c, {"CJO", "CJ0", "CJ"}, 0.0);
             k.vj = first(c, {"VJ", "PB"}, 1.0); k.m = first(c, {"M", "MJ"}, 0.5);
             k.fc = c->get("FC", 0.5); k.tt = c->get("TT", 0.0);
-            k.bvGiven = c->get("BV", 0.0) != 0.0;  // BV = 0 means no breakdown (SPICE: infinite)
+            k.bvGiven = c->params.count("BV") > 0;  // BV > 0 (checked above)
             k.bv = c->get("BV", 0.0); k.ibv = c->get("IBV", 1e-3);
             if (!(k.m < 1.0 && k.vj > 0.0 && k.fc < 1.0 && k.rs >= 0.0 && k.ibv > 0.0))
                 throw std::runtime_error("model " + c->name + ": needs M < 1, VJ > 0, FC < 1, RS >= 0, IBV > 0");
         }
-        for (auto& q : blk.bjts) if (const ModelCard* c = card(q.modelName)) {
+        for (auto& q : blk.bjts) if (const ModelCard* c = kind(card(q.modelName), q.instanceName, {"NPN", "PNP"})) {
             supported(c, {"IS", "BF", "BR", "NF", "NR", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR",
                           "ISE", "NE", "ISC", "NC", "RB", "RC", "RE", "CJE", "VJE", "PE", "MJE", "ME",
                           "CJC", "VJC", "PC", "MJC", "MC", "XCJC", "CJS", "CCS", "VJS", "PS", "MJS", "MS",
-                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS"});
+                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS", "SUBS"});
+            bounded(c, {"IS", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR", "ISE", "ISC", "CJE", "CJC", "CJS", "CCS",
+                        "MJE", "ME", "MJC", "MC", "MJS", "MS", "TF", "XTF", "VTF", "ITF", "TR", "ISS"},
+                    {"NE", "NC", "NS"});
             q.isNPN = (c->type != "PNP");
             q.saturationCurrent_I_S_A = c->get("IS", 1e-16);
             q.betaF = c->get("BF", 100.0);
@@ -555,6 +579,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             k.cjs = first(c, {"CJS", "CCS"}, 0.0); k.vjs = first(c, {"VJS", "PS"}, 0.75); k.mjs = first(c, {"MJS", "MS"}, 0.0);
             k.fc = c->get("FC", 0.5);
             k.iss = c->get("ISS", 0.0); k.ns = c->get("NS", 1.0);
+            // SUBS (ngspice): 1 vertical (substrate junction to C), -1 lateral (to B); default by polarity
+            const double subs = c->get("SUBS", q.isNPN ? 1.0 : -1.0);
+            if (subs != 1.0 && subs != -1.0) throw std::runtime_error("model " + c->name + ": SUBS must be 1 or -1");
+            k.lateral = subs == -1.0;
             k.tf = c->get("TF", 0.0); k.xtf = c->get("XTF", 0.0); k.vtf = c->get("VTF", 0.0);
             k.itf = c->get("ITF", 0.0); k.tr = c->get("TR", 0.0);
             // RBM != RB makes the base resistance bias dependent (qb), which is not modelled
@@ -799,12 +827,16 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.source = nodeIndex(tok[3]);
     m.body   = nodeIndex(tok[4]);
     m.modelName = tok[5];
+    if (!modelNames_.count(toUpper(tok[5])))
+        throw std::runtime_error(tok[0] + ": expected 4 nodes (d g s b), then a model name; '" + tok[5] +
+                                 "' is not a .model card");
     m.w = m.l = 100e-6;  // SPICE DEFW / DEFL
 
     // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS act through CJ/CJSW;
     // NRD/NRS only through RSH, which the model check rejects.
     for (size_t i = 6; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
+        if (upper == "OFF") throw std::runtime_error(tok[0] + ": OFF is not supported yet");
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")        m.w = parseValue(tok[++i]);
         else if (upper == "L")   m.l = parseValue(tok[++i]);
@@ -833,15 +865,9 @@ void SPICEParser::parseBJT(const std::vector<std::string>& tok, TensorBlock& blk
     q.base = nodeIndex(tok[2]);
     q.emitter = nodeIndex(tok[3]);
 
-    // Optional substrate node: tok[4] is the substrate only if tok[5] is a
-    // name (not a number or an instance keyword). The old "starts with a
-    // digit" test took models like 2N3904 for a node. No substrate node: ground.
-    size_t modelIdx = 4;
-    if (tok.size() >= 6) {
-        std::string t5 = toUpper(tok[5]);
-        if (!isValue(tok[5]) && t5 != "AREA" && t5 != "OFF" && t5 != "IC" && t5 != "M")
-            modelIdx = 5;
-    }
+    // Optional substrate node: tok[4] is the substrate when tok[5] names a .model
+    // card (all names are known after the first pass). No substrate node: ground.
+    const size_t modelIdx = tok.size() >= 6 && modelNames_.count(toUpper(tok[5])) ? 5 : 4;
     if (modelIdx == 5) q.substrate = nodeIndex(tok[4]);
     q.modelName = tok[modelIdx];
     q.area = instanceArea(tok, modelIdx + 1);

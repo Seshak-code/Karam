@@ -634,6 +634,8 @@ public:
     const BJT *q = nullptr;
     std::array<int, 7> n{};
     int terms = 0;
+    int sub = 4;           // BJT: substrate junction's inner terminal, C' (vertical) or B' (lateral)
+    double subSign = 1.0;  // BJT SUBS: substrate voltage type*SUBS*(S - that terminal)
     BlockState::DeviceCharge *st = nullptr;
   };
   template <class F> void forEachJunction(const TensorNetlist &nl, F &&f) const {
@@ -659,6 +661,7 @@ public:
         j.n[4] = q.card.rc > 0.0 ? next++ : j.n[0];
         j.n[5] = q.card.rb > 0.0 ? next++ : j.n[1];
         j.n[6] = q.card.re > 0.0 ? next++ : j.n[2];
+        if (q.card.lateral) { j.sub = 5; j.subSign = -1.0; }
         j.st = i < st->bjtState.size() ? &st->bjtState[i] : nullptr;
         f(j);
       }
@@ -756,7 +759,7 @@ public:
   }
 
   // Charge branches (terminal pairs, q flows from -> to): diode A'->C; BJT
-  // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C').
+  // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C'; lateral: S->B', Junction::sub).
   static constexpr int diodeFrom[1] = {2}, diodeTo[1] = {1};
   static constexpr int bjtFrom[4] = {5, 5, 1, 3}, bjtTo[4] = {6, 4, 4, 4};
 
@@ -781,7 +784,8 @@ public:
     }
     const auto p = bjtModel(*j.q, tempK);
     const double t = p.type;
-    for (int k = 0; k < 4; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
+    for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
+    v[3] = t * j.subSign * (x[3] - x[j.sub]);
     v[0] = shifted(v[0], sh, 0); v[1] = shifted(v[1], sh, 1);
     const auto e = bjt_gp(v[0], v[1], v[2], v[3], p);
     for (int k = 0; k < 4; ++k) q[k] = e.q[k];
@@ -817,9 +821,9 @@ public:
       };
       res(0, 4, p.rc); res(1, 5, p.rb); res(2, 6, p.re);
       const auto e = bjt_gp(shifted(T(type * (x[5] - x[6])), sh, 0), shifted(T(type * (x[5] - x[4])), sh, 1),
-                            T(type * (x[1] - x[4])), T(type * (x[3] - x[4])), p);
+                            T(type * (x[1] - x[4])), T(type * j.subSign * (x[3] - x[j.sub])), p);
       I[4] += type * e.cc; I[5] += type * e.cb; I[6] -= type * (e.cc + e.cb);
-      I[3] += type * e.cs; I[4] -= type * e.cs;  // substrate junction S -> C'
+      I[3] += type * j.subSign * e.cs; I[j.sub] -= type * j.subSign * e.cs;  // substrate junction
       from = bjtFrom; to = bjtTo;
     }
     const BlockState::DeviceCharge *st = j.st;
@@ -834,8 +838,9 @@ public:
     const bool trap = integrator->getType() == IntegrationType::TRAPEZOIDAL;
     for (int k = 0; k < K; ++k) {
       const T i = trap ? (2.0 / h) * (q[k] - st->q[k]) - st->i[k] : (q[k] - st->q[k]) / h;
-      I[from[k]] += type * i;
-      I[to[k]] -= type * i;
+      const bool sub = j.q && k == 3;  // substrate branch: to Junction::sub, SUBS sign
+      I[from[k]] += (sub ? j.subSign : 1.0) * type * i;
+      I[sub ? j.sub : to[k]] -= (sub ? j.subSign : 1.0) * type * i;
       if constexpr (std::is_same_v<T, double>)
         if (next) { next->v[0][k] = v[k]; next->q[k] = q[k]; next->i[k] = i; }
     }

@@ -1,0 +1,7 @@
+* fine sweep around vdsat, all Meyer regions via caps in ac at several biases
+VD 1 0 DC 1
+VG 2 0 DC 1.7 AC 1
+M1 1 2 0 0 NM W=10u L=1u
+.model NM NMOS(VTO=0.7 KP=60u TOX=20n LAMBDA=0.02 CGSO=3e-10 CGDO=3e-10 CGBO=2e-10)
+.dc VD 0 3 0.01
+.end

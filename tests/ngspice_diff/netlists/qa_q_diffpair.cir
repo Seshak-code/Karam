@@ -1,0 +1,13 @@
+* differential pair with tail current source, DC sweep of differential input
+VCC 1 0 DC 12
+VEE 7 0 DC -12
+VA 2 0 DC 0
+VB 3 0 DC 0.1
+RC1 1 4 5k
+RC2 1 5 5k
+Q1 4 2 6 QD
+Q2 5 3 6 QD
+IT 6 7 DC 1m
+.model QD NPN(IS=1e-15 BF=150 VAF=100 RB=100 RC=10 CJE=1p CJC=0.5p TF=300p)
+.dc VA -0.2 0.2 0.01
+.end

@@ -1,0 +1,11 @@
+* PMOS pass transistor passing a high level, load cap
+VDD 1 0 DC 3
+VG 2 0 PULSE(3 0 5n 1n 1n 30n 100n)
+VS 3 0 DC 0
+M1 4 2 5 1 PM W=10u L=1u AD=10p AS=10p PD=8u PS=8u
+VIN 5 0 PULSE(0 3 1n 1n 1n 10n 40n)
+C1 4 0 20f
+RL 4 0 1meg
+.model PM PMOS(VTO=-0.8 KP=25u TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=4e-4 CJSW=3e-10 GAMMA=0.4 PHI=0.65)
+.tran 0.05n 100n
+.end

@@ -296,13 +296,11 @@ From `Roadmap.md` Phase 2, with pointers:
   pre-existing failures (DTO default `success`, two MC result counts) — verified identical at baseline.
 - Hard nonlinear DC: plain-Newton-first costs extra iterations (Darlington 35 → ~115); consider a lower
   iteration cap on the direct attempt.
-- Instance KCL audit: diodes use the unclamped equation and MOSFETs hard-coded params (global audit uses
-  model cards) — inconsistent for model-card MOSFETs inside subcircuits.
 - BJT: bias-dependent base resistance (IRB, RBM != RB), excess phase (PTF), flicker noise (KF), temperature
   coefficients away from TNOM: explicit errors or no effect. JFET AREA, EXP/PWL/SFFM/AM, T lines: explicit errors.
-- Subcircuit parameters (`params:`) unsupported. `.include/.lib/.options/.ic/.print` silently ignored.
+- Subcircuit parameters (`params:`) and `.param` arithmetic expressions unsupported (PDK libraries use
+  both). `.options`: only `gminsteps` is read, the rest ignored; `.print` ignored (output only).
 - Junction-cap shortcut and other simplifications are marked `ponytail:` in code (grep for it).
-- AVX2/AVX-512 kernels are x86-only and were not built on this Mac; they mirror the NEON code.
 - Engine CLI (`acutesim_engine_cli`) parses `.tran 10u` with `istringstream` (no SI suffixes).
 
 ## 7. Gotchas learned the hard way

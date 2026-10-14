@@ -1,0 +1,9 @@
+* PNP saturation sweep with GP params
+VCC 1 0 DC 5
+VB 2 0 DC 0
+RB 2 3 10k
+Q1 4 3 1 PN
+RC 4 0 1k
+.model PN PNP(IS=2e-15 BF=80 BR=3 NF=1.02 NR=1.05 VAF=40 VAR=15 IKF=5m IKR=2m ISE=1e-14 NE=1.6 ISC=1e-14 NC=1.4 RB=100 RC=10 RE=2)
+.dc VB 0 5 0.1
+.end

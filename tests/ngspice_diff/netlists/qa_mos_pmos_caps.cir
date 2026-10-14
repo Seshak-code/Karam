@@ -1,0 +1,11 @@
+* QA: PMOS inverter-like stage with heavy overlap/junction caps, tran + bulk pulled above rail
+VDD 1 0 DC 3
+VIN 2 0 PULSE(3 0 5n 2n 2n 20n 60n)
+RG 2 3 2k
+MP 4 3 1 6 PM W=40u L=1u AD=60p AS=60p PD=20u PS=20u
+VB 6 0 PULSE(3 3.6 15n 5n 5n 20n 60n)
+RL 4 0 5k
+CL 4 0 30f
+.model PM PMOS(VTO=-0.8 KP=25u GAMMA=0.4 PHI=0.65 LAMBDA=0.03 TOX=20n CGSO=5e-10 CGDO=5e-10 CGBO=4e-10 CJ=5e-4 CJSW=4e-10 PB=0.8 MJ=0.5 MJSW=0.33)
+.tran 0.1n 60n
+.end

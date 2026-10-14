@@ -1,0 +1,11 @@
+* QA: BJT cascode amplifier tran with Miller caps and substrate caps
+VCC 1 0 DC 10
+VB2 5 0 DC 4
+VIN 2 0 SIN(0.8 0.05 5meg)
+RS 2 6 50
+Q1 3 6 0 0 QN
+Q2 4 5 3 0 QN
+RC 1 4 2k
+.model QN NPN(IS=1e-15 BF=150 VAF=80 RB=60 CJE=1p CJC=0.6p CJS=1p TF=0.2n TR=5n)
+.tran 1n 1u
+.end

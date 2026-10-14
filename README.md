@@ -80,11 +80,12 @@ honest expected scaling, not a claim of beating it.
 | Diode | SPICE level 1: IS, N, RS (internal node), CJO/VJ/M/FC, TT, BV/IBV breakdown, instance AREA/M |
 | BJT | Gummel–Poon: IS, BF/BR, NF/NR, VAF/VAR, IKF/IKR, ISE/NE, ISC/NC, RB/RC/RE (internal nodes), CJE/CJC with XCJC, CJS (substrate node), TF/XTF/VTF/ITF, TR, AREA |
 | MOSFET | Level 1 complete: source/drain swap, body effect, bulk junctions, Meyer gate charge, overlap and junction capacitances |
-| Netlist | SPICE syntax with SI suffixes, `.model`, `.param` substitution, `.subckt`. Unknown or unsupported cards are **hard errors**, never silently dropped |
-| Convergence | Plain Newton first, then ngspice's dynamic gmin stepping on failure; gmin across each PN junction as in ngspice; responses fail closed on NaN or non-convergence |
+| Compiled Verilog-A | BSIM4, BSIM-CMG and other OpenVAF models through OSDI (`.osdi <file>`, ngspice's `N` element): DC, transient, AC, noise (flicker included) |
+| Netlist | SPICE syntax with SI suffixes, `.model`, `.param` substitution, `.subckt`, `.include`, `.lib <file> <corner>`. Unknown or unsupported cards are **hard errors**, never silently dropped |
+| Convergence | Plain Newton first, then ngspice's dynamic gmin stepping, then source stepping; gmin across each PN junction as in ngspice; responses fail closed on NaN or non-convergence |
 | Determinism | No `-ffast-math`, round-to-nearest enforced, deterministic parallel solve |
 
-**Not yet supported:** BSIM4/BSIM-CMG, bias-dependent base resistance (IRB/RBM), excess phase (PTF), flicker noise (KF), `.lib`/`.include`,
+**Not yet supported:** `.param` arithmetic expressions, bias-dependent base resistance (IRB/RBM), excess phase (PTF), flicker noise (KF) of built-in devices, OSDI models that keep state or use `$limit`,
 EXP/PWL/SFFM sources, transmission lines, PZ analysis. The GPU mode currently runs the CPU
 path.
 
@@ -141,10 +142,10 @@ waveform corners, all running through one transient loop shared by the API and t
 |---|---|
 | MOSFET level 1, DC and charges | ✅ done |
 | Diode RS/CJO/TT/BV, Gummel–Poon BJT with junction capacitances | ✅ done |
-| BSIM4, BSIM-CMG and PSP through an OSDI loader compiled with OpenVAF (the ngspice ≥ 39 route), not hand ports | Established |
-| `.lib` sections and process corners (PDK ingestion) | Established |
+| BSIM4, BSIM-CMG and PSP through an OSDI loader compiled with OpenVAF (the ngspice ≥ 39 route), not hand ports | ✅ done (BSIM4, BSIM-CMG verified against ngspice) |
+| `.lib` sections and process corners (PDK ingestion) | ✅ done (`.param` expressions still open) |
 | Dynamic gmin stepping (ngspice `dynamic_gmin`) | ✅ done |
-| Source stepping | Established |
+| Source stepping | ✅ done |
 | **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so TreeSPICE must win there too, not only on resistor grids | Established techniques, open outcome |
 | **Condition-number survey** of real MNA matrices, with and without gmin and scaling. This decides whether low-precision factors are viable | Open: no published data |
 | Per-front dirty flags with exact reuse of an unchanged subtree's Schur complement (CPU prototype) | Open integration |
