@@ -1,0 +1,9 @@
+* NPN high injection IKF/IKR, forward and reverse active, saturation
+VCC 1 0 DC 10
+VB 2 0 DC 0
+RB 2 3 1k
+Q1 4 3 0 NH
+RC 1 4 100
+.model NH NPN(IS=1e-16 BF=300 BR=5 IKF=2m IKR=1m ISE=1e-13 NE=1.8 VAF=60 VAR=20 RB=50 RC=5 RE=1)
+.dc VB 0 10 0.1
+.end

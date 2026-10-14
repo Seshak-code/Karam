@@ -1,0 +1,17 @@
+* QA: CMOS cross-coupled NOR SR latch, set/reset pulses, tran
+VDD 1 0 DC 3.3
+VS 2 0 PULSE(0 3.3 80n 1n 1n 20n 200n)
+VR 3 0 PULSE(3.3 0 30n 1n 1n 1 200n)
+X1 2 5 4 1 NOR
+X2 3 4 5 1 NOR
+.subckt NOR a b y vdd
+MP1 m a vdd vdd PM W=8u L=1u AD=8p AS=8p PD=10u PS=10u
+MP2 y b m vdd PM W=8u L=1u AD=8p AS=8p PD=10u PS=10u
+MN1 y a 0 0 NM W=2u L=1u AD=2p AS=2p PD=5u PS=5u
+MN2 y b 0 0 NM W=2u L=1u AD=2p AS=2p PD=5u PS=5u
+CL y 0 20f
+.ends
+.model NM NMOS(VTO=0.7 KP=60u LAMBDA=0.03 GAMMA=0.4 PHI=0.7 TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=3e-4 CJSW=3e-10)
+.model PM PMOS(VTO=-0.8 KP=25u LAMBDA=0.03 GAMMA=0.4 PHI=0.7 TOX=20n CGSO=3e-10 CGDO=3e-10 CJ=3e-4 CJSW=3e-10)
+.tran 0.2n 140n
+.end

@@ -1,0 +1,10 @@
+* breakdown clamp in tran with sine
+V1 1 0 SIN(0 10 1meg)
+R1 1 2 1k
+D1 0 2 DZ
+D2 2 3 DX
+R2 3 0 1k
+.model DZ D(IS=1e-14 BV=6.8 IBV=1m CJO=1p)
+.model DX D(IS=1e-14)
+.tran 5n 3u
+.end

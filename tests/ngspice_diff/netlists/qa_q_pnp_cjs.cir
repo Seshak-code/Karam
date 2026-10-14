@@ -1,0 +1,12 @@
+* QA BUG: PNP CJS only; ngspice gives NO C-S cap for PNP (NPN mirror matches), engine stamps it
+VCC 1 0 DC 12
+VIN 9 0 DC 0 AC 1
+CIN 9 2 1u
+R1 1 2 100k
+R2 2 0 22k
+R3 1 5 1k
+Q2 6 2 5 1 QP
+RC2 6 0 500
+.model QP PNP(IS=1e-15 BF=60 VAF=50 CJS=2p)
+.ac dec 10 1meg 10G
+.end

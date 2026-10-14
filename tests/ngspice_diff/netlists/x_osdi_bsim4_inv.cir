@@ -1,0 +1,13 @@
+* OSDI: BSIM4 CMOS inverter pair, transient (model charges, internal nodes)
+.osdi bsim4.osdi
+VDD 1 0 DC 1.2
+VIN 2 0 PULSE(0 1.2 0.2n 50p 50p 1n 2.4n)
+NP1 3 2 1 1 pch
+NN1 3 2 0 0 nch
+NP2 4 3 1 1 pch
+NN2 4 3 0 0 nch
+C4 4 0 2f
+.model nch bsim4va type=1 w=1u l=100n
+.model pch bsim4va type=-1 w=2u l=100n
+.tran 5p 3n
+.end

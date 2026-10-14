@@ -1,0 +1,14 @@
+* AC at cutoff, linear, saturation: three NMOS with different biases
+V1 1 0 DC 3 AC 1
+R1 1 2 1k
+M1 2 3 0 0 NM W=20u L=1u AD=20p AS=20p PD=10u PS=10u
+VG 3 0 DC 0.5 AC 0
+R2 1 4 1k
+M2 4 5 0 0 NM W=20u L=1u AD=20p AS=20p PD=10u PS=10u
+VG2 5 0 DC 1.5
+R3 1 6 100k
+M3 6 7 0 0 NM W=20u L=1u AD=20p AS=20p PD=10u PS=10u
+VG3 7 0 DC 3
+.model NM NMOS(VTO=0.7 KP=60u TOX=20n CGSO=3e-10 CGDO=3e-10 CGBO=2e-10 CJ=3e-4 CJSW=4e-10 MJ=0.5 MJSW=0.33 PB=0.8)
+.ac dec 5 1meg 10G
+.end

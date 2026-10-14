@@ -1,0 +1,7 @@
+* diode cap forward beyond FC*VJ in ac
+V1 1 0 DC 0.8 AC 1
+R1 1 2 10
+D1 2 0 DC1
+.model DC1 D(IS=1e-15 CJO=5p VJ=0.6 M=0.33 FC=0.4 TT=1n)
+.ac dec 5 1meg 1G
+.end

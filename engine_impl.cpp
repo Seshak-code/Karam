@@ -87,7 +87,7 @@ static JobID generateJobID() {
 // partial (or empty) netlist solved anyway, reporting "converged".
 static bool deserialiseRequest(const SimulationRequestDTO& req, SPICEParseResult& out,
                                SimulationResponseDTO& failure) {
-    out = SPICEParser().parse(req.source.payload);
+    out = SPICEParser().parse(req.source.payload, req.source.baseDir);
     if (out.success) return true;
     failure.errorDetail = "SPICE parse error: " + out.errorMessage;
     return false;

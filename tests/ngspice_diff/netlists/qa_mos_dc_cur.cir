@@ -1,0 +1,18 @@
+* QA: MOS1 DC with series Rs (currents observable): body effect, S/D swap, PMOS, LD, M, LAMBDA, sweep through Vds<0
+VD 1 0 DC 0
+RD 1 2 100
+VG 3 0 DC 2
+VB 4 0 DC -1
+M1 2 3 5 4 NB W=10u L=2u M=3
+RS 5 6 100
+VS 6 0 DC 0.5
+MP 7 3 8 9 PB W=10u L=1u
+RP 7 10 200
+VP 10 0 DC 0
+RQ 8 11 50
+VQ 11 0 DC 1
+VNW 9 0 DC 2.5
+.model NB NMOS(VTO=0.7 KP=80u LD=0.2u GAMMA=0.5 PHI=0.7 LAMBDA=0.05 CBD=1f CBS=1f TOX=20n)
+.model PB PMOS(VTO=-0.8 KP=30u GAMMA=0.4 PHI=0.65 LAMBDA=0.04)
+.dc VD -2 3 0.1
+.end

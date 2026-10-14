@@ -62,7 +62,8 @@ public:
     SPICEParser() = default;
 
     /// Parse a complete SPICE netlist string.
-    SPICEParseResult parse(const std::string& netlistText);
+    // baseDir: directory .include / .lib paths are relative to (empty: working directory)
+    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "");
 
 private:
     // ── Value and Token Helpers ────────────────────────────────────────
@@ -79,6 +80,9 @@ private:
 
     // ── Line Pre-Processing ───────────────────────────────────────────
     /// Merge continuation lines ('+' prefix), strip comments.
+    // Splice .include files and .lib sections into the lines (recursively).
+    std::vector<std::pair<int, std::string>> expandIncludes(const std::vector<std::pair<int, std::string>>& lines,
+                                                            const std::string& dir, int depth, int& errLine);
     static std::vector<std::pair<int, std::string>> preprocessLines(
         const std::string& text);
 
@@ -93,6 +97,7 @@ private:
     void parseMosfet     (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseBJT        (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseJFET       (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseOsdiDevice (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
@@ -141,6 +146,8 @@ private:
 
     // Model cards collected during parse, merged into netlist at end
     std::map<std::string, ModelCard> modelCards_;
+    std::set<std::string> modelNames_;                              // every .model name (first pass)
+    std::map<std::string, std::shared_ptr<osdi::Model>> osdiModels_; // per card, shared by its N devices
 
     // .param expressions (name -> value)
     std::map<std::string, double> params_;

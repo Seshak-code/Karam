@@ -1,0 +1,11 @@
+* QA: NMOS used with drain/source swapped (Vds<0) in tran with all caps; ac coupling via gate
+VG 1 0 PULSE(0 3 2n 2n 2n 30n 80n)
+RG 1 2 5k
+M1 3 2 4 0 NM W=20u L=1u AD=30p AS=30p PD=12u PS=12u
+VH 3 0 DC 0
+RS 4 5 2k
+VL 5 0 PULSE(2.5 0.2 10n 3n 3n 20n 80n)
+C4 4 0 100f
+.model NM NMOS(VTO=0.7 KP=60u GAMMA=0.4 PHI=0.7 LAMBDA=0.02 TOX=20n CGSO=4e-10 CGDO=2e-10 CGBO=3e-10 CJ=4e-4 MJ=0.45 CJSW=5e-10 MJSW=0.28 PB=0.9 FC=0.4)
+.tran 0.1n 80n
+.end

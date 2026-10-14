@@ -1,0 +1,7 @@
+* MOS with no W/L, no model params (defaults W=L=1e-4?)
+V1 1 0 DC 3
+V2 2 0 DC 3
+M1 1 2 0 0 NM
+.model NM NMOS
+.dc V1 0 3 0.5
+.end

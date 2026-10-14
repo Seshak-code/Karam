@@ -1,0 +1,15 @@
+* QA: PNP differential pair with mirror load (NPN), DC sweep
+VCC 1 0 DC 10
+VA 2 0 DC 0
+VB 3 0 DC 0.0
+IT 1 6 DC 1m
+Q1 4 2 6 QP
+Q2 5 3 6 QP
+Q3 4 4 0 QN
+Q4 5 4 0 QN
+RL 5 7 10k
+VL 7 0 DC 3
+.model QP PNP(IS=1e-15 BF=80 VAF=50 RB=100)
+.model QN NPN(IS=1e-15 BF=150 VAF=70 RB=50)
+.dc VA -0.2 0.2 0.01
+.end

@@ -1,0 +1,6 @@
+* QA netlist
+V1 1 0 DC 0
+D1 1 0 DM AREA=3 M=2
+.model DM D(IS=1e-14 RS=1)
+.dc V1 -0.5 1 0.05
+.end

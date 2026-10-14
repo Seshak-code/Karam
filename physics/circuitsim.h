@@ -22,10 +22,10 @@
 
 #include "../autodiff/dual.h"
 #include "device_physics.h"
+#include "../osdi/osdi_device.h"
 #include "physics_constants.h"
 #include "../tensors/physics_tensors.h"
 #include "stamps.h"
-#include "../infrastructure/model_registry.h"
 
 // ============================================================================
 // CIRCUITSIM CLASS
@@ -633,6 +633,8 @@ public:
     const BJT *q = nullptr;
     std::array<int, 7> n{};
     int terms = 0;
+    int sub = 4;           // BJT: substrate junction's inner terminal, C' (vertical) or B' (lateral)
+    double subSign = 1.0;  // BJT SUBS: substrate voltage type*SUBS*(S - that terminal)
     BlockState::DeviceCharge *st = nullptr;
   };
   template <class F> void forEachJunction(const TensorNetlist &nl, F &&f) const {
@@ -658,14 +660,105 @@ public:
         j.n[4] = q.card.rc > 0.0 ? next++ : j.n[0];
         j.n[5] = q.card.rb > 0.0 ? next++ : j.n[1];
         j.n[6] = q.card.re > 0.0 ? next++ : j.n[2];
+        if (q.card.lateral) { j.sub = 5; j.subSign = -1.0; }
         j.st = i < st->bjtState.size() ? &st->bjtState[i] : nullptr;
         f(j);
       }
     }
   }
 
+  // Independent source value: its waveform in transient, else DC, times the
+  // source-stepping factor (1 except while solveDC ramps the sources).
+  double srcFact_ = 1.0;
+  template <class S> double sourceValue(const S &s, double dc, double h, double time) const {
+    return srcFact_ * (h > 1e-15 ? waveformValue(s, dc, time) : dc);
+  }
+
+  // OSDI devices (compiled Verilog-A: BSIM4, BSIM-CMG, ...). An instance's local
+  // nodes are its terminals, then the internal nodes left after collapsing; the
+  // internal nodes are unknowns after the junction internals (BranchSlot::dev).
+  static int osdiInternals(const BlockState &st) {
+    int k = 0;
+    for (const auto &in : st.osdiState) k += in ? (int)in->numInternal() : 0;
+    return k;
+  }
+  static int deviceInternals(const TensorBlock &blk, const BlockState &st) {
+    return junctionInternals(blk) + osdiInternals(st);
+  }
+  struct OsdiRef {
+    const OsdiDevice *dev;
+    osdi::Instance *in;
+    std::vector<int> n;  // 1-based unknown of each local node (0 = ground)
+  };
+  template <class F> void forEachOsdi(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      int next = sl.dev + junctionInternals(*sl.blk) + 1;
+      for (size_t i = 0; i < sl.blk->osdiDevices.size() && i < sl.st->osdiState.size(); ++i) {
+        osdi::Instance *in = sl.st->osdiState[i].get();
+        if (!in) continue;
+        OsdiRef r{&sl.blk->osdiDevices[i], in, {}};
+        for (int t : r.dev->nodes) r.n.push_back(sl.map(t));
+        for (uint32_t k = 0; k < in->numInternal(); ++k) r.n.push_back(next++);
+        f(r);
+      }
+    }
+  }
+
+  // Currents into an OSDI device's local nodes at the unknowns v: the resistive
+  // residual plus, in transient, its charges' current integrated from the last
+  // accepted step (TRAP, else BE, as mosCurrents). One definition for the stamp,
+  // the KCL audit and the history update. J: dI/dx = G + coef*C (row-major).
+  // accept: store this point as the accepted step. A fatal model error gives NaN.
+  std::vector<double> osdiCurrents(const OsdiRef &r, const std::vector<double> &v, double h,
+                                   std::vector<double> *J = nullptr, bool accept = false) const {
+    const size_t L = r.n.size();
+    std::vector<double> x(L), I(L);
+    for (size_t k = 0; k < L; ++k) x[k] = r.n[k] > 0 && r.n[k] <= (int)v.size() ? v[r.n[k] - 1] : 0.0;
+    const bool tran = h > 1e-15 && integrator;
+    osdi::Instance &in = *r.in;
+    if (!in.evaluate(x.data(), tran ? osdi::ANALYSIS_TRAN : osdi::ANALYSIS_DC | osdi::ANALYSIS_STATIC, 0.0)) {
+      std::fill(I.begin(), I.end(), NAN);
+      if (J) J->assign(L * L, 0.0);
+      return I;
+    }
+    const bool trap = tran && integrator->getType() == IntegrationType::TRAPEZOIDAL;
+    const double coef = !tran ? 0.0 : trap ? 2.0 / h : 1.0 / h;
+    for (size_t k = 0; k < L; ++k) {
+      const double iq = tran ? coef * (in.q()[k] - in.qPrev[k]) - (trap ? in.iPrev[k] : 0.0) : 0.0;
+      I[k] = in.f()[k] + iq;
+      if (accept) { in.qPrev[k] = in.q()[k]; in.iPrev[k] = iq; }
+    }
+    if (accept) { in.vHist[2] = in.vHist[1]; in.vHist[1] = in.vHist[0]; in.vHist[0] = x; }
+    if (J) {
+      J->assign(L * L, 0.0);
+      for (size_t a = 0; a < L; ++a)
+        for (size_t b = 0; b < L; ++b) (*J)[a * L + b] = in.G(a, b) + coef * in.C(a, b);
+    }
+    return I;
+  }
+
+  // Newton stamp of osdiCurrents() at v (a node shared by two terminals sums).
+  void stampOsdi(const OsdiRef &r, const std::vector<double> &v, double h) {
+    std::vector<double> J;
+    const auto I = osdiCurrents(r, v, h, &J);
+    const size_t L = r.n.size();
+    auto V = [&](int g) { return g > 0 && g <= (int)v.size() ? v[g - 1] : 0.0; };
+    for (size_t t = 0; t < L; ++t) {
+      if (r.n[t] <= 0) continue;
+      double ieq = I[t];
+      for (size_t u = 0; u < L; ++u) {
+        const double g = J[t * L + u];
+        if (g == 0.0) continue;
+        ieq -= g * V(r.n[u]);
+        if (r.n[u] > 0) matrixBuilder.add(r.n[t] - 1, r.n[u] - 1, g);
+      }
+      rhsVector[r.n[t] - 1] -= ieq;
+    }
+  }
+
   // Charge branches (terminal pairs, q flows from -> to): diode A'->C; BJT
-  // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C').
+  // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C'; lateral: S->B', Junction::sub).
   static constexpr int diodeFrom[1] = {2}, diodeTo[1] = {1};
   static constexpr int bjtFrom[4] = {5, 5, 1, 3}, bjtTo[4] = {6, 4, 4, 4};
 
@@ -690,7 +783,8 @@ public:
     }
     const auto p = bjtModel(*j.q, tempK);
     const double t = p.type;
-    for (int k = 0; k < 4; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
+    for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
+    v[3] = t * j.subSign * (x[3] - x[j.sub]);
     v[0] = shifted(v[0], sh, 0); v[1] = shifted(v[1], sh, 1);
     const auto e = bjt_gp(v[0], v[1], v[2], v[3], p);
     for (int k = 0; k < 4; ++k) q[k] = e.q[k];
@@ -726,9 +820,9 @@ public:
       };
       res(0, 4, p.rc); res(1, 5, p.rb); res(2, 6, p.re);
       const auto e = bjt_gp(shifted(T(type * (x[5] - x[6])), sh, 0), shifted(T(type * (x[5] - x[4])), sh, 1),
-                            T(type * (x[1] - x[4])), T(type * (x[3] - x[4])), p);
+                            T(type * (x[1] - x[4])), T(type * j.subSign * (x[3] - x[j.sub])), p);
       I[4] += type * e.cc; I[5] += type * e.cb; I[6] -= type * (e.cc + e.cb);
-      I[3] += type * e.cs; I[4] -= type * e.cs;  // substrate junction S -> C'
+      I[3] += type * j.subSign * e.cs; I[j.sub] -= type * j.subSign * e.cs;  // substrate junction
       from = bjtFrom; to = bjtTo;
     }
     const BlockState::DeviceCharge *st = j.st;
@@ -743,8 +837,9 @@ public:
     const bool trap = integrator->getType() == IntegrationType::TRAPEZOIDAL;
     for (int k = 0; k < K; ++k) {
       const T i = trap ? (2.0 / h) * (q[k] - st->q[k]) - st->i[k] : (q[k] - st->q[k]) / h;
-      I[from[k]] += type * i;
-      I[to[k]] -= type * i;
+      const bool sub = j.q && k == 3;  // substrate branch: to Junction::sub, SUBS sign
+      I[from[k]] += (sub ? j.subSign : 1.0) * type * i;
+      I[sub ? j.sub : to[k]] -= (sub ? j.subSign : 1.0) * type * i;
       if constexpr (std::is_same_v<T, double>)
         if (next) { next->v[0][k] = v[k]; next->q[k] = q[k]; next->i[k] = i; }
     }
@@ -1134,7 +1229,7 @@ public:
     for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
-    for (auto &s : branchList) { s.dev = next; next += junctionInternals(*s.blk); }
+    for (auto &s : branchList) { s.dev = next; next += deviceInternals(*s.blk, *s.st); }
     total = next;
     return branchList;
   }
@@ -1171,6 +1266,8 @@ public:
       for (const auto &e : b.zenerDiodes) mark({e.anode, e.cathode});
       for (const auto &e : b.mosfets) mark({e.drain, e.gate, e.source, e.body});
       for (const auto &e : b.bjts) mark({e.nodeCollector, e.base, e.emitter, e.substrate});
+      for (const auto &e : b.osdiDevices)
+        for (int t : e.nodes) mark({t});
       for (const auto &e : b.jfets) mark({e.drain, e.gate, e.source});
       for (const auto &e : b.voltageControlledVoltageSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
@@ -1226,7 +1323,7 @@ public:
         const auto &v = blk.voltageSources[i];
         const int b = sl.vs + (int)i;
         branch(b, node(v.nodePositive), node(v.nodeNegative));
-        S.rhs[b] += scale * (tran ? waveformValue(v, v.voltage_V, time) : v.voltage_V);
+        S.rhs[b] += scale * sourceValue(v, v.voltage_V, tran ? h : 0.0, time);
       }
       // Inductors (+ mutual coupling K: off-diagonal L_ab terms between branch rows)
       const auto &L = blk.inductors;
@@ -1322,7 +1419,7 @@ public:
     // 2.5. Current Sources (Ideal Current Injection)
     // Current sources inject fixed current regardless of voltage
     for (const auto &cs : netlist.globalBlock.currentSources) {
-      double is = (h > 1e-15) ? waveformValue(cs, cs.current_A, time) : cs.current_A;
+      double is = sourceValue(cs, cs.current_A, h, time);
       // Current flows from + to - inside source, leaves + externally
       addRes(cs.nodePositive, -is); // Current leaving + node
       addRes(cs.nodeNegative, is);  // Current entering - node
@@ -1365,6 +1462,12 @@ public:
         const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, h);
         for (int k = 0; k < j.terms; ++k)
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
+    });
+    // 3.65 OSDI devices: the stamped osdiCurrents(), internal-node rows included
+    forEachOsdi(netlist, [&](const OsdiRef &r) {
+        const auto I = osdiCurrents(r, v_candidate, h);
+        for (size_t k = 0; k < r.n.size(); ++k)
+          if (r.n[k] > 0 && r.n[k] <= (int)node_residuals.size()) node_residuals[r.n[k] - 1] -= I[k];
     });
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
@@ -1470,7 +1573,7 @@ public:
 
         // Current sources inside the subcircuit (V sources are branch elements)
         for (const auto &cs : block.currentSources) {
-          double is = (h > 1e-15) ? waveformValue(cs, cs.current_A, time) : cs.current_A;
+          double is = sourceValue(cs, cs.current_A, h, time);
           addRes(mapNode(cs.nodePositive), -is);
           addRes(mapNode(cs.nodeNegative), is);
         }
@@ -1643,10 +1746,11 @@ public:
 
     // Current Sources
     for (const auto &cs : netlist.globalBlock.currentSources) {
-      addRes(cs.nodePositive, -cs.current_A);
-      addRes(cs.nodeNegative, cs.current_A);
+      const double is = sourceValue(cs, cs.current_A, 0.0, 0.0);
+      addRes(cs.nodePositive, -is);
+      addRes(cs.nodeNegative, is);
       attributions.push_back({cs.type.empty() ? "I?" : cs.type, "CurrentSource",
-          {{cs.nodePositive, -cs.current_A}, {cs.nodeNegative, cs.current_A}}});
+          {{cs.nodePositive, -is}, {cs.nodeNegative, is}}});
     }
 
 
@@ -1660,6 +1764,16 @@ public:
       for (int k = 0; k < j.terms; ++k) {
         addRes(j.n[k], -I[k]);
         if (j.n[k] > 0 && j.n[k] <= n) a.nodeCurrents.push_back({j.n[k], -I[k]});
+      }
+      attributions.push_back(std::move(a));
+    });
+    // OSDI devices, likewise (DC, external nodes)
+    forEachOsdi(netlist, [&](const OsdiRef &r) {
+      const auto I = osdiCurrents(r, v_candidate, 0.0);
+      DeviceAttribution a{r.dev->instanceName, "OSDI", {}};
+      for (size_t k = 0; k < r.dev->nodes.size(); ++k) {
+        addRes(r.n[k], -I[k]);
+        if (r.n[k] > 0 && r.n[k] <= n) a.nodeCurrents.push_back({r.n[k], -I[k]});
       }
       attributions.push_back(std::move(a));
     });
@@ -1713,29 +1827,6 @@ public:
       addRes(z.cathode, iz);
       attributions.push_back({z.instanceName, "ZenerDiode",
           {{z.anode, -iz}, {z.cathode, iz}}});
-    }
-
-    // DYNAMIC COMPONENTS (Generic Physics Models)
-    // Re-use stampJacobian but only capture RHS (which sums currents/residuals)
-    for (auto& [modelType, dynEntry] : soaBlock.dynamicTensors) {
-        if (!dynEntry.tensor) continue;
-        auto& registry = ModelRegistry::instance();
-        const ModelInfo* info = registry.getModel(modelType, modelType);
-
-        if (info && info->batchPhysics && info->stampJacobian) {
-             info->batchPhysics(dynEntry.tensor, v_candidate);
-
-             struct ResidualTarget : public SparseStampTarget {
-                std::function<void(int, double)> addResFn;
-                ResidualTarget(std::function<void(int, double)> fn) : addResFn(fn) {}
-                void add(int r, int c, double v) override { (void)r; (void)c; (void)v; }
-                void addRhs(int r, double v) override {
-                    addResFn(r + 1, -v);
-                }
-            };
-            ResidualTarget target(addRes);
-            info->stampJacobian(dynEntry.tensor, dynEntry.count, &target);
-        }
     }
 
     // Find worst node
@@ -1949,7 +2040,7 @@ public:
     // 3. Current Sources
     // 3. Current Sources
     for (const auto &i : block.currentSources) {
-      double val = (h > 1e-15) ? waveformValue(i, i.current_A, time) : i.current_A;
+      double val = sourceValue(i, i.current_A, h, time);
 
       int nP = mapNode(i.nodePositive);
       int nN = mapNode(i.nodeNegative);
@@ -2035,7 +2126,7 @@ public:
     for (size_t i = 0; i < nIS; ++i) {
         int nP = block.currentSources.nodesPos[i];
         int nN = block.currentSources.nodesNeg[i];
-        double I = block.currentSources.currents[i];
+        double I = srcFact_ * block.currentSources.currents[i];  // (refreshed to the waveform in transient)
         if (nP != 0) rhsVector[nP-1] -= I;
         if (nN != 0) rhsVector[nN-1] += I;
     }
@@ -2084,35 +2175,6 @@ public:
     }
     // Diodes, BJTs and MOSFETs: stampAllElements() (stampByDual, both paths)
 
-    // 3. Dynamic Models (ModelRegistry dispatch)
-    auto& registry = ModelRegistry::instance();
-    for (auto& [deviceType, entry] : block.dynamicTensors) {
-        if (!entry.tensor || entry.count == 0) continue;
-
-        auto models = registry.listModels(deviceType);
-        if (models.empty()) continue;
-        const ModelInfo* info = registry.getModel(deviceType, models[0]);
-        if (!info) continue;
-
-        // Batch physics evaluation
-        if (info->batchPhysics) {
-            info->batchPhysics(entry.tensor, v_guess);
-        }
-
-        // Jacobian + RHS stamping via SparseStampTarget adapter
-        if (info->stampJacobian) {
-            struct StampAdapter : SparseStampTarget {
-                MatrixConstructor& mb;
-                std::vector<double>& rhs;
-                StampAdapter(MatrixConstructor& mb_, std::vector<double>& rhs_)
-                    : mb(mb_), rhs(rhs_) {}
-                void add(int row, int col, double val) override { mb.add(row, col, val); }
-                void addRhs(int row, double val) override { rhs[row] += val; }
-            };
-            StampAdapter adapter(matrixBuilder, rhsVector);
-            info->stampJacobian(entry.tensor, entry.count, &adapter);
-        }
-    }
 
   }
 
@@ -2226,6 +2288,7 @@ public:
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     const double tempK = netlist.environment.ambient_temp_K;
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
+    forEachOsdi(netlist, [&](const OsdiRef &r) { stampOsdi(r, v_guess, h); });
 
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it

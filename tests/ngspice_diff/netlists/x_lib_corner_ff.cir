@@ -1,0 +1,8 @@
+* .lib corner ff: models and a .subckt reached through nested .lib/.include
+.lib lib/corners.lib ff
+VDD 1 0 DC 3.3
+VIN 2 0 DC 0
+X1 2 3 1 inv
+RL 3 0 20k
+.dc VIN 0 3.3 0.1
+.end

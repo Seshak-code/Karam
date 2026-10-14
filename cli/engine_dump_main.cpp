@@ -27,6 +27,8 @@ int main(int argc, char** argv) {
     auto session = engine->createSession();
     SimulationRequestDTO req;
     req.source.payload = ss.str();
+    const std::string path = argv[1];
+    req.source.baseDir = path.find('/') == std::string::npos ? "" : path.substr(0, path.rfind('/'));
     EngineCallbacks cb;
     std::string mode = argv[3];
     SimulationResponseDTO r;

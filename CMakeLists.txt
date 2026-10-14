@@ -111,14 +111,16 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/analysis_registry.cpp
 
-    # === Tensors (SoA linear elements, generic models) ===
+    # === Tensors (SoA linear elements) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_tensors.cpp
 
     # === Netlist ===
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
 
-    # === Physics (Verilog-A model compiler pipeline) ===
+    # === OSDI devices (compiled Verilog-A: BSIM4, BSIM-CMG, ... from OpenVAF) ===
+    ${CMAKE_CURRENT_SOURCE_DIR}/osdi/osdi_device.cpp
 )
+target_link_libraries(acutesim_engine_objects PUBLIC ${CMAKE_DL_LIBS})  # dlopen for .osdi libraries
 
 # ---------------------------------------------------------------------------
 # STATIC library wrapper

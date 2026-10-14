@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <map>
 #include <unordered_map>
-#include "../infrastructure/model_registry.h"
 #include "../netlist/circuit.h"
 #include "../physics/device_physics.h"
 #include <array>
@@ -232,34 +231,12 @@ struct TensorizedBlock {
     VoltageSourceTensor voltageSources;
     CurrentSourceTensor currentSources;
     
-    // Dynamic Models (Type-Erased)
-    // Key: DeviceType (e.g. "Diode", "MosfetLevel1") -> Value: tensor + instance count
-    struct DynamicTensorEntry {
-        void* tensor = nullptr;
-        size_t count = 0;
-    };
-    std::unordered_map<std::string, DynamicTensorEntry> dynamicTensors;
-
     void clear() {
         resistors.clear();
         capacitors.clear();
         inductors.clear();
         voltageSources.clear();
         currentSources.clear();
-        
-        // Clear dynamic tensors
-        auto& registry = ModelRegistry::instance();
-        for (auto& [type, entry] : dynamicTensors) {
-            if (!entry.tensor) continue;
-            auto models = registry.listModels(type);
-            if (!models.empty()) {
-                const ModelInfo* info = registry.getModel(type, models[0]);
-                if (info && info->destroyTensor) {
-                    info->destroyTensor(entry.tensor);
-                }
-            }
-        }
-        dynamicTensors.clear();
     }
 };
 
@@ -269,12 +246,6 @@ struct TensorizedBlock {
 
 // Forward declaration: TensorBlock is defined in circuit.h
 struct TensorBlock;
-
-/**
- * Convert a TensorBlock (AoS) to TensorizedBlock (SoA).
- * This enables efficient batch processing on the solver side.
- */
-TensorizedBlock tensorizeBlock(const struct TensorBlock& block);
 
 /**
  * Convert a full TensorNetlist (Hierarchical) to a single TensorizedBlock (Flat SoA).

@@ -1,0 +1,14 @@
+* QA: MOS gate input impedance .ac at a DC bias in linear region (Meyer lin), via RC divider
+VIN 1 0 DC 0 AC 1
+RS 1 2 100
+CB 2 3 1u
+RG 3 0 1meg
+VG 3x 0 DC 0
+MA 4 3 5 0 NM W=100u L=1u
+VD 4 0 DC 0.2
+RB 3 6 1k
+VB 6 0 DC 2
+RZ 5 0 1
+.model NM NMOS(VTO=0.7 KP=60u TOX=10n CGSO=1e-10 CGDO=1e-10 CGBO=1e-10)
+.ac dec 8 10k 10G
+.end

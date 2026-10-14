@@ -45,9 +45,15 @@ def cards(text):
         else: out.append(line)
     return out
 
+# OSDI libraries (.osdi <file>): compiled Verilog-A models, git-ignored; build them with tests/build_osdi.sh
+OSDI_DIR = os.path.join(ROOT, "datasets", "osdi")
+os.environ.setdefault("TREESPICE_OSDI_PATH", OSDI_DIR)
+def osdi_libs(text): return re.findall(r"^\s*\.osdi\s+(\S+)", text, re.I | re.M)
+
 def node_map(text):
     """Engine column order: first appearance in top-level element cards (name -> 1-based column)."""
     m, in_sub = {}, False
+    models = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".model")}
     for line in cards(text):
         t = toks(line)
         if t[0][0] == ".":
@@ -58,6 +64,8 @@ def node_map(text):
         if in_sub: continue
         c = t[0][0].upper()
         pos = range(1, len(t) - 1) if c == "X" else NODE_POS.get(c, [])
+        if c == "N":  # N<name> <terminals...> <model> [params]: terminals precede the first model name
+            pos = range(1, next((k for k in range(1, len(t)) if t[k].upper() in models), 1))
         # Q c b e [s] model ...: the 4th field is a substrate node when the 5th is a name (engine rule)
         if c == "Q" and len(t) >= 6 and not re.fullmatch(r"[-+.\d].*", t[5]) and t[5].upper() not in ("AREA", "OFF", "IC", "M"):
             pos = [1, 2, 3, 4]
@@ -121,7 +129,7 @@ def run_ngspice(args, text, an, names):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
-    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end)\b", re.I)
+    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end|osdi)\b", re.I)
     kept, skip = [], False
     for i, ln in enumerate(text.splitlines()):
         if i > 0 and ln.strip()[:1] == "+":
@@ -141,6 +149,10 @@ def run_ngspice(args, text, an, names):
         ctl = [".control", "noise {1} {2} {3} {4} {5!r} {6!r}".format(*an), "setplot noise1",
                f"wrdata {out} onoise_spectrum inoise_spectrum", "setplot noise2",
                "print onoise_total inoise_total", "quit", ".endc", ".end"]
+    for lib in osdi_libs(text):  # ngspice loads OSDI with pre_osdi (copied: its paths cannot hold spaces)
+        dst = os.path.join(args.tmp, os.path.basename(lib))
+        shutil.copy(os.path.join(OSDI_DIR, lib) if not os.path.isabs(lib) else lib, dst)
+        ctl.insert(1, f"pre_osdi {dst}")
     cir = os.path.join(args.tmp, "ng.cir")
     open(cir, "w").write("\n".join(kept + ctl) + "\n")
     p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout)
@@ -264,6 +276,8 @@ def main():
         sys.exit(f"engine not found: {args.engine}  (cmake -S . -B build && cmake --build build --target acutesim_engine_dump)")
     args.tmp = tempfile.mkdtemp(prefix="ngdiff_")
     atexit.register(shutil.rmtree, args.tmp, True)
+    if os.path.isdir(os.path.join(HERE, "netlists", "lib")):  # .include/.lib targets, beside the temp netlists
+        shutil.copytree(os.path.join(HERE, "netlists", "lib"), os.path.join(args.tmp, "lib"))
     fails = 0
     for path in sorted(glob.glob(os.path.join(HERE, "netlists", "*.cir"))):
         name = os.path.basename(path)
@@ -272,6 +286,9 @@ def main():
         an = analysis(text)
         if an[0] == "unsupported":
             print(f"{'SKIPPED':<19} {name} ({an[1]})"); continue
+        missing = [l for l in osdi_libs(text) if not os.path.exists(os.path.join(OSDI_DIR, l))]
+        if missing:
+            print(f"{'SKIPPED':<19} {name} (no {', '.join(missing)} in datasets/osdi: run tests/build_osdi.sh)"); continue
         nm = node_map(text) if an[0] != "noise" else {}
         try: ref = run_ngspice(args, text, an, list(nm))
         except (RuntimeError, subprocess.TimeoutExpired) as e:

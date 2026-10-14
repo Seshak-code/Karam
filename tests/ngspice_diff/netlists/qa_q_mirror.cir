@@ -1,0 +1,12 @@
+* current mirror, finite beta and Early
+VCC 1 0 DC 10
+RR 1 2 9.3k
+Q1 2 2 0 QM
+Q2 3 2 0 QM
+VL 4 0 DC 0
+RL 4 3 100
+Q3 5 2 0 QM AREA=2
+RL3 1 5 1k
+.model QM NPN(IS=1e-15 BF=100 VAF=50 RB=30)
+.dc VL 0 12 0.5
+.end

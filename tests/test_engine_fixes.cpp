@@ -11,11 +11,14 @@
 #include "engine_api/simulation_dto.h"
 #include "engine_api/engine_callbacks.h"
 #include "physics/circuitsim.h"
+#include "netlist/spice_parser.h"
 
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <filesystem>
+#include <fstream>
 
 using namespace acutesim;
 using namespace acutesim::compute::orchestration;
@@ -331,6 +334,22 @@ int main() {
         check(s.stats.converged && !s.stats.gminSteppingUsed, "linear divider: no GMIN stepping reported");
     }
 
+    // Source stepping (ngspice gillespie_src): with gmin stepping off, a 50-stage RTL
+    // chain that plain Newton cannot solve converges by ramping the sources
+    {
+        std::string net = "* rtl\n.options gminsteps=0\nVCC 1 0 DC 5\nVIN 2 0 DC 0\n";
+        for (int i = 0; i < 50; ++i)
+            net += "RB" + std::to_string(i) + " " + std::to_string(2 + i) + " b" + std::to_string(i) + " 10k\nQ" +
+                   std::to_string(i) + " " + std::to_string(3 + i) + " b" + std::to_string(i) + " 0 NP\nRC" +
+                   std::to_string(i) + " 1 " + std::to_string(3 + i) + " 1k\n";
+        net += ".model NP NPN(IS=1e-15 BF=100)\n.op\n.end\n";
+        auto p = SPICEParser().parse(net);
+        CircuitSim sim;
+        SolverStep s = sim.solveDC(p.netlist);
+        check(p.success && s.stats.converged && s.stats.sourceSteppingUsed,
+              "DC source stepping solves a 50-stage RTL chain with gminsteps=0");
+    }
+
     // Phase 3 MOS1: SPICE card defaults (KP 2e-5, VTO 0, W = L = 100u) give
     // Id = 0.5*2e-5*1^2 = 10 uA at Vgs = 1 V (saturation); M=3 triples it
     for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
@@ -342,6 +361,44 @@ int main() {
               "MOS1 M=3 triples the current: V(drain) = 4.97 (" + std::to_string(V(r, 3)) + ")");
         r = run(mode, "* mos NF\nVDD 1 0 DC 5\nM1 1 1 0 0 NM NF=2\n.model NM NMOS\n.op\n");
         check(!r.converged && r.errorDetail.find("NF") != std::string::npos, "MOS1 NF=2 is an explicit error");
+        // .lib section missing and an .include cycle are explicit errors (absolute paths: no baseDir here)
+        {
+            const std::string dir = std::filesystem::temp_directory_path().string();
+            std::ofstream(dir + "/tf_corner.lib") << ".lib tt\n.model nm nmos\n.endl tt\n";
+            std::ofstream(dir + "/tf_cycle.inc") << ".include " + dir + "/tf_cycle.inc\n";
+            r = run(mode, "* lib\n.lib " + dir + "/tf_corner.lib ss\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+            check(!r.converged && r.errorDetail.find("no section ss") != std::string::npos,
+                  ".lib: a missing corner section is an explicit error (" + r.errorDetail + ")");
+            r = run(mode, "* inc\n.include " + dir + "/tf_cycle.inc\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+            check(!r.converged && r.errorDetail.find("cycle") != std::string::npos,
+                  ".include: a cycle is an explicit error (" + r.errorDetail + ")");
+        }
+        // QA phase 3 (BUG-2..5): nonsense parameters, OFF/IC and mismatched cards are explicit errors
+        const std::pair<const char*, const char*> bad[] = {
+            {"V1 1 0 DC 3\nR1 1 2 1k\nQ1 2 2 0 QM\n.model QM NPN VAF=-5\n", "VAF must be >= 0"},
+            {"V1 1 0 DC 3\nR1 1 2 1k\nM1 2 2 0 0 MM\n.model MM NMOS GAMMA=1 PHI=0\n", "PHI must be > 0"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D BV=0\n", "BV must be > 0"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D N=0\n", "N must be > 0"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM OFF\n.model DM D\n", "OFF is not supported"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 QM IC=0.6,5\n.model QM NPN\n", "IC is not supported"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 NM\n.model NM NMOS\n", "is NMOS, not a NPN/PNP model"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nM1 2 2 0 NM W=10u\n.model NM NMOS\n", "expected 4 nodes"},
+        };
+        for (const auto &[net, want] : bad) {
+            r = run(mode, std::string("* bad\n") + net + ".op\n");
+            check(!r.converged && r.errorDetail.find(want) != std::string::npos,
+                  std::string("explicit error '") + want + "' (" + r.errorDetail + ")");
+        }
+        // OSDI (N devices) fails closed: missing library, no model card, card type not a loaded module
+        r = run(mode, "* osdi lib\n.osdi no_such_model.osdi\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+        check(!r.converged && r.errorDetail.find("not found") != std::string::npos,
+              "OSDI: a missing .osdi library is an explicit error (" + r.errorDetail + ")");
+        r = run(mode, "* osdi card\nV1 1 0 DC 1\nN1 1 0 0 0 nomodel\n.op\n");
+        check(!r.converged && r.errorDetail.find(".model") != std::string::npos,
+              "OSDI: an N device without a .model card is an explicit error (" + r.errorDetail + ")");
+        r = run(mode, "* osdi module\nV1 1 0 DC 1\nN1 1 0 0 0 nch\n.model nch bsim4va type=1\n.op\n");
+        check(!r.converged && r.errorDetail.find("OSDI module") != std::string::npos,
+              "OSDI: a card whose type is no loaded module is an explicit error (" + r.errorDetail + ")");
         r = run(mode, "* mos LD\nVDD 1 0 DC 5\nM1 1 1 0 0 NM L=1u\n.model NM NMOS LD=0.5u\n.op\n");
         check(!r.converged && r.errorDetail.find("LD") != std::string::npos, "MOS1 Leff <= 0 is an explicit error");
         // TOX without KP: KP = UO * 1e-4 * 3.9 eps0 / TOX (ngspice), here 500 cm^2/Vs and 20 nm

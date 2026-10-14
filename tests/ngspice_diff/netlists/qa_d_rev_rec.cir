@@ -1,0 +1,7 @@
+* reverse recovery with TT, CJO, RS
+V1 1 0 PULSE(2 -5 20n 1n 1n 200n 500n)
+R1 1 2 100
+D1 2 0 DR
+.model DR D(IS=1e-14 RS=5 TT=20n CJO=2p VJ=0.7 M=0.4 FC=0.5)
+.tran 0.2n 100n
+.end

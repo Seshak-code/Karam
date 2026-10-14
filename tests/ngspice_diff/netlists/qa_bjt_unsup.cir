@@ -1,0 +1,6 @@
+* QA netlist
+V1 1 0 DC 1
+Q1 1 1 0 QX
+.model QX NPN(IS=1e-15 BF=100 IRB=1m RBM=10 PTF=10 KF=1e-16 EG=1.2 XTI=3 XTB=1.5 ISC=1e-14)
+.op
+.end

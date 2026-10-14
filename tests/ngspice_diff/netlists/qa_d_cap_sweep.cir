@@ -1,0 +1,10 @@
+* QA: diode small-signal ac via bias point in reverse and forward ranges, TT diffusion cap, RS
+V1 1 0 DC 0.55 AC 1
+R1 1 2 50
+D1 2 0 DA 
+V2 3 0 DC -3 AC 1
+R2 3 4 50
+D2 4 0 DA
+.model DA D(IS=1e-14 N=1.05 RS=3 CJO=2p VJ=0.7 M=0.45 FC=0.6 TT=0.5n)
+.ac dec 8 1meg 100G
+.end

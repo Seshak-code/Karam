@@ -1,0 +1,9 @@
+* BJT in saturation .ac with diffusion caps (TF/TR)
+VCC 1 0 DC 5
+VIN 6 0 DC 0.9 AC 1
+RB 6 2 10k
+Q1 3 2 0 QS
+RC 1 3 1k
+.model QS NPN(IS=1e-15 BF=100 BR=2 TF=1n TR=50n CJE=1p CJC=1p ITF=10m XTF=2 VTF=5)
+.ac dec 5 1k 10G
+.end

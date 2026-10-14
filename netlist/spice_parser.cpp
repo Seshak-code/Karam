@@ -6,7 +6,10 @@
  */
 
 #include "spice_parser.h"
+#include "../osdi/osdi_device.h"
+#include "../physics/physics_constants.h"
 #include <sstream>
+#include <fstream>
 #include <cctype>
 #include <cmath>
 #include <algorithm>
@@ -98,17 +101,17 @@ void SPICEParser::requireFields(const std::vector<std::string>& tok, size_t n) {
                                  std::to_string(n - 1) + " fields after the name");
 }
 
-// Instance fields after a D/Q model name: [area] [AREA=a] [M=m] [OFF] [IC=...].
-// AREA and M both scale the device (currents, capacitances; resistances divide);
-// OFF and IC= only steer the operating-point search / UIC start, as in SPICE.
+// Instance fields after a D/Q model name: [area] [AREA=a] [M=m]. AREA and M both
+// scale the device (currents, capacitances; resistances divide). OFF and IC=
+// steer which operating point SPICE finds (ngspice holds OFF junctions at 0 V
+// through MODEINITFIX) and the UIC start: errors until they are modelled, not dropped.
 double SPICEParser::instanceArea(const std::vector<std::string>& tok, size_t from) const {
     double area = 1.0;
     for (size_t i = from; i < tok.size(); ++i) {
         const std::string k = toUpper(tok[i]);
         if (i == from && isValue(tok[i])) area *= parseValue(tok[i]);
         else if ((k == "AREA" || k == "M") && i + 1 < tok.size() && isValue(tok[i + 1])) area *= parseValue(tok[++i]);
-        else if (k == "OFF") continue;
-        else if (k == "IC") { while (i + 1 < tok.size() && isValue(tok[i + 1])) ++i; }
+        else if (k == "OFF" || k == "IC") throw std::runtime_error(tok[0] + ": " + k + " is not supported yet");
         else throw std::runtime_error(tok[0] + ": parameter " + k + " is not supported yet");
     }
     if (!(area > 0.0)) throw std::runtime_error(tok[0] + ": AREA and M must be > 0");
@@ -178,11 +181,64 @@ std::vector<std::pair<int, std::string>> SPICEParser::preprocessLines(
     return merged;
 }
 
+// .include <file> splices a file; .lib <file> <section> splices the lines between
+// `.lib <section>` and `.endl` of <file> (PDK corners: .lib models.lib tt). Paths
+// are relative to the including file. Spliced lines carry the including card's
+// line number, which is also reported (errLine) when a file or section is missing.
+std::vector<std::pair<int, std::string>> SPICEParser::expandIncludes(
+    const std::vector<std::pair<int, std::string>>& lines, const std::string& dir, int depth, int& errLine)
+{
+    if (depth > 16) throw std::runtime_error(".include/.lib nested deeper than 16 files (a cycle?)");
+    auto unquote = [](std::string s) {
+        if (s.size() >= 2 && (s[0] == '"' || s[0] == '\'') && s.back() == s[0]) s = s.substr(1, s.size() - 2);
+        return s;
+    };
+    auto fields = [&](const std::string& l) {  // first three fields, upper-case keyword
+        std::istringstream t(l);
+        std::vector<std::string> f(4);
+        t >> f[0] >> f[1] >> f[2] >> f[3];
+        f[0] = toUpper(f[0]);
+        return f;
+    };
+    std::vector<std::pair<int, std::string>> out;
+    for (const auto& [num, line] : lines) {
+        const auto f = fields(line);
+        const bool inc = f[0] == ".INCLUDE" || f[0] == ".INC", lib = f[0] == ".LIB" && !f[2].empty();
+        if (!inc && !lib) { out.push_back({num, line}); continue; }
+        errLine = num;
+        if (f[1].empty() || (inc && !f[2].empty()) || !f[3].empty())
+            throw std::runtime_error(inc ? ".include takes one file" : ".lib takes a file and a section");
+        const std::string file = unquote(f[1]);
+        const std::string path = file[0] == '/' || dir.empty() ? file : dir + "/" + file;
+        std::ifstream in(path);
+        if (!in) throw std::runtime_error(f[0] + ": cannot open '" + path + "'");
+        std::stringstream buf;
+        buf << in.rdbuf();
+        auto body = preprocessLines(buf.str());
+        if (lib) {  // keep .lib <section> ... .endl
+            const std::string want = toUpper(unquote(f[2]));
+            size_t from = 0, to;
+            while (from < body.size() && !(fields(body[from].second)[0] == ".LIB" &&
+                                           toUpper(unquote(fields(body[from].second)[1])) == want &&
+                                           fields(body[from].second)[2].empty()))
+                ++from;
+            if (from == body.size()) throw std::runtime_error(".lib: no section " + f[2] + " in '" + path + "'");
+            for (to = from + 1; to < body.size() && fields(body[to].second)[0] != ".ENDL"; ++to) {}
+            body = {body.begin() + from + 1, body.begin() + to};
+        }
+        for (auto& b : body) b.first = num;
+        const size_t slash = path.rfind('/');
+        const auto sub = expandIncludes(body, slash == std::string::npos ? "" : path.substr(0, slash), depth + 1, errLine);
+        out.insert(out.end(), sub.begin(), sub.end());
+    }
+    return out;
+}
+
 // ============================================================================
 // Main Parse Entry Point
 // ============================================================================
 
-SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
+SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::string& baseDir) {
     result_ = SPICEParseResult{};
     nodeMap_.clear();
     nextNode_ = 1;
@@ -197,6 +253,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     modelCards_.clear();
     params_.clear();
     inductorIndex_.clear();
+    modelNames_.clear();
+    osdiModels_.clear();
 
     auto lines = preprocessLines(netlistText);
     if (lines.empty()) {
@@ -212,12 +270,25 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
         return result_;
     };
 
+    int incLine = 0;
+    try { lines = expandIncludes(lines, baseDir, 0, incLine); }
+    catch (const std::exception& e) { return fail(incLine, e.what()); }
+
     // .param values are global in SPICE: resolve them before any card uses one
     for (const auto& [lineNum, line] : lines) {
         if (lineNum == 1) continue;
         auto tok = tokenize(line);
         if (!tok.empty() && toUpper(tok[0]) == ".GLOBAL")  // global in every .subckt, wherever declared
             for (size_t i = 1; i < tok.size(); ++i) globals_.insert(toUpper(tok[i]));
+        if (!tok.empty() && toUpper(tok[0]) == ".MODEL" && tok.size() > 1)  // N lines need every model name
+            modelNames_.insert(toUpper(tok[1]));
+        if (!tok.empty() && toUpper(tok[0]) == ".OSDI") {  // load compiled Verilog-A modules up front
+            try {
+                if (tok.size() != 2) throw std::runtime_error(".osdi needs exactly one library path");
+                osdi::loadLibrary(tok[1]);
+            } catch (const std::exception& e) { return fail(lineNum, e.what()); }
+            continue;
+        }
         if (tok.empty() || toUpper(tok[0]) != ".PARAM") continue;
         try { parseParam(tok); }
         catch (const std::exception& e) { return fail(lineNum, e.what()); }
@@ -236,10 +307,17 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             // Directives start with '.'
             if (keyword[0] == '.') {
                 if (keyword == ".MODEL")  parseModelCard(tok);
+                else if (keyword == ".OSDI") {}   // loaded in the first pass
                 else if (keyword == ".SUBCKT") parseSubcktBegin(tok);
                 else if (keyword == ".ENDS")   parseSubcktEnd();
                 else if (keyword == ".PARAM")  {} // handled in the first pass
                 else if (keyword == ".OP")     result_.hasOP = true;
+                else if (keyword == ".OPTION" || keyword == ".OPTIONS") {
+                    // gminsteps changes the DC homotopy; the other options are still ignored
+                    for (size_t i = 1; i + 1 < tok.size(); ++i)
+                        if (toUpper(tok[i]) == "GMINSTEPS")
+                            result_.netlist.environment.gmin_stepping = parseValue(tok[i + 1]) != 0.0;
+                }
                 else if (keyword == ".TRAN") {
                     result_.hasTRAN = true;
                     if (tok.size() >= 3) {
@@ -301,11 +379,11 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 }
                 else if (keyword == ".END") break;
                 // Output-only (.four only prints a Fourier table) and first-pass cards; anything else changes the
-                // circuit or analysis (.step, .temp, .nodeset, .include, ...) and used to be
+                // circuit or analysis (.step, .temp, .nodeset, ...) and used to be
                 // ignored silently.
                 else if (keyword != ".GLOBAL" && keyword != ".PRINT" && keyword != ".PLOT" &&
                          keyword != ".SAVE" && keyword != ".PROBE" && keyword != ".MEAS" &&
-                         keyword != ".MEASURE" && keyword != ".OPTION" && keyword != ".OPTIONS" &&
+                         keyword != ".MEASURE" &&
                          keyword != ".WIDTH" && keyword != ".TITLE" && keyword != ".FOUR")
                     throw std::runtime_error(tok[0] + " is not supported yet");
                 continue;
@@ -326,6 +404,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 case 'M': parseMosfet(tok, blk);      break;
                 case 'Q': parseBJT(tok, blk);         break;
                 case 'J': parseJFET(tok, blk);        break;
+                case 'N': parseOsdiDevice(tok, blk);  break;
                 case 'E': parseVCVS(tok, blk);        break;
                 case 'G': parseVCCS(tok, blk);        break;
                 case 'H': parseCCVS(tok, blk);        break;
@@ -411,11 +490,31 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             if (!ok) throw std::runtime_error("model " + c->name + ": parameter " + k + " is not supported yet");
         }
     };
+    // Magnitudes (>= 0) and scales (> 0): a negative value is a sign error, never a
+    // model; it used to be simulated silently (VAF = -5 put 18 V on a 3 V supply).
+    auto bounded = [&](const ModelCard* c, std::initializer_list<const char*> nonNeg,
+                       std::initializer_list<const char*> pos) {
+        for (const char* k : nonNeg)
+            if (c->params.count(k) && !(c->params.at(k) >= 0.0))
+                throw std::runtime_error("model " + c->name + ": " + k + " must be >= 0");
+        for (const char* k : pos)
+            if (c->params.count(k) && !(c->params.at(k) > 0.0))
+                throw std::runtime_error("model " + c->name + ": " + k + " must be > 0");
+    };
+    // The card's type must fit the device (a Q on an NMOS card reported "VTO is not supported")
+    auto kind = [&](const ModelCard* c, const std::string& inst, std::initializer_list<const char*> types) {
+        for (const char* t : types) if (c->type == t) return c;
+        throw std::runtime_error(inst + ": model " + c->name + " is " + c->type + ", not a " +
+                                 std::string(*types.begin()) + "/" + *(types.begin() + 1) + " model");
+    };
     auto resolveBlock = [&](TensorBlock& blk) {
         for (auto& m : blk.mosfets)
-            if (const ModelCard* c = card(m.modelName)) {
+            if (const ModelCard* c = kind(card(m.modelName), m.instanceName, {"NMOS", "PMOS"})) {
                 supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
                               "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC"});
+                bounded(c, {"KP", "LAMBDA", "GAMMA", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO", "CGBO",
+                            "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW"},
+                        {"PHI"});
                 auto& k = m.card;
                 k.resolved = true;
                 k.pmos = c->type == "PMOS";
@@ -440,25 +539,29 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             return def;
         };
         // EG/XTI/XTB only act away from TNOM; the engine runs at TNOM.
-        for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
+        for (auto& d : blk.diodes) if (const ModelCard* c = kind(card(d.modelName), d.instanceName, {"D", "D"})) {
             supported(c, {"IS", "N", "RS", "CJO", "CJ0", "CJ", "VJ", "PB", "M", "MJ", "FC", "TT", "BV", "IBV",
                           "EG", "XTI"});
+            bounded(c, {"IS", "RS", "CJO", "CJ0", "CJ", "M", "MJ", "TT"}, {"N", "BV"});  // ngspice: BV = 0 breaks down at 0 V
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
             d.emissionCoefficient_N   = c->get("N", 1.0);
             auto& k = d.card;
             k.rs = c->get("RS", 0.0); k.cjo = first(c, {"CJO", "CJ0", "CJ"}, 0.0);
             k.vj = first(c, {"VJ", "PB"}, 1.0); k.m = first(c, {"M", "MJ"}, 0.5);
             k.fc = c->get("FC", 0.5); k.tt = c->get("TT", 0.0);
-            k.bvGiven = c->get("BV", 0.0) != 0.0;  // BV = 0 means no breakdown (SPICE: infinite)
+            k.bvGiven = c->params.count("BV") > 0;  // BV > 0 (checked above)
             k.bv = c->get("BV", 0.0); k.ibv = c->get("IBV", 1e-3);
             if (!(k.m < 1.0 && k.vj > 0.0 && k.fc < 1.0 && k.rs >= 0.0 && k.ibv > 0.0))
                 throw std::runtime_error("model " + c->name + ": needs M < 1, VJ > 0, FC < 1, RS >= 0, IBV > 0");
         }
-        for (auto& q : blk.bjts) if (const ModelCard* c = card(q.modelName)) {
+        for (auto& q : blk.bjts) if (const ModelCard* c = kind(card(q.modelName), q.instanceName, {"NPN", "PNP"})) {
             supported(c, {"IS", "BF", "BR", "NF", "NR", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR",
                           "ISE", "NE", "ISC", "NC", "RB", "RC", "RE", "CJE", "VJE", "PE", "MJE", "ME",
                           "CJC", "VJC", "PC", "MJC", "MC", "XCJC", "CJS", "CCS", "VJS", "PS", "MJS", "MS",
-                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS"});
+                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS", "SUBS"});
+            bounded(c, {"IS", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR", "ISE", "ISC", "CJE", "CJC", "CJS", "CCS",
+                        "MJE", "ME", "MJC", "MC", "MJS", "MS", "TF", "XTF", "VTF", "ITF", "TR", "ISS"},
+                    {"NE", "NC", "NS"});
             q.isNPN = (c->type != "PNP");
             q.saturationCurrent_I_S_A = c->get("IS", 1e-16);
             q.betaF = c->get("BF", 100.0);
@@ -476,6 +579,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             k.cjs = first(c, {"CJS", "CCS"}, 0.0); k.vjs = first(c, {"VJS", "PS"}, 0.75); k.mjs = first(c, {"MJS", "MS"}, 0.0);
             k.fc = c->get("FC", 0.5);
             k.iss = c->get("ISS", 0.0); k.ns = c->get("NS", 1.0);
+            // SUBS (ngspice): 1 vertical (substrate junction to C), -1 lateral (to B); default by polarity
+            const double subs = c->get("SUBS", q.isNPN ? 1.0 : -1.0);
+            if (subs != 1.0 && subs != -1.0) throw std::runtime_error("model " + c->name + ": SUBS must be 1 or -1");
+            k.lateral = subs == -1.0;
             k.tf = c->get("TF", 0.0); k.xtf = c->get("XTF", 0.0); k.vtf = c->get("VTF", 0.0);
             k.itf = c->get("ITF", 0.0); k.tr = c->get("TR", 0.0);
             // RBM != RB makes the base resistance bias dependent (qb), which is not modelled
@@ -486,6 +593,15 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                   k.rb >= 0.0 && k.rc >= 0.0 && k.re >= 0.0 && q.betaF > 0.0 && q.betaR > 0.0))
                 throw std::runtime_error("model " + c->name + ": needs MJE/MJC/MJS < 1, VJE/VJC/VJS > 0, FC < 1, "
                                          "0 <= XCJC <= 1, NF/NR/BF/BR > 0, RB/RC/RE >= 0");
+        }
+        for (auto& o : blk.osdiDevices) {
+            const ModelCard* c = card(o.modelName);
+            const osdi::Descriptor* d = osdi::findModule(c->type);
+            if (!d) throw std::runtime_error("model " + c->name + ": type " + c->type +
+                                             " is not a loaded OSDI module (load it with .osdi <file>)");
+            auto& m = osdiModels_[toUpper(c->name)];
+            if (!m) m = std::make_shared<osdi::Model>(d, c->name, c->params);
+            o.model = m;
         }
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
             supported(c, {"BETA", "VTO", "LAMBDA"});
@@ -517,6 +633,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
 
     // Initialize global state
     result_.netlist.globalState.initialize(result_.netlist.globalBlock);
+    try {  // OSDI instances: parameters, setup_instance, node collapsing
+        result_.netlist.instantiateOsdi(result_.netlist.environment.ambient_temp_K - 300.15 +
+                                        PhysicsConstants::T_DEVICE_NOMINAL_K);
+    } catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
 
     return result_;
 }
@@ -707,12 +827,16 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.source = nodeIndex(tok[3]);
     m.body   = nodeIndex(tok[4]);
     m.modelName = tok[5];
+    if (!modelNames_.count(toUpper(tok[5])))
+        throw std::runtime_error(tok[0] + ": expected 4 nodes (d g s b), then a model name; '" + tok[5] +
+                                 "' is not a .model card");
     m.w = m.l = 100e-6;  // SPICE DEFW / DEFL
 
     // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS act through CJ/CJSW;
     // NRD/NRS only through RSH, which the model check rejects.
     for (size_t i = 6; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
+        if (upper == "OFF") throw std::runtime_error(tok[0] + ": OFF is not supported yet");
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")        m.w = parseValue(tok[++i]);
         else if (upper == "L")   m.l = parseValue(tok[++i]);
@@ -741,15 +865,9 @@ void SPICEParser::parseBJT(const std::vector<std::string>& tok, TensorBlock& blk
     q.base = nodeIndex(tok[2]);
     q.emitter = nodeIndex(tok[3]);
 
-    // Optional substrate node: tok[4] is the substrate only if tok[5] is a
-    // name (not a number or an instance keyword). The old "starts with a
-    // digit" test took models like 2N3904 for a node. No substrate node: ground.
-    size_t modelIdx = 4;
-    if (tok.size() >= 6) {
-        std::string t5 = toUpper(tok[5]);
-        if (!isValue(tok[5]) && t5 != "AREA" && t5 != "OFF" && t5 != "IC" && t5 != "M")
-            modelIdx = 5;
-    }
+    // Optional substrate node: tok[4] is the substrate when tok[5] names a .model
+    // card (all names are known after the first pass). No substrate node: ground.
+    const size_t modelIdx = tok.size() >= 6 && modelNames_.count(toUpper(tok[5])) ? 5 : 4;
     if (modelIdx == 5) q.substrate = nodeIndex(tok[4]);
     q.modelName = tok[modelIdx];
     q.area = instanceArea(tok, modelIdx + 1);
@@ -767,6 +885,24 @@ void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& bl
     j.source = nodeIndex(tok[3]);
     j.modelName = tok[4];
     blk.jfets.push_back(j);
+}
+
+// N<name> <terminal>... <modelName> [<param> <value>]...   (OSDI device, as ngspice)
+// The model name is the first field naming a .model card (all are known after
+// the first pass), so the terminals are numbered in order like any element.
+void SPICEParser::parseOsdiDevice(const std::vector<std::string>& tok, TensorBlock& blk) {
+    requireFields(tok, 3);
+    size_t m = 1;
+    while (m < tok.size() && !modelNames_.count(toUpper(tok[m]))) ++m;
+    if (m == tok.size()) throw std::runtime_error(tok[0] + ": no field names a .model card");
+    if (m == 1) throw std::runtime_error(tok[0] + ": no terminals before the model name");
+    if ((tok.size() - m - 1) % 2) throw std::runtime_error(tok[0] + ": instance parameters must be name=value pairs");
+    OsdiDevice o;
+    o.instanceName = tok[0];
+    o.modelName = tok[m];
+    for (size_t i = 1; i < m; ++i) o.nodes.push_back(nodeIndex(tok[i]));
+    for (size_t i = m + 1; i + 1 < tok.size(); i += 2) o.params.push_back({tok[i], parseValue(tok[i + 1])});
+    blk.osdiDevices.push_back(o);
 }
 
 // E<name> <n+> <n-> <nc+> <nc-> <gain>
