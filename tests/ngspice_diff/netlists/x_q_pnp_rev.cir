@@ -1,0 +1,8 @@
+* PNP with reverse-mode parameters (BR, NR, VAR, IKR, ISC/NC): VCE swept through both signs
+VEE 1 0 DC 0
+RB 2 3 50k
+VBB 3 0 DC -1
+Q1 0 2 1 QP
+.model QP PNP(IS=2e-15 BF=80 BR=4 NR=1.03 VAF=30 VAR=10 IKF=10m IKR=2m ISC=2e-13 NC=1.8 RC=5 RE=1)
+.dc VEE -5 5 0.05
+.end

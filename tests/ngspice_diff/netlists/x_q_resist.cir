@@ -1,0 +1,10 @@
+* Terminal resistances RB, RC, RE (three internal nodes) in a biased CE stage
+VCC 1 0 DC 10
+RL 1 2 1k
+VB 4 0 DC 0
+RBB 4 3 1k
+Q1 2 3 5 QR
+RE1 5 0 100
+.model QR NPN(IS=1e-15 BF=120 VAF=60 RB=200 RC=30 RE=3)
+.dc VB 0 3 0.02
+.end

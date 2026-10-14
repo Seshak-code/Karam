@@ -111,32 +111,14 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/analysis_registry.cpp
 
-    # === Tensors (SIMD kernels) ===
-    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/kernel_dispatch.cpp
+    # === Tensors (SoA linear elements, generic models) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_tensors.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_neon.cpp
 
     # === Netlist ===
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
 
     # === Physics (Verilog-A model compiler pipeline) ===
 )
-
-# AVX-512 source flags
-if(NOT EMSCRIPTEN)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)")
-        set_source_files_properties(
-            ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx512.cpp
-            PROPERTIES COMPILE_OPTIONS "-mavx512f"
-        )
-        set_source_files_properties(
-            ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_kernels_avx2.cpp
-            PROPERTIES COMPILE_OPTIONS "-mavx2"
-        )
-    endif()
-endif()
 
 # ---------------------------------------------------------------------------
 # STATIC library wrapper

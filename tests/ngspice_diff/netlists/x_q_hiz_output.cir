@@ -1,0 +1,15 @@
+* 555 output stage: a high-impedance node set by picoamp leakages (BJT substrate-junction GMIN,
+* B-C GMIN, ISE leakage); Newton must not stop early (damping on equal floored residuals did)
+VCC 21 0 DC 15
+R13 21 29 6.8K
+Q23 21 29 28 QN
+Q26 21 28 30 QN
+D2 30 29 DA
+VB 26 0 DC 0
+Q25 30 26 0 QN
+.MODEL DA D (RS=40 IS=1.0E-14 CJO=1PF)
+.MODEL QN NPN (IS=5.07F NF=1 BF=100 VAF=161 IKF=30M ISE=3.9P NE=2
++ BR=4 NR=1 VAR=16 IKR=45M RE=1.03 RB=4.12 RC=.412
++ CJE=12.4P VJE=1.1 MJE=.5 CJC=4.02P VJC=.3 MJC=.3 TF=229P TR=959P)
+.op
+.end

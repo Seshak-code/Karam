@@ -30,6 +30,10 @@ DIALECT = {
     "GLOBALNODE/global3.cir": "Xyce reads 1a as 1 (ngspice: atto)",
     "Output/TRAN/tran-prn-timescalefactor.cir": "output time scaling",
     "MINDUCTORS/mutIndPrint": "V source across an inductor: singular at DC (ngspice .op: check l1#branch)",
+    "MINCAPRES/mincr.cir": ".options DEVICE MINRES=1 gives the RS=0 diode 1 ohm (Xyce V(2a) = ngspice v(2b)); ngspice agrees with the engine",
+    "LOAD/load.cir": "Xyce gold is 0.5 mV off ngspice near V4 = 54.7 V; the engine matches ngspice to 33 uV",
+    "SANDLER21/sandler21.cir": "555 timer: output edges match ngspice to 0.1 us (1.0817 ms, 2.0816 ms, ...); a pointwise "
+                               "compare at its near-vertical switching edges measures that offset, not the model",
 }
 
 def gold(prn):

@@ -76,13 +76,15 @@ honest expected scaling, not a claim of beating it.
 | Area | Supported |
 |---|---|
 | Analyses | `.op`, `.dc` sweeps, `.tran` (trapezoidal, LTE step control, breakpoints, `uic` / `.ic`), `.ac`, `.noise` |
-| Elements | R, C, L, K (mutual inductance), V/I sources (DC, PULSE, SIN, AC), E/F/G/H controlled sources, D, Q (Ebers–Moll), J (Shichman–Hodges), X subcircuits (nested, local node scoping) |
+| Elements | R, C, L, K (mutual inductance), V/I sources (DC, PULSE, SIN, AC), E/F/G/H controlled sources, J (Shichman–Hodges), X subcircuits (nested, local node scoping) |
+| Diode | SPICE level 1: IS, N, RS (internal node), CJO/VJ/M/FC, TT, BV/IBV breakdown, instance AREA/M |
+| BJT | Gummel–Poon: IS, BF/BR, NF/NR, VAF/VAR, IKF/IKR, ISE/NE, ISC/NC, RB/RC/RE (internal nodes), CJE/CJC with XCJC, CJS (substrate node), TF/XTF/VTF/ITF, TR, AREA |
 | MOSFET | Level 1 complete: source/drain swap, body effect, bulk junctions, Meyer gate charge, overlap and junction capacitances |
 | Netlist | SPICE syntax with SI suffixes, `.model`, `.param` substitution, `.subckt`. Unknown or unsupported cards are **hard errors**, never silently dropped |
 | Convergence | Plain Newton first, then ngspice's dynamic gmin stepping on failure; gmin across each PN junction as in ngspice; responses fail closed on NaN or non-convergence |
 | Determinism | No `-ffast-math`, round-to-nearest enforced, deterministic parallel solve |
 
-**Not yet supported:** BSIM4/BSIM-CMG, Gummel–Poon BJT, diode RS/CJO/TT/BV, `.lib`/`.include`,
+**Not yet supported:** BSIM4/BSIM-CMG, bias-dependent base resistance (IRB/RBM), excess phase (PTF), flicker noise (KF), `.lib`/`.include`,
 EXP/PWL/SFFM sources, transmission lines, PZ analysis. The GPU mode currently runs the CPU
 path.
 
@@ -138,7 +140,7 @@ waveform corners, all running through one transient loop shared by the API and t
 | Item | Status |
 |---|---|
 | MOSFET level 1, DC and charges | ✅ done |
-| Diode RS/CJO/TT/BV, Gummel–Poon BJT with junction capacitances | Established |
+| Diode RS/CJO/TT/BV, Gummel–Poon BJT with junction capacitances | ✅ done |
 | BSIM4, BSIM-CMG and PSP through an OSDI loader compiled with OpenVAF (the ngspice ≥ 39 route), not hand ports | Established |
 | `.lib` sections and process corners (PDK ingestion) | Established |
 | Dynamic gmin stepping (ngspice `dynamic_gmin`) | ✅ done |
@@ -253,7 +255,7 @@ autodiff/      Dual-number forward-mode AD (device Jacobians)
 math/          contraction solver, FPU control, integration methods
 netlist/       SPICE parser, circuit model, canonical topology hash
 physics/       stateless device models, MNA stamps, KCL audit
-tensors/       structure-of-arrays device storage, SIMD kernels (NEON / AVX2 / AVX-512)
+tensors/       structure-of-arrays storage of the linear elements; device-model resolvers
 solvers/       DC / transient / AC / noise, LTE control, analysis registry
 infrastructure/  scheduling, tracing, Monte Carlo
 cli/           acutesim_engine_cli, acutesim_engine_dump (machine-readable waveforms)

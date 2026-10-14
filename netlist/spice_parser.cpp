@@ -98,11 +98,21 @@ void SPICEParser::requireFields(const std::vector<std::string>& tok, size_t n) {
                                  std::to_string(n - 1) + " fields after the name");
 }
 
-// AREA scaling isn't modelled; ignoring it would silently change the answer.
-void SPICEParser::rejectArea(const std::vector<std::string>& tok, size_t from) const {
-    for (size_t i = from; i < tok.size(); ++i)
-        if (toUpper(tok[i]) == "AREA" || (i == from && isValue(tok[i])))
-            throw std::runtime_error(tok[0] + ": AREA scaling is not supported yet");
+// Instance fields after a D/Q model name: [area] [AREA=a] [M=m] [OFF] [IC=...].
+// AREA and M both scale the device (currents, capacitances; resistances divide);
+// OFF and IC= only steer the operating-point search / UIC start, as in SPICE.
+double SPICEParser::instanceArea(const std::vector<std::string>& tok, size_t from) const {
+    double area = 1.0;
+    for (size_t i = from; i < tok.size(); ++i) {
+        const std::string k = toUpper(tok[i]);
+        if (i == from && isValue(tok[i])) area *= parseValue(tok[i]);
+        else if ((k == "AREA" || k == "M") && i + 1 < tok.size() && isValue(tok[i + 1])) area *= parseValue(tok[++i]);
+        else if (k == "OFF") continue;
+        else if (k == "IC") { while (i + 1 < tok.size() && isValue(tok[i + 1])) ++i; }
+        else throw std::runtime_error(tok[0] + ": parameter " + k + " is not supported yet");
+    }
+    if (!(area > 0.0)) throw std::runtime_error(tok[0] + ": AREA and M must be > 0");
+    return area;
 }
 
 int SPICEParser::nodeIndex(const std::string& name) {
@@ -424,17 +434,58 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 if (!(k.mj < 1.0 && k.mjsw < 1.0 && k.pb > 0.0 && k.fc < 1.0))
                     throw std::runtime_error("model " + c->name + ": needs MJ, MJSW < 1, PB > 0, FC < 1");
             }
+        // first(c, {"A", "B"}, def): the first alias the card gives (SPICE spellings vary)
+        auto first = [](const ModelCard* c, std::initializer_list<const char*> keys, double def) {
+            for (const char* k : keys) if (c->params.count(k)) return c->params.at(k);
+            return def;
+        };
+        // EG/XTI/XTB only act away from TNOM; the engine runs at TNOM.
         for (auto& d : blk.diodes) if (const ModelCard* c = card(d.modelName)) {
-            supported(c, {"IS", "N"});
+            supported(c, {"IS", "N", "RS", "CJO", "CJ0", "CJ", "VJ", "PB", "M", "MJ", "FC", "TT", "BV", "IBV",
+                          "EG", "XTI"});
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
             d.emissionCoefficient_N   = c->get("N", 1.0);
+            auto& k = d.card;
+            k.rs = c->get("RS", 0.0); k.cjo = first(c, {"CJO", "CJ0", "CJ"}, 0.0);
+            k.vj = first(c, {"VJ", "PB"}, 1.0); k.m = first(c, {"M", "MJ"}, 0.5);
+            k.fc = c->get("FC", 0.5); k.tt = c->get("TT", 0.0);
+            k.bvGiven = c->get("BV", 0.0) != 0.0;  // BV = 0 means no breakdown (SPICE: infinite)
+            k.bv = c->get("BV", 0.0); k.ibv = c->get("IBV", 1e-3);
+            if (!(k.m < 1.0 && k.vj > 0.0 && k.fc < 1.0 && k.rs >= 0.0 && k.ibv > 0.0))
+                throw std::runtime_error("model " + c->name + ": needs M < 1, VJ > 0, FC < 1, RS >= 0, IBV > 0");
         }
         for (auto& q : blk.bjts) if (const ModelCard* c = card(q.modelName)) {
-            supported(c, {"IS", "BF", "BR"});
+            supported(c, {"IS", "BF", "BR", "NF", "NR", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR",
+                          "ISE", "NE", "ISC", "NC", "RB", "RC", "RE", "CJE", "VJE", "PE", "MJE", "ME",
+                          "CJC", "VJC", "PC", "MJC", "MC", "XCJC", "CJS", "CCS", "VJS", "PS", "MJS", "MS",
+                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS"});
             q.isNPN = (c->type != "PNP");
             q.saturationCurrent_I_S_A = c->get("IS", 1e-16);
             q.betaF = c->get("BF", 100.0);
             q.betaR = c->get("BR", 1.0);
+            auto& k = q.card;
+            k.nf = c->get("NF", 1.0); k.nr = c->get("NR", 1.0);
+            k.vaf = first(c, {"VAF", "VA"}, 0.0); k.var = first(c, {"VAR", "VB"}, 0.0);
+            k.ikf = first(c, {"IKF", "IK"}, 0.0); k.ikr = c->get("IKR", 0.0);
+            k.ise = c->get("ISE", 0.0); k.ne = c->get("NE", 1.5);
+            k.isc = c->get("ISC", 0.0); k.nc = c->get("NC", 2.0);
+            k.rb = c->get("RB", 0.0); k.rc = c->get("RC", 0.0); k.re = c->get("RE", 0.0);
+            k.cje = c->get("CJE", 0.0); k.vje = first(c, {"VJE", "PE"}, 0.75); k.mje = first(c, {"MJE", "ME"}, 0.33);
+            k.cjc = c->get("CJC", 0.0); k.vjc = first(c, {"VJC", "PC"}, 0.75); k.mjc = first(c, {"MJC", "MC"}, 0.33);
+            k.xcjc = c->get("XCJC", 1.0);
+            k.cjs = first(c, {"CJS", "CCS"}, 0.0); k.vjs = first(c, {"VJS", "PS"}, 0.75); k.mjs = first(c, {"MJS", "MS"}, 0.0);
+            k.fc = c->get("FC", 0.5);
+            k.iss = c->get("ISS", 0.0); k.ns = c->get("NS", 1.0);
+            k.tf = c->get("TF", 0.0); k.xtf = c->get("XTF", 0.0); k.vtf = c->get("VTF", 0.0);
+            k.itf = c->get("ITF", 0.0); k.tr = c->get("TR", 0.0);
+            // RBM != RB makes the base resistance bias dependent (qb), which is not modelled
+            if (c->params.count("RBM") && c->params.at("RBM") != k.rb)
+                throw std::runtime_error("model " + c->name + ": RBM != RB (bias-dependent base resistance) is not supported yet");
+            if (!(k.mje < 1.0 && k.mjc < 1.0 && k.mjs < 1.0 && k.vje > 0.0 && k.vjc > 0.0 && k.vjs > 0.0 &&
+                  k.fc < 1.0 && k.xcjc >= 0.0 && k.xcjc <= 1.0 && k.nf > 0.0 && k.nr > 0.0 &&
+                  k.rb >= 0.0 && k.rc >= 0.0 && k.re >= 0.0 && q.betaF > 0.0 && q.betaR > 0.0))
+                throw std::runtime_error("model " + c->name + ": needs MJE/MJC/MJS < 1, VJE/VJC/VJS > 0, FC < 1, "
+                                         "0 <= XCJC <= 1, NF/NR/BF/BR > 0, RB/RC/RE >= 0");
         }
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
             supported(c, {"BETA", "VTO", "LAMBDA"});
@@ -634,11 +685,11 @@ void SPICEParser::parseCurrSrc(const std::vector<std::string>& tok, TensorBlock&
     blk.currentSources.push_back(cs);
 }
 
-// D<name> <n+> <n-> <modelName>   (IS/N come from the .model card in parse())
+// D<name> <n+> <n-> <modelName> [area] [AREA=] [M=] [OFF] [IC=]   (params from .model in parse())
 void SPICEParser::parseDiode(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 4);
-    rejectArea(tok, 4);
     Diode d;
+    d.area = instanceArea(tok, 4);
     d.instanceName = tok[0];
     d.anode = nodeIndex(tok[1]);
     d.cathode = nodeIndex(tok[2]);
@@ -692,22 +743,23 @@ void SPICEParser::parseBJT(const std::vector<std::string>& tok, TensorBlock& blk
 
     // Optional substrate node: tok[4] is the substrate only if tok[5] is a
     // name (not a number or an instance keyword). The old "starts with a
-    // digit" test took models like 2N3904 for a node. Substrate is not modelled.
+    // digit" test took models like 2N3904 for a node. No substrate node: ground.
     size_t modelIdx = 4;
     if (tok.size() >= 6) {
         std::string t5 = toUpper(tok[5]);
         if (!isValue(tok[5]) && t5 != "AREA" && t5 != "OFF" && t5 != "IC" && t5 != "M")
             modelIdx = 5;
     }
+    if (modelIdx == 5) q.substrate = nodeIndex(tok[4]);
     q.modelName = tok[modelIdx];
-    rejectArea(tok, modelIdx + 1);
+    q.area = instanceArea(tok, modelIdx + 1);
     blk.bjts.push_back(q);
 }
 
 // J<name> <nd> <ng> <ns> <modelName>   (params from .model in parse())
 void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 5);
-    rejectArea(tok, 5);
+    if (instanceArea(tok, 5) != 1.0) throw std::runtime_error(tok[0] + ": AREA scaling is not supported yet");
     JFET j;
     j.instanceName = tok[0];
     j.drain  = nodeIndex(tok[1]);

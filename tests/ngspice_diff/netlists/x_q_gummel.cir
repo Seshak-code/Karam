@@ -1,0 +1,8 @@
+* Gummel plot: VBE sweep through low-level leakage, ideal and high-injection regions
+VBE 2 0 DC 0
+VCE 1 0 DC 3
+RC 1 4 1
+Q1 4 2 0 QGP
+.model QGP NPN(IS=1e-15 BF=150 NF=1.02 VAF=40 IKF=20m ISE=5e-14 NE=1.6)
+.dc VBE 0.3 1.0 0.01
+.end

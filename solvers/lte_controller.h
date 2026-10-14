@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <deque>
 #include <iterator>
+#include <functional>
 #include "../netlist/circuit.h"
 #include "../tensors/physics_tensors.h"
 #include "../math/integration_method.h"
@@ -70,7 +71,10 @@ public:
         const TensorNetlist& netlist,
         const std::vector<double>& v_curr,
         double dt,
-        IntegrationType method) const
+        IntegrationType method,
+        // Extra charge branches the netlist scan cannot see (diode/BJT charges on
+        // internal nodes): extra(visit) calls visit(v_now, {v[t-1], v[t-2], v[t-3]}).
+        const std::function<void(const std::function<void(double, const std::array<double, 3>&)>&)>& extra = nullptr) const
     {
         LTEResult result{};
         result.maxLTE = 0.0;
@@ -168,6 +172,15 @@ public:
                 return (n <= 0 || n > (int)inst.nodeMapping.size()) ? 0 : inst.nodeMapping[n - 1];
             });
         }
+        if (extra)
+            extra([&](double y0, const std::array<double, 3>& hist) {
+                const double lte_v = lteOf(y0, hist);
+                if (lte_v > result.maxLTE) {
+                    result.maxLTE = lte_v;
+                    result.worstElementIndex = -1;
+                    result.worstIsCapacitor = true;
+                }
+            });
         // Compute safety factor and timestep suggestion
         double effective_tol = trtol_ * tolerance_;
         if (result.maxLTE > 0.0) {

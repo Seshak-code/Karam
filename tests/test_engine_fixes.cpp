@@ -77,6 +77,23 @@ int main() {
         check(r.converged && near(V(r, 1), 0.02585 * std::log(1.0 / 1e-14 + 1), 2e-3),
               "1 A diode follows Shockley, not the old linear clamp (V=" + std::to_string(V(r, 1)) + ")");
 
+        // Diode breakdown: BV is adjusted (ngspice diotemp) so that exactly IBV
+        // flows at -BV; forcing IBV in reverse must give BV across the diode.
+        r = run(mode, "* zener knee\nI1 0 1 DC 5m\nD1 0 1 DZ\n.model DZ D(IS=1e-14 BV=5.1 IBV=5m)\n.op\n");
+        check(r.converged && near(V(r, 1), 5.1, 2e-3),
+              "diode breakdown passes IBV at BV (V=" + std::to_string(V(r, 1)) + ")");
+
+        // Gummel-Poon Early effect: Ic = IS (e^(Vbe/Vt) - 1) (1 - Vbc/VAF) in forward
+        // active (q1 = 1/(1 - Vbc/VAF); the reverse terms are ~1e-15 A here).
+        r = run(mode, "* early\nVCC 1 0 DC 5\nRS 1 2 1\nVBE 3 0 DC 0.7\nQ1 2 3 0 QE\n"
+                      ".model QE NPN(IS=1e-15 BF=100 VAF=50)\n.op\n");
+        {
+            const double ic = 5.0 - V(r, 2), vbc = 0.7 - V(r, 2);  // V(): nodes in order of appearance
+            const double expect = 1e-15 * (std::exp(0.7 / 0.02585) - 1.0) * (1.0 - vbc / 50.0);
+            check(r.converged && near(ic, expect, 1e-3 * expect),
+                  "BJT Early effect matches q1 = 1/(1 - Vbc/VAF) (Ic=" + std::to_string(ic) + ")");
+        }
+
         // Fix 1: a NaN solution must not be reported as converged (N=0 -> /0)
         r = run(mode, "* nan diode\nV1 1 0 DC 5\nR1 1 2 1k\nD1 2 0 DZ\n.model DZ D(N=0)\n.op\n");
         check(!r.converged, "NaN-producing circuit reports NOT converged");

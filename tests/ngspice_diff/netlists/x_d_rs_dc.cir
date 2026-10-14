@@ -1,0 +1,7 @@
+* Diode series resistance RS (internal node) and N: forward/reverse .dc sweep
+V1 1 0 DC 0
+R1 1 2 50
+D1 2 0 DRS
+.model DRS D(IS=2n N=1.8 RS=25)
+.dc V1 -3 3 0.05
+.end

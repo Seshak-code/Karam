@@ -1,0 +1,9 @@
+* Diode AREA and M scaling (IS, CJO, IBV scale; RS divides)
+V1 1 0 DC 1
+R1 1 2 100
+D1 2 0 DA 3
+R2 1 3 100
+D2 3 0 DA AREA=2 M=2
+.model DA D(IS=1e-14 RS=10 CJO=1p)
+.op
+.end

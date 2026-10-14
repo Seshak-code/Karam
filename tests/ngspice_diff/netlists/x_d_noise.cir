@@ -1,0 +1,7 @@
+* Diode noise: shot noise of the junction current + RS thermal noise
+VIN 1 0 DC 2 AC 1
+R1 1 2 1k
+D1 2 0 DN
+.model DN D(IS=1e-14 RS=50)
+.noise V(2) VIN DEC 10 10 1MEG
+.end

@@ -1,0 +1,10 @@
+* BJT saturating switch: storage time from TR/TF, junction and substrate charges, substrate node
+VCC 1 0 DC 5
+VIN 2 0 PULSE(0 5 10n 2n 2n 80n 200n)
+RB 2 3 4.7k
+RC 1 4 1k
+Q1 4 3 0 5 QSW
+VSUB 5 0 DC -1
+.model QSW NPN(IS=1e-15 BF=100 BR=2 RB=50 RC=10 CJE=3p CJC=2p CJS=1p TF=300p TR=30n XTF=2 VTF=5)
+.tran 0.5n 400n
+.end
