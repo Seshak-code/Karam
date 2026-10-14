@@ -101,8 +101,7 @@ then the two Roadmap sections it points to. Everything below was verified by run
   bounds (PHI=0 crawl, VAF<0), D/Q OFF/IC fail closed, clearer errors; 49 QA netlists imported. OSDI models are
   built with `OPENVAF_DIR=... tests/build_osdi.sh` into git-ignored `datasets/osdi` (the harness SKIPs without
   them). Open: `.param` arithmetic expressions and subckt `params:` (PDK libraries need both); OSDI models
-  with state/`$limit`; `tools/physics_compiler` + `models/*.yaml` are unused (owner to decide: delete, or keep
-  the WGSL backend for the GPU device-evaluation work).
+  with state/`$limit`.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).

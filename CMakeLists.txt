@@ -111,7 +111,7 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/register_analyses.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/analysis_registry.cpp
 
-    # === Tensors (SoA linear elements, generic models) ===
+    # === Tensors (SoA linear elements) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/tensors/physics_tensors.cpp
 
     # === Netlist ===

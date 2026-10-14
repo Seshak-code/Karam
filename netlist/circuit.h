@@ -756,15 +756,6 @@ struct TensorBlock {
     // Interconnects
     std::vector<TransmissionLine> transmissionLines;
     
-    // Generic Components (Dynamic Physics Models)
-    struct GenericComponent {
-        std::string instanceName;
-        std::string modelName; // Reference to registered model
-        std::vector<int> nodes;
-        std::vector<double> params;
-    };
-    std::vector<GenericComponent> genericComponents;
-    
     // Aux
     std::vector<Probe> probes;
     std::vector<BusProbe> busProbes;

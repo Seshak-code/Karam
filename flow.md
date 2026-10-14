@@ -11,16 +11,13 @@ All engine source code has been migrated here from its former scattered location
 acutesim_engine/
 ├── autodiff/          ← Dual number AD foundation (zero deps)
 ├── math/              ← LinAlg, EmulatedF64, integration methods
-├── models/            ← Device model YAML definitions
 ├── netlist/           ← circuit.h, graph_canonical, netlist_export
-├── tensors/           ← SoA layout, SIMD kernel dispatch
+├── tensors/           ← SoA layout of the linear elements
 ├── physics/           ← Device models, MNA stampers, statistical engine
-│   └── veriloga/      ← Full Verilog-A lexer → AST → assembler
 ├── infrastructure/    ← Netlist compiler, scheduler, trace, Monte Carlo
 ├── solvers/           ← DC/AC/Tran/PZ/TF/Fourier/WebGPU solvers
-├── shaders/           ← WGSL GPU kernels (persistent NR loop)
 ├── internal/          ← engine_pch.h, precision.h (never visible outside)
-├── tools/physics_compiler/ ← Python model compiler toolchain
+├── osdi/              ← OSDI loader: compiled Verilog-A devices (OpenVAF)
 ├── CMakeLists.txt     ← OBJECT → STATIC library target
 ├── engine_export.h    ← ENGINE_API / ENGINE_INTERNAL visibility macros
 ├── engine_impl.h      ← EngineImpl + SessionImpl (non-virtual hot path)
@@ -56,39 +53,18 @@ The numerical system solved at every Newton iteration must be identically equiva
 
 | Property | Value |
 |---|---|
-| GPU Acceleration | WebGPU/Dawn, persistent 6-stage NR loop |
-| Precision | f64 (CPU), EmulatedF64 hi-lo (GPU) |
-| Sparsity | CSR matrix with PCG or pivoted LU |
-| Parallelism | SoA layout + AVX-512/NEON + OpenMP batch |
+| GPU | Dawn/WebGPU adapter probe only (`gpu_context_manager`); `gpu` mode solves on the CPU path (Phase 4) |
+| Precision | f64 throughout |
+| Linear solver | tensor-contraction direct solver (`math/contraction_solver`), fronts on worker threads |
+| Devices | one definition per device kind, Jacobian by Dual numbers or OSDI |
 | Visibility | `-fvisibility=hidden` — only ENGINE_API escapes |
 | Side-effects | Zero Qt, zero GUI dependencies |
 
-## Implementation Status: Mixed-Signal Acceleration Pillars
+## Implementation status
 
-| Pillar | Status | Files |
-|--------|--------|-------|
-| **Pillar 1: SPICE Contract** (14/14 parity) | ✅ Complete | `solvers/webgpu_solver.cpp`, `shaders/gpu_nr_loop.wgsl` |
-| **Pillar 2: Virtual VLIW** (predicated WGSL) | ✅ Complete (Phase A) | `shaders/gpu_nr_loop.wgsl` — `f64_select()`, predicated `f64_exp`, MOSFET region select, voltage gathers |
-| **Pillar 4: Static Routing** (workgroup cache) | ✅ Complete (Phase B) | `solvers/webgpu_solver.h/cpp` — `VoltageRouteBuffer`; `shaders/gpu_nr_loop.wgsl` — `var<workgroup>` cache + `workgroupBarrier()` |
-| **Pillar 3: Graph Partitioning** (SM-local subgraphs) | ✅ Complete (Phase C) | `infrastructure/graph_partitioner.h/cpp` — BFS partitioner; `infrastructure/compiled_block.h` — `partitions` field; `infrastructure/netlist_compiler.cpp` — post-tensorize call |
-
-### Phase A — Virtual VLIW Changes (gpu_nr_loop.wgsl)
-- Added `f64_select(false_val, true_val, cond)` — component-wise `select()` for EmulatedF64 structs.
-- Rewrote `f64_exp` to be fully predicated: all three paths (underflow / linear continuation / Horner polynomial) are always computed; `f64_select()` picks the correct result. No `return` inside `if`.
-- Replaced voltage-gather `if (n > 0)` branches in Diode/MOSFET/BJT kernels with `select(0.0, voltages_hi[max(0,n-1)], n>0)`.
-- Replaced `if (pmos != 0u)` / `if (isNPN == 0u)` sign selection with `select()`.
-- Replaced MOSFET `if/else if/else` region selection with eager evaluation of all three regions + two-stage `f64_select(f64_select(sat, lin, in_linear), cut, in_cutoff)`.
-
-### Phase B — Static Routing Changes
-- `webgpu_solver.h`: Added `diodeVoltageRouteBuffer`, `mosfetVoltageRouteBuffer`, `bjtVoltageRouteBuffer`.
-- `webgpu_solver.cpp`: Allocated route buffers in `setupResources()`; populated in `buildStampMaps()` alongside stamp maps.
-- `gpu_nr_loop.wgsl`: Added `@group(1) @binding(7..9)` for route arrays; `var<workgroup>` caches (128/256/192 f32 slots); each physics kernel now preloads terminal voltages into shared memory then reads from cache.
-
-### Phase C — Graph Partitioning Changes
-- `infrastructure/graph_partitioner.h/cpp`: `GraphPartitioner::partition()` builds node-to-device adjacency, device-neighbour graph, BFS-seeds partitions from highest-degree device, greedy-expands to `devicesPerWorkgroup` limit.
-- `infrastructure/compiled_block.h`: `std::vector<TensorPartition> partitions` field.
-- `infrastructure/netlist_compiler.cpp`: Calls `GraphPartitioner::partition()` after `tensorizeNetlist()`.
-- `tests/test_graph_partitioner.cpp`: 6-test coverage (empty, chain, 200 independent, mixed types, exact-64, nodeSet correctness).
+The WebGPU Newton loop, its WGSL shaders, the SIMD device kernels and the graph partitioner described in
+earlier versions of this file were deleted (they solved a voltage-only system that is not SPICE MNA, or
+were unused). GPU work restarts in Phase 4 from the design principles above; see `ENGINE_HANDOFF.md` §0.
 
 ## 🤖 SME Validation Checklist
 - [ ] **No Qt**: Does any header in this directory include a Qt type? (ABSOLUTELY FORBIDDEN)

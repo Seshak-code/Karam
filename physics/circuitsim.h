@@ -26,7 +26,6 @@
 #include "physics_constants.h"
 #include "../tensors/physics_tensors.h"
 #include "stamps.h"
-#include "../infrastructure/model_registry.h"
 
 // ============================================================================
 // CIRCUITSIM CLASS
@@ -1830,29 +1829,6 @@ public:
           {{z.anode, -iz}, {z.cathode, iz}}});
     }
 
-    // DYNAMIC COMPONENTS (Generic Physics Models)
-    // Re-use stampJacobian but only capture RHS (which sums currents/residuals)
-    for (auto& [modelType, dynEntry] : soaBlock.dynamicTensors) {
-        if (!dynEntry.tensor) continue;
-        auto& registry = ModelRegistry::instance();
-        const ModelInfo* info = registry.getModel(modelType, modelType);
-
-        if (info && info->batchPhysics && info->stampJacobian) {
-             info->batchPhysics(dynEntry.tensor, v_candidate);
-
-             struct ResidualTarget : public SparseStampTarget {
-                std::function<void(int, double)> addResFn;
-                ResidualTarget(std::function<void(int, double)> fn) : addResFn(fn) {}
-                void add(int r, int c, double v) override { (void)r; (void)c; (void)v; }
-                void addRhs(int r, double v) override {
-                    addResFn(r + 1, -v);
-                }
-            };
-            ResidualTarget target(addRes);
-            info->stampJacobian(dynEntry.tensor, dynEntry.count, &target);
-        }
-    }
-
     // Find worst node
     double max_err = 0.0;
     int worst_idx = 0;
@@ -2199,35 +2175,6 @@ public:
     }
     // Diodes, BJTs and MOSFETs: stampAllElements() (stampByDual, both paths)
 
-    // 3. Dynamic Models (ModelRegistry dispatch)
-    auto& registry = ModelRegistry::instance();
-    for (auto& [deviceType, entry] : block.dynamicTensors) {
-        if (!entry.tensor || entry.count == 0) continue;
-
-        auto models = registry.listModels(deviceType);
-        if (models.empty()) continue;
-        const ModelInfo* info = registry.getModel(deviceType, models[0]);
-        if (!info) continue;
-
-        // Batch physics evaluation
-        if (info->batchPhysics) {
-            info->batchPhysics(entry.tensor, v_guess);
-        }
-
-        // Jacobian + RHS stamping via SparseStampTarget adapter
-        if (info->stampJacobian) {
-            struct StampAdapter : SparseStampTarget {
-                MatrixConstructor& mb;
-                std::vector<double>& rhs;
-                StampAdapter(MatrixConstructor& mb_, std::vector<double>& rhs_)
-                    : mb(mb_), rhs(rhs_) {}
-                void add(int row, int col, double val) override { mb.add(row, col, val); }
-                void addRhs(int row, double val) override { rhs[row] += val; }
-            };
-            StampAdapter adapter(matrixBuilder, rhsVector);
-            info->stampJacobian(entry.tensor, entry.count, &adapter);
-        }
-    }
 
   }
 
