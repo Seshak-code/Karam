@@ -58,6 +58,9 @@ def node_map(text):
         if in_sub: continue
         c = t[0][0].upper()
         pos = range(1, len(t) - 1) if c == "X" else NODE_POS.get(c, [])
+        # Q c b e [s] model ...: the 4th field is a substrate node when the 5th is a name (engine rule)
+        if c == "Q" and len(t) >= 6 and not re.fullmatch(r"[-+.\d].*", t[5]) and t[5].upper() not in ("AREA", "OFF", "IC", "M"):
+            pos = [1, 2, 3, 4]
         for p in pos:
             if p < len(t) and t[p].upper() not in GROUND: m.setdefault(t[p].upper(), len(m) + 1)
     return m

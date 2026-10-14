@@ -44,43 +44,18 @@
        addRes(r.nodeTerminal2, i_r);
     }
 
-    // AUDIT 4: Diodes
-    for (const auto &d : netlist.globalBlock.diodes) {
-       double v_a = getV(d.anode);
-       double v_c = getV(d.cathode);
-       DiodeParams<double> params = {d.saturationCurrent_I_S_A, d.emissionCoefficient_N, d.thermalVoltage_V_T_V};
-       double i_d = diode_current_clamped(v_a - v_c, params, 30.0);
-       addRes(d.anode, -i_d);
-       addRes(d.cathode, i_d);
-    }
-
-    // AUDIT 5: BJTs
-    for (const auto &q : netlist.globalBlock.bjts) {
-        double v_c = getV(q.nodeCollector);
-        double v_b = getV(q.base);
-        double v_e = getV(q.emitter);
-        
-        BJTParams<double> params;
-        params.Is = q.saturationCurrent_I_S_A;
-        params.BetaF = q.betaF;
-        params.BetaR = q.betaR;
-        params.Vt = q.thermalVoltage_V_T_V;
-        
-        BJTCurrents<double> currents = bjt_ebers_moll(v_c, v_b, v_e, q.isNPN, params);
-        
-        addRes(q.nodeCollector, currents.Ic);
-        addRes(q.base, currents.Ib);
-        addRes(q.emitter, currents.Ie);
-
-        if (std::abs(currents.Ic) > 10.0) {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "WARN: BJT %s Ic=%e A\n      Params: Is=%e Vt=%e\n      Voltages: Vc=%e Vb=%e Ve=%e\n", 
-                     q.instanceName.c_str(), currents.Ic, params.Is, params.Vt, v_c, v_b, v_e);
-            report += std::string(buf);
+    // AUDIT 4: Diodes and BJTs (DC junctionCurrents(); terminal currents > 10 A are reported)
+    forEachJunction(netlist, [&](const Junction &j) {
+        std::array<double, 7> x{};
+        for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
+        const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, 0.0);
+        const std::string &name = j.d ? j.d->instanceName : j.q->instanceName;
+        for (int k = 0; k < j.terms; ++k) {
+            addRes(j.n[k], -I[k]);
+            if (std::abs(I[k]) > 10.0)
+                report += "WARN: " + name + " terminal " + std::to_string(k) + " I=" + std::to_string(I[k]) + " A\n";
         }
-        if (std::abs(currents.Ib) > 10.0) report += "WARN: BJT " + q.instanceName + " Ib=" + std::to_string(currents.Ib) + " A\n";
-        if (std::abs(currents.Ie) > 10.0) report += "WARN: BJT " + q.instanceName + " Ie=" + std::to_string(currents.Ie) + " A\n";
-    }
+    });
 
     // AUDIT 6: KCL Check
     for (int i=0; i<n; ++i) {

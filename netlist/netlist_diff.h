@@ -126,9 +126,10 @@ public:
                     details += "Is: " + std::to_string(a.saturationCurrent_I_S_A) + " -> " + std::to_string(b.saturationCurrent_I_S_A) + "; ";
                 if (a.isNPN != b.isNPN) details += "polarity changed; ";
                 if (a.modelName != b.modelName) details += "model: " + a.modelName + " -> " + b.modelName + "; ";
+                if (a.area != b.area) details += "area: " + std::to_string(a.area) + " -> " + std::to_string(b.area) + "; ";
                 return details;
             },
-            [](const BJT& b) { return std::vector<int>{b.nodeCollector, b.base, b.emitter}; }
+            [](const BJT& b) { return std::vector<int>{b.nodeCollector, b.base, b.emitter, b.substrate}; }
         );
 
         diffByInstanceName<JFET>(oldBlock.jfets, newBlock.jfets, "JFET", report,
@@ -173,6 +174,8 @@ public:
                     details += "Is: " + std::to_string(a.saturationCurrent_I_S_A) + " -> " + std::to_string(b.saturationCurrent_I_S_A) + "; ";
                 if (std::abs(a.emissionCoefficient_N - b.emissionCoefficient_N) > 1e-6)
                     details += "N: " + std::to_string(a.emissionCoefficient_N) + " -> " + std::to_string(b.emissionCoefficient_N) + "; ";
+                if (a.modelName != b.modelName) details += "model: " + a.modelName + " -> " + b.modelName + "; ";
+                if (a.area != b.area) details += "area: " + std::to_string(a.area) + " -> " + std::to_string(b.area) + "; ";
                 return details;
             },
             [](const Diode& d) -> std::pair<int, int> { return {d.anode, d.cathode}; }

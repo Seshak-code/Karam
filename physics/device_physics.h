@@ -324,115 +324,126 @@ inline Mos1Charges<T> mos1_charges(T vd, T vg, T vs, T vb, const Mos1Params<doub
 }
 
 // ============================================================================
-// BJT (EBERS-MOLL / GUMMEL-POON L1) PHYSICS
+// SPICE JUNCTION DEVICES: DIODE (level 1) AND GUMMEL-POON BJT
 // ============================================================================
 
-template <typename T>
-struct BJTParams 
-{
-    T Is;     // Transport Saturation Current [A]
-    T BetaF;  // Forward Current Gain
-    T BetaR;  // Reverse Current Gain
-    T Vt;     // Thermal Voltage [V]
-    
-    // Thermal
-    T Temp;
-    T Tnom;
-    T Xtb;    // Beta temperature exponent
-    T Eg;     // Bandgap
-    T Xti;    // IS temperature exponent
-};
-
-template <typename T>
-struct BJTCurrents {
-    T Ic; // Collector Current
-    T Ib; // Base Current
-    T Ie; // Emitter Current
-    
-    // Gradients
-    T g_cc, g_cb, g_ce; 
-    T g_bc, g_bb, g_be;
-    T g_ec, g_eb, g_ee;
-};
-
-/**
- * bjt_ebers_moll
- * Computes currents and conductance matrix for a BJT.
- * templated for Dual/EmulatedF64 support.
- */
+// Junction current of an exponential diode with saturation current is and
+// emission voltage vte = N*Vt, as ngspice dioload/bjtload: exponential above
+// -3 vte (linear continuation past JUNCTION_EXP_ARG_MAX, like every junction
+// here), the cubic reverse tail below it. No GMIN (callers add it where ngspice does).
 template <typename T, typename P>
-inline BJTCurrents<T> bjt_ebers_moll(T v_c, T v_b, T v_e, bool isNPN, const BJTParams<P>& p)
+inline T spice_junction(T v, P is, P vte)
 {
-    // 1. Determine local voltages relative to Base (Vbc, Vbe)
-    T v_be, v_bc;
-    T sign = isNPN ? T(1.0) : T(-1.0);
+    using std::exp;
+    if (v >= -3.0 * vte) {
+        const P amax = PhysicsConstants::JUNCTION_EXP_ARG_MAX;
+        if (v > amax * vte) { const P e = exp(amax); return is * (e - 1.0) + (is / vte) * e * (v - amax * vte); }
+        return is * (exp(v / vte) - 1.0);
+    }
+    T a = 3.0 * vte / (v * 2.718281828459045);  // CONSTe
+    a = a * a * a;
+    return -is * (1.0 + a);
+}
 
-    v_be = sign * (v_b - v_e);
-    v_bc = sign * (v_b - v_c);
+// Diode, parameters resolved (AREA applied): ngspice dio level 1 without
+// temperature dependence (the engine runs at TNOM).
+template <typename P>
+struct DiodeModel {
+    P is = 1e-14, vte = PhysicsConstants::V_THERMAL_300K;  // IS*AREA, N*Vt
+    P rs = 0.0;                                            // RS/AREA (series, internal node)
+    P cjo = 0.0, vj = 1.0, m = 0.5, fc = 0.5, tt = 0.0;    // CJO*AREA
+    bool breakdown = false; P xbv = 0.0;                    // BV adjusted so I(-BV) = IBV (diotemp)
+};
 
-    // 2. Compute Diode Currents
-    
-    // Implicit Diode Params (Ebers-Moll diodes have N=1 ideal usually, or scaled)
-    // We construct a temporary DiodeParams to pass to the unified helper
-    DiodeParams<T> dp;
-    dp.Is = p.Is;
-    dp.N = T(1.0); // Ebers-Moll assumes N=1 or absorbed into Is? Usually N=1.
-    dp.Vt = p.Vt;
-    // Rs, etc ignored for core junction
+// Breakdown voltage xbv such that the reverse current at -BV is IBV (ngspice
+// diotemp, NBV = N): returns BV unchanged when IBV is below the knee current.
+inline double diode_breakdown_xbv(double bv, double ibv, double is, double vte, double reltol = 1e-3)
+{
+    double cbv = ibv;
+    if (cbv < is * bv / vte) return bv;
+    const double tol = reltol * cbv;
+    double xbv = bv - vte * std::log(1.0 + cbv / is);
+    for (int it = 0; it < 25; ++it) {
+        xbv = bv - vte * std::log(cbv / is + 1.0 - xbv / vte);
+        const double xcbv = is * (std::exp((bv - xbv) / vte) - 1.0 + xbv / vte);
+        if (std::abs(xcbv - cbv) <= tol) break;
+    }
+    return xbv;
+}
 
-    auto [i_f, g_f] = diode_model_pair(v_be, dp);
-    auto [i_r, g_r] = diode_model_pair(v_bc, dp);
+// Junction current (with GMIN across the junction) and charge (depletion +
+// TT * diffusion) at junction voltage vd (ngspice dioload).
+template <typename T, typename P>
+inline std::pair<T, T> diode_iq(T vd, const DiodeModel<P>& p)
+{
+    using std::exp;
+    T cdb;
+    if (p.breakdown && vd < -p.xbv) cdb = -p.is * exp(-(p.xbv + vd) / p.vte);
+    else cdb = spice_junction(vd, p.is, p.vte);
+    const T q = depletion_charge(vd, p.cjo, p.m, p.vj, p.fc) + p.tt * cdb;
+    return {cdb + PhysicsConstants::JUNCTION_GMIN * vd, q};
+}
 
-    // 3. Terminal Currents (Ebers-Moll)
-    T invBetaF = T(1.0) / p.BetaF;
-    T invBetaR = T(1.0) / p.BetaR;
-    
-    T i_ct = i_f - i_r;
-    T i_base_component_f = i_f * invBetaF;
-    T i_base_component_r = i_r * invBetaR;
+// Gummel-Poon BJT, parameters resolved (AREA applied; ngspice bjt level 1
+// without temperature dependence, excess phase or bias-dependent RB).
+template <typename P>
+struct BjtModel {
+    P type = 1.0;                                  // +1 NPN, -1 PNP
+    P is = 1e-16, bf = 100.0, br = 1.0, vtf = PhysicsConstants::V_THERMAL_300K, vtr = PhysicsConstants::V_THERMAL_300K;  // NF*Vt, NR*Vt
+    P invVaf = 0.0, invVar = 0.0, oikf = 0.0, oikr = 0.0;     // 1/VAF, 1/VAR, 1/(IKF*AREA), 1/(IKR*AREA)
+    P ise = 0.0, vte = 1.5 * PhysicsConstants::V_THERMAL_300K; // ISE*AREA, NE*Vt
+    P isc = 0.0, vtc = 2.0 * PhysicsConstants::V_THERMAL_300K; // ISC*AREA, NC*Vt
+    P rb = 0.0, rc = 0.0, re = 0.0;                            // per AREA; > 0: internal node
+    P cje = 0.0, vje = 0.75, mje = 0.33;                        // *AREA
+    P cjcInt = 0.0, cjcExt = 0.0, vjc = 0.75, mjc = 0.33;       // CJC*XCJC*AREA (B'-C'), rest (B-C')
+    P cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
+    P tf = 0.0, xtf = 0.0, ovtf = 0.0, xjtf = 0.0, tr = 0.0;   // ovtf = 1/(1.44 VTF), xjtf = ITF*AREA
+};
 
-    T ic_local = i_ct - i_base_component_r;
-    T ib_local = i_base_component_f + i_base_component_r;
-    T ie_local = -ic_local - ib_local;
-    
-    // 4. Derivatives (Conductances)
-    T dIf_dVbe = g_f;
-    T dIr_dVbc = g_r;
-    
-    T dIct_dVbe = dIf_dVbe;
-    T dIct_dVbc = -dIr_dVbc;
-    
-    T dIbf_dVbe = dIf_dVbe * invBetaF;
-    T dIbr_dVbc = dIr_dVbc * invBetaR;
-    
-    T dIc_dVbe = dIct_dVbe;       
-    T dIc_dVbc = dIct_dVbc - dIbr_dVbc; 
-    
-    T dIb_dVbe = dIbf_dVbe;      
-    T dIb_dVbc = dIbr_dVbc;      
-    
-    T dIe_dVbe = -(dIc_dVbe + dIb_dVbe);
-    T dIe_dVbc = -(dIc_dVbc + dIb_dVbc);
-    
-    BJTCurrents<T> res;
-    res.Ic = sign * ic_local;
-    res.Ib = sign * ib_local;
-    res.Ie = sign * ie_local;
+// DC terminal currents (into C', B') and the four charges qbe (B'-E'),
+// qbc (B'-C'), qbx (B-C'), qsub (S-C'), all in the type domain, of ngspice
+// bjtload at junction voltages vbe, vbc (internal), vbx (external base) and vsub.
+template <typename T> struct BjtEval { T cc, cb, q[4]; };
 
-    // Conductances
-    res.g_cc = -dIc_dVbc; 
-    res.g_cb = dIc_dVbe + dIc_dVbc;
-    res.g_ce = -dIc_dVbe;
-    
-    res.g_bc = -dIb_dVbc;
-    res.g_bb = dIb_dVbe + dIb_dVbc;
-    res.g_be = -dIb_dVbe;
-    
-    res.g_ec = -dIe_dVbc;
-    res.g_eb = dIe_dVbe + dIe_dVbc;
-    res.g_ee = -dIe_dVbe;
-    
-    return res;
+template <typename T, typename P>
+inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
+{
+    using std::exp; using std::log; using std::sqrt;
+    const P gmin = PhysicsConstants::JUNCTION_GMIN;
+    const T cbe = spice_junction(vbe, p.is, p.vtf);
+    const T cbc = spice_junction(vbc, p.is, p.vtr);
+    const T cben = (p.ise != P(0.0) ? spice_junction(vbe, p.ise, p.vte) : T(0.0)) + gmin * vbe;
+    const T cbcn = (p.isc != P(0.0) ? spice_junction(vbc, p.isc, p.vtc) : T(0.0)) + gmin * vbc;
+    const T q1 = 1.0 / (1.0 - p.invVaf * vbc - p.invVar * vbe);
+    T qb = q1;
+    if (p.oikf != P(0.0) || p.oikr != P(0.0)) {
+        T arg = 1.0 + 4.0 * (p.oikf * cbe + p.oikr * cbc);
+        if (arg < P(0.0)) arg = T(0.0);
+        qb = q1 * (1.0 + sqrt(arg)) / 2.0;
+    }
+    BjtEval<T> r;
+    r.cc = (cbe - cbc) / qb - cbc / p.br - cbcn;
+    r.cb = cbe / p.bf + cben + cbc / p.br + cbcn;
+
+    T cbeq = cbe;  // transit-time current, XTF/VTF/ITF-modulated (ngspice bjtload)
+    if (p.tf != P(0.0) && vbe > P(0.0)) {
+        T argtf(0.0);
+        if (p.xtf != P(0.0)) {
+            argtf = T(p.xtf);
+            if (p.ovtf != P(0.0)) argtf = argtf * exp(vbc * p.ovtf);
+            if (p.xjtf != P(0.0)) { const T t = cbe / (cbe + p.xjtf); argtf = argtf * t * t; }
+        }
+        cbeq = cbe * (1.0 + argtf) / qb;
+    }
+    r.q[0] = p.tf * cbeq + depletion_charge(vbe, p.cje, p.mje, p.vje, p.fc);
+    r.q[1] = p.tr * cbc + depletion_charge(vbc, p.cjcInt, p.mjc, p.vjc, p.fc);
+    r.q[2] = depletion_charge(vbx, p.cjcExt, p.mjc, p.vjc, p.fc);
+    if (p.cjs == P(0.0)) r.q[3] = T(0.0);
+    else if (vsub <= P(0.0)) {
+        const T arg = 1.0 - vsub / p.vjs;
+        r.q[3] = p.vjs * p.cjs * (1.0 - arg * exp(-p.mjs * log(arg))) / (1.0 - p.mjs);
+    } else r.q[3] = vsub * p.cjs * (1.0 + p.mjs * vsub / (2.0 * p.vjs));
+    return r;
 }
 
 // ============================================================================

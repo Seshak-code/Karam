@@ -70,7 +70,7 @@ private:
     bool isValue(const std::string& s) const;
     static void requireFields(const std::vector<std::string>& tok, size_t n);
     static void requireLinearForm(const std::vector<std::string>& tok, size_t n);
-    void rejectArea(const std::vector<std::string>& tok, size_t from) const;
+    double instanceArea(const std::vector<std::string>& tok, size_t from) const;
     static std::string toUpper(const std::string& s);
     static std::vector<std::string> tokenize(const std::string& line);
 

@@ -1,0 +1,8 @@
+* Gummel-Poon output characteristics: Early (VAF), high injection (IKF), BE leakage (ISE/NE)
+VCC 1 0 DC 0
+VBB 3 0 DC 1.2
+RB 3 2 20k
+Q1 1 2 0 QGP
+.model QGP NPN(IS=1e-15 BF=150 BR=3 NF=1.02 NR=1.01 VAF=40 VAR=15 IKF=20m IKR=5m ISE=5e-14 NE=1.6 ISC=1e-13 NC=1.9)
+.dc VCC 0 6 0.05
+.end

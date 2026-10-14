@@ -523,28 +523,6 @@ public:
       if (n2 != 0) rhs[n2-1] += i_eq;
   }
 
-  void stampDiode(const Diode& d, int nA, int nC, double v_diff, double temp_K,
-                  MatrixConstructor& mb, std::vector<double>& rhs) {
-      // 1. Setup Parameters
-      DiodeParams<double> params = {d.saturationCurrent_I_S_A, d.emissionCoefficient_N,
-                                    d.thermalVoltage_V_T_V};
-      
-      // Thermal Scaling
-      double temp_scale = temp_K / 300.15;
-      params.Vt *= temp_scale;
-
-      // 2. Evaluate Physics (AD)
-      Dual<double> v_diff_dual(v_diff, 1.0);
-      Dual<double> i_d = diode_current_clamped(v_diff_dual, params);
-
-      // 3. Extract Linear Model
-      double g_eq = i_d.grad;
-      double i_src = i_d.val - g_eq * v_diff;
-
-      // 4. Stamp
-      stampTwoTerminalNonLinear(nA, nC, g_eq, i_src, mb, rhs);
-  }
-
   void stampSchottky(const SchottkyDiode& sd, int nA, int nC, double v_diff, double temp_K,
                      MatrixConstructor& mb, std::vector<double>& rhs) {
       // Identical structure to Diode but different params/handling potentially
@@ -591,8 +569,8 @@ public:
   // ponytail: GEAR_2 (never chosen by runTransient) integrates the charges with BE.
   template <typename T>
   std::array<T, 4> mosCurrents(const std::array<T, 4> &x, const Mos1Params<double> &p,
-                               const BlockState::MosfetCharge *st, double h,
-                               BlockState::MosfetCharge *next = nullptr) const {
+                               const BlockState::DeviceCharge *st, double h,
+                               BlockState::DeviceCharge *next = nullptr) const {
       const auto dc = mos1_currents(x[0], x[1], x[2], x[3], p);
       std::array<T, 4> I{dc.d, T(0.0), dc.s, dc.b};
       if (!p.caps || !st || !(h > 1e-15) || !integrator) return I;
@@ -631,83 +609,162 @@ public:
   // per terminal), so it is the exact derivative of the currents the KCL audit
   // checks: gm, gds, gmbs, the junctions and charges, either orientation.
   void stampMos1(const std::array<int, 4>& n, const Mos1Params<double>& p,
-                 const BlockState::MosfetCharge* st, double h, const std::vector<double>& v) {
-      auto V = [&](int k) { return n[k] > 0 && n[k] <= (int)v.size() ? v[n[k] - 1] : 0.0; };
-      double I[4], J[4][4];
-      for (int u = 0; u < 4; ++u) {
-          std::array<Dual<double>, 4> x;
-          for (int k = 0; k < 4; ++k) x[k] = Dual<double>(V(k), k == u ? 1.0 : 0.0);
-          const auto cur = mosCurrents(x, p, st, h);
-          for (int t = 0; t < 4; ++t) { I[t] = cur[t].val; J[t][u] = cur[t].grad; }
-      }
-      for (int t = 0; t < 4; ++t) {
-          if (n[t] <= 0) continue;
-          double ieq = I[t];
-          for (int u = 0; u < 4; ++u) {
-              ieq -= J[t][u] * V(u);
-              if (n[u] > 0 && J[t][u] != 0.0) matrixBuilder.add(n[t] - 1, n[u] - 1, J[t][u]);
-          }
-          rhsVector[n[t] - 1] -= ieq;
-      }
+                 const BlockState::DeviceCharge* st, double h, const std::vector<double>& v) {
+      stampByDual(n, 4, v, [&](const std::array<Dual<double>, 4> &x) { return mosCurrents(x, p, st, h); });
   }
 
+  // Diodes and BJTs ("junction devices"): one evaluation of currents and charges
+  // (diode_iq / bjt_gp) for the Newton stamp, both KCL audits, the history
+  // update, AC and noise. Series resistances (diode RS; BJT RB, RC, RE) add an
+  // internal node each, an extra unknown after the branch currents (BranchSlot::dev);
+  // without the resistance the internal terminal is the external one.
+  static int junctionInternals(const TensorBlock &blk) {
+    int k = 0;
+    for (const auto &d : blk.diodes) k += d.card.rs > 0.0;
+    for (const auto &q : blk.bjts) k += (q.card.rb > 0.0) + (q.card.rc > 0.0) + (q.card.re > 0.0);
+    return k;
+  }
 
-  void stampBJT(const BJT& bjt, int nC, int nB, int nE, int nS,
-                double v_c, double v_b, double v_e, double v_s,
-                double temp_K,
-                MatrixConstructor& mb, std::vector<double>& rhs) {
-      // Use efficient analytical model (No dual overhead if not needed)
-      BJTParams<double> p;
-      p.Is = bjt.saturationCurrent_I_S_A;
-      p.BetaF = bjt.betaF;
-      p.BetaR = bjt.betaR;
-      p.Vt = bjt.thermalVoltage_V_T_V;
+  // A junction device of the flattened netlist. n: its terminal unknowns, 1-based
+  // (0 = ground; internal nodes > numGlobalNodes). Diode: A, C, A'. BJT: C, B, E,
+  // S, C', B', E'. st: charge history (null when the block state is not sized).
+  struct Junction {
+    const Diode *d = nullptr;
+    const BJT *q = nullptr;
+    std::array<int, 7> n{};
+    int terms = 0;
+    BlockState::DeviceCharge *st = nullptr;
+  };
+  template <class F> void forEachJunction(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      int next = sl.dev + 1;  // 1-based unknown of the next internal node
+      auto *st = const_cast<BlockState *>(sl.st);
+      for (size_t i = 0; i < sl.blk->diodes.size(); ++i) {
+        const Diode &d = sl.blk->diodes[i];
+        Junction j;
+        j.d = &d; j.terms = 3;
+        j.n[0] = sl.map(d.anode); j.n[1] = sl.map(d.cathode);
+        j.n[2] = d.card.rs > 0.0 ? next++ : j.n[0];
+        j.st = i < st->diodeState.size() ? &st->diodeState[i] : nullptr;
+        f(j);
+      }
+      for (size_t i = 0; i < sl.blk->bjts.size(); ++i) {
+        const BJT &q = sl.blk->bjts[i];
+        Junction j;
+        j.q = &q; j.terms = 7;
+        j.n[0] = sl.map(q.nodeCollector); j.n[1] = sl.map(q.base);
+        j.n[2] = sl.map(q.emitter); j.n[3] = sl.map(q.substrate);
+        j.n[4] = q.card.rc > 0.0 ? next++ : j.n[0];
+        j.n[5] = q.card.rb > 0.0 ? next++ : j.n[1];
+        j.n[6] = q.card.re > 0.0 ? next++ : j.n[2];
+        j.st = i < st->bjtState.size() ? &st->bjtState[i] : nullptr;
+        f(j);
+      }
+    }
+  }
 
-      // Thermal scaling (consistent with stampDiode/stampZener)
-      double Tnom = 300.15; // 27°C nominal
-      double temp_scale = temp_K / Tnom;
-      p.Vt *= temp_scale;
+  // Charge branches (terminal pairs, q flows from -> to): diode A'->C; BJT
+  // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C').
+  static constexpr int diodeFrom[1] = {2}, diodeTo[1] = {1};
+  static constexpr int bjtFrom[4] = {5, 5, 1, 3}, bjtTo[4] = {6, 4, 4, 4};
 
-      // Is temperature scaling: Is(T) = Is(Tnom) * (T/Tnom)^Xti * exp(Eg/Vt_nom - Eg/Vt_T)
-      double Xti = 3.0;  // Silicon default
-      double Eg = 1.11;  // Silicon bandgap [eV]
-      double Vt_nom = bjt.thermalVoltage_V_T_V;
-      double Vt_T = p.Vt;
-      p.Is *= std::pow(temp_scale, Xti) * exp(Eg / Vt_nom - Eg / Vt_T);
+  // Branch voltages and charges (type domain) of j at terminal values x.
+  template <typename T>
+  int junctionCharges(const Junction &j, const std::array<T, 7> &x, double tempK, T *v, T *q) const {
+    if (j.d) {
+      v[0] = x[2] - x[1];
+      q[0] = diode_iq(v[0], diodeModel(*j.d, tempK)).second;
+      return 1;
+    }
+    const auto p = bjtModel(*j.q, tempK);
+    const double t = p.type;
+    for (int k = 0; k < 4; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
+    const auto e = bjt_gp(v[0], v[1], v[2], v[3], p);
+    for (int k = 0; k < 4; ++k) q[k] = e.q[k];
+    return 4;
+  }
+  static bool junctionHasCharge(const Junction &j) {
+    if (j.d) return j.d->card.cjo > 0.0 || j.d->card.tt > 0.0;
+    const auto &c = j.q->card;
+    return c.cje > 0.0 || c.cjc > 0.0 || c.cjs > 0.0 || c.tf > 0.0 || c.tr > 0.0;
+  }
 
-      bool isNPN = (bjt.modelName.find("NPN") != std::string::npos || bjt.modelName.find("npn") != std::string::npos);
-      
-      BJTCurrents<double> res = bjt_ebers_moll(v_c, v_b, v_e, isNPN, p);
-
-      // Stamp G (7x7 block for 3 terminals usually, simplified here)
-      // Helper to add conductance
-      auto addG = [&](int r, int c, double val) {
-          if (r!=0 && c!=0) mb.add(r-1, c-1, val);
+  // Terminal currents into j at x: DC plus, in transient, the charge currents
+  // integrated from the last accepted step (TRAP, else BE), as mosCurrents().
+  // next != null: write the accepted charge state (history update).
+  template <typename T>
+  std::array<T, 7> junctionCurrents(const Junction &j, const std::array<T, 7> &x, double tempK, double h,
+                                    BlockState::DeviceCharge *next = nullptr) const {
+    std::array<T, 7> I{};
+    for (auto &i : I) i = T(0.0);
+    double type = 1.0;
+    const int *from, *to;
+    if (j.d) {
+      const auto p = diodeModel(*j.d, tempK);
+      if (p.rs > 0.0) { const T ir = (x[0] - x[2]) / p.rs; I[0] += ir; I[2] -= ir; }
+      const T id = diode_iq(x[2] - x[1], p).first;
+      I[2] += id; I[1] -= id;
+      from = diodeFrom; to = diodeTo;
+    } else {
+      const auto p = bjtModel(*j.q, tempK);
+      type = p.type;
+      auto res = [&](int a, int b, double r) {
+        if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
       };
+      res(0, 4, p.rc); res(1, 5, p.rb); res(2, 6, p.re);
+      const auto e = bjt_gp(type * (x[5] - x[6]), type * (x[5] - x[4]), type * (x[1] - x[4]),
+                            type * (x[3] - x[4]), p);
+      I[4] += type * e.cc; I[5] += type * e.cb; I[6] -= type * (e.cc + e.cb);
+      from = bjtFrom; to = bjtTo;
+    }
+    const BlockState::DeviceCharge *st = j.st;
+    if (!st || !(h > 1e-15) || !integrator || !junctionHasCharge(j)) return I;
+    T v[5], q[5];
+    const int K = junctionCharges(j, x, tempK, v, q);
+    if constexpr (std::is_same_v<T, double>)
+      if (next) {  // shift the voltage history (next may alias st)
+        std::copy(st->v[1], st->v[1] + 5, next->v[2]);
+        std::copy(st->v[0], st->v[0] + 5, next->v[1]);
+      }
+    const bool trap = integrator->getType() == IntegrationType::TRAPEZOIDAL;
+    for (int k = 0; k < K; ++k) {
+      const T i = trap ? (2.0 / h) * (q[k] - st->q[k]) - st->i[k] : (q[k] - st->q[k]) / h;
+      I[from[k]] += type * i;
+      I[to[k]] -= type * i;
+      if constexpr (std::is_same_v<T, double>)
+        if (next) { next->v[0][k] = v[k]; next->q[k] = q[k]; next->i[k] = i; }
+    }
+    return I;
+  }
 
-      addG(nC, nC, res.g_cc); addG(nC, nB, res.g_cb); addG(nC, nE, res.g_ce);
-      addG(nB, nC, res.g_bc); addG(nB, nB, res.g_bb); addG(nB, nE, res.g_be);
-      addG(nE, nC, res.g_ec); addG(nE, nB, res.g_eb); addG(nE, nE, res.g_ee);
-
-      // Stamp I_rhs
-      // I_node = -Sum(G*V) + I_eq
-      // I_eq = I_actual(V) - G*V
-      // RHS needs -I_eq (to move I_eq to LHS? No wait).
-      // KCL: Sum(G*V) = Sum(I_sources).
-      // Linearized: I(V) ~ I(Vo) + G*(V-Vo) = I(Vo) - G*Vo + G*V.
-      // So I_source_equiv = I(Vo) - G*Vo.
-      // KCL: ... + I(V) = 0 -> ... + G*V + I_source_equiv = 0 -> ... + G*V = -I_source_equiv.
-      // RHS = -I_source_equiv.
-      // RHS = -(I(Vo) - G*Vo) = G*Vo - I(Vo).
-      
-      // Let's compute I_source_equiv for each terminal
-      double i_c_eq = res.Ic - (res.g_cc*v_c + res.g_cb*v_b + res.g_ce*v_e);
-      double i_b_eq = res.Ib - (res.g_bc*v_c + res.g_bb*v_b + res.g_be*v_e);
-      double i_e_eq = res.Ie - (res.g_ec*v_c + res.g_eb*v_b + res.g_ee*v_e);
-
-      if (nC != 0) rhs[nC-1] -= i_c_eq;
-      if (nB != 0) rhs[nB-1] -= i_b_eq;
-      if (nE != 0) rhs[nE-1] -= i_e_eq;
+  // Newton stamp of f(x) (terminal currents) over the terminal unknowns n.
+  // Terminals may share an unknown (an internal node without its resistance),
+  // so derivatives are seeded per unknown, not per terminal.
+  template <size_t NT, class F>
+  void stampByDual(const std::array<int, NT> &n, int terms, const std::vector<double> &v, F &&f) {
+    auto V = [&](int k) { return n[k] > 0 && n[k] <= (int)v.size() ? v[n[k] - 1] : 0.0; };
+    std::array<double, NT> I{};
+    bool any = false;
+    for (int u = 0; u < terms; ++u) {
+      if (n[u] <= 0) continue;
+      bool seen = false;
+      for (int w = 0; w < u; ++w) seen = seen || n[w] == n[u];
+      if (seen) continue;
+      any = true;
+      std::array<Dual<double>, NT> x;
+      for (int k = 0; k < (int)NT; ++k) x[k] = Dual<double>(V(k), k < terms && n[k] == n[u] ? 1.0 : 0.0);
+      const auto cur = f(x);
+      for (int t = 0; t < terms; ++t) {
+        I[t] = cur[t].val;
+        if (n[t] <= 0 || cur[t].grad == 0.0) continue;
+        matrixBuilder.add(n[t] - 1, n[u] - 1, cur[t].grad);
+        rhsVector[n[t] - 1] += cur[t].grad * V(u);  // -(ieq) = -(I - J V)
+      }
+    }
+    if (!any) return;  // every terminal grounded
+    for (int t = 0; t < terms; ++t)
+      if (n[t] > 0) rhsVector[n[t] - 1] -= I[t];
   }
 
   void stampJFET(const JFET& j, int nD, int nG, int nS,
@@ -780,8 +837,8 @@ public:
                                                          const std::vector<double> &freqs);
 
   // Noise around the last solveDC() operating point (ngspice .noise semantics).
-  // Generators: resistor thermal 4kT/R, diode shot 2q|Id|, BJT shot 2q|Ic| (C-E)
-  // and 2q|Ib| (B-E), MOSFET/JFET channel thermal 4kT*(2/3)*gm (MOS1). Per
+  // Generators: resistor thermal 4kT/R (incl. diode RS, BJT RB/RC/RE), diode shot 2q|Id|,
+  // BJT shot 2q|Ic| (C'-E') and 2q|Ib| (B'-E'), MOSFET/JFET channel thermal 4kT*(2/3)*gm (MOS1). Per
   // frequency one adjoint solve gives every generator's transfer to
   // v(out)-v(ref) and one forward solve the gain from `inputSource` at unit AC;
   // totals integrate each generator with ngspice's power law (Nintegrate).
@@ -894,10 +951,9 @@ private:
    * applyPnJunctionLimits - Apply SPICE-style pnjlim to prevent NR overshoot.
    * Modifies v_new in-place based on v_old.
    */
-  void applyPnJunctionLimits(const TensorizedBlock& block,
+  void applyPnJunctionLimits(const TensorNetlist& netlist,
                               std::vector<double>& v_new,
-                              const std::vector<double>& v_old,
-                              double temp_K = 300.15);
+                              const std::vector<double>& v_old);
 
   /**
    * coldStartSweep - SPICE3-accurate cold-start using dt_init = tstep/100 micro-steps.
@@ -988,38 +1044,29 @@ public:
     const TensorBlock *blk;
     const BlockState *st;
     std::function<int(int)> map;   // local node -> global node
-    int vs, ind, e, h;             // first matrix row of each branch kind
+    int vs, ind, e, h, dev;        // first matrix row of each branch kind; dev: device internal nodes
   };
   std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
     std::vector<BranchSlot> branchList;
-    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0});
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0});
     for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
       auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
       if (it == nl.blockDefinitions.end()) continue;
       const auto *inst = &nl.instances[k];
       branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
         return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
-      }, 0, 0, 0, 0});
+      }, 0, 0, 0, 0, 0});
     }
     int next = nl.numGlobalNodes;
     for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
     for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
+    for (auto &s : branchList) { s.dev = next; next += junctionInternals(*s.blk); }
     total = next;
     return branchList;
   }
   int systemSize(const TensorNetlist &nl) const { int t = 0; branchSlots(nl, t); return t; }
-
-  // BJT kernel parameters shared by the KCL audits and noise (thermal scaling as stampBJT).
-
-  static BJTParams<double> bjtKernelParams(const TensorNetlist &nl, const BJT &q) {
-    BJTParams<double> p = {q.saturationCurrent_I_S_A, q.betaF, q.betaR, q.thermalVoltage_V_T_V};
-    const double ts = nl.environment.ambient_temp_K / 300.15;
-    p.Vt *= ts;
-    p.Is *= std::pow(ts, 3.0) * std::exp(1.11 / q.thermalVoltage_V_T_V - 1.11 / p.Vt);
-    return p;
-  }
 
   // Small-signal system at the last DC operating point: G (Newton Jacobian
   // without node gmin), reactive triplets C. Shared by solveAC and solveNoise.
@@ -1051,7 +1098,7 @@ public:
       for (const auto &e : b.schottkyDiodes) mark({e.anode, e.cathode});
       for (const auto &e : b.zenerDiodes) mark({e.anode, e.cathode});
       for (const auto &e : b.mosfets) mark({e.drain, e.gate, e.source, e.body});
-      for (const auto &e : b.bjts) mark({e.nodeCollector, e.base, e.emitter});
+      for (const auto &e : b.bjts) mark({e.nodeCollector, e.base, e.emitter, e.substrate});
       for (const auto &e : b.jfets) mark({e.drain, e.gate, e.source});
       for (const auto &e : b.voltageControlledVoltageSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
@@ -1217,22 +1264,6 @@ public:
         addRes(vccs.outNeg, i_vccs);
     }
 
-    // 3. Diodes (Shockley Equation: I = Is * (exp(V/Vt) - 1))
-    for (const auto &d : netlist.globalBlock.diodes) {
-      double v_anode = getV(d.anode);
-      double v_cathode = getV(d.cathode);
-      double v_d = v_anode - v_cathode;
-
-      // Use CLAMPED physics kernel (matching solver) to avoid false divergence
-      // on valid linear continuation steps.
-      DiodeParams<double> params = {d.saturationCurrent_I_S_A, d.emissionCoefficient_N,
-                            d.thermalVoltage_V_T_V};
-      double i_d = diode_current_clamped(v_d, params); // device_physics.h default cap
-
-      addRes(d.anode, -i_d);
-      addRes(d.cathode, i_d);
-    }
-
     // 3.25 Schottky Diode Audit
     for (const auto &sd : netlist.globalBlock.schottkyDiodes) {
       double v_a = getV(sd.anode);
@@ -1247,25 +1278,21 @@ public:
       addRes(sd.cathode, i_d);
     }
 
-    // 3.5 BJT Audit (temperature-aware)
-    for (const auto &q : netlist.globalBlock.bjts) {
-        double v_c = getV(q.nodeCollector);
-        double v_b = getV(q.base);
-        double v_e = getV(q.emitter);
-
-        BJTCurrents currents = bjt_ebers_moll(v_c, v_b, v_e, q.isNPN, bjtKernelParams(netlist, q));
-        
-        addRes(q.nodeCollector, -currents.Ic);
-        addRes(q.base, -currents.Ib);
-        addRes(q.emitter, -currents.Ie);
-    }
-
     // 3.55 MOSFETs, global block and every instance: the stamped mosCurrents()
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &t,
-                               const BlockState::MosfetCharge *st) {
+                               const BlockState::DeviceCharge *st) {
         const auto I = mosCurrents<double>({getV(t[0]), getV(t[1]), getV(t[2]), getV(t[3])},
                                            mos1Params(m), st, h);
         for (int k = 0; k < 4; ++k) addRes(t[k], -I[k]);
+    });
+    // 3.6 Diodes and BJTs, global block and every instance: the stamped
+    //     junctionCurrents(), including their internal-node rows
+    forEachJunction(netlist, [&](const Junction &j) {
+        std::array<double, 7> x{};
+        for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
+        const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, h);
+        for (int k = 0; k < j.terms; ++k)
+          if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
     });
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
@@ -1376,36 +1403,12 @@ public:
           addRes(mapNode(cs.nodeNegative), is);
         }
 
-        // Diodes
-        for (const auto &d : block.diodes) {
-          double v_d = getV(mapNode(d.anode)) - getV(mapNode(d.cathode));
-          DiodeParams<double> params = {d.saturationCurrent_I_S_A,
-                                 d.emissionCoefficient_N,
-                                 d.thermalVoltage_V_T_V};
-          double i_d = diode_current_clamped(v_d, params);  // as stamped
-          addRes(mapNode(d.anode), -i_d);
-          addRes(mapNode(d.cathode), i_d);
-        }
-
         // Dependent Sources: G only (E/F/H are branch elements)
         for (const auto &vccs : block.voltageControlledCurrentSources) {
             double v_ctrl = getV(mapNode(vccs.ctrlPos)) - getV(mapNode(vccs.ctrlNeg));
             double i_vccs = vccs.gm * v_ctrl;
             addRes(mapNode(vccs.outPos), -i_vccs);
             addRes(mapNode(vccs.outNeg), i_vccs);
-        }
-
-        // BJTs (Instance)
-        for (const auto &q : block.bjts) {
-            double v_c = getV(mapNode(q.nodeCollector));
-            double v_b = getV(mapNode(q.base));
-            double v_e = getV(mapNode(q.emitter));
-
-            BJTCurrents currents = bjt_ebers_moll(v_c, v_b, v_e, q.isNPN, bjtKernelParams(netlist, q));
-
-            addRes(mapNode(q.nodeCollector), -currents.Ic);
-            addRes(mapNode(q.base), -currents.Ib);
-            addRes(mapNode(q.emitter), -currents.Ie);
         }
 
         // JFETs (Instance) — same form as the global audit
@@ -1575,17 +1578,19 @@ public:
     }
 
 
-    // 3. Diodes
-    for (const auto &d : netlist.globalBlock.diodes) {
-      double v_d = getV(d.anode) - getV(d.cathode);
-      DiodeParams<double> params = {d.saturationCurrent_I_S_A, d.emissionCoefficient_N,
-                            d.thermalVoltage_V_T_V};
-      double i_d = diode_current_clamped(v_d, params);
-      addRes(d.anode, -i_d);
-      addRes(d.cathode, i_d);
-      attributions.push_back({d.modelName, "Diode",
-          {{d.anode, -i_d}, {d.cathode, i_d}}});
-    }
+    // 3. Diodes and BJTs (every block): DC junctionCurrents() at the external
+    //    nodes (internal-node rows are not node KCL rows here)
+    forEachJunction(netlist, [&](const Junction &j) {
+      std::array<double, 7> x{};
+      for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
+      const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, 0.0);
+      DeviceAttribution a{j.d ? j.d->instanceName : j.q->instanceName, j.d ? "Diode" : "BJT", {}};
+      for (int k = 0; k < j.terms; ++k) {
+        addRes(j.n[k], -I[k]);
+        if (j.n[k] > 0 && j.n[k] <= n) a.nodeCurrents.push_back({j.n[k], -I[k]});
+      }
+      attributions.push_back(std::move(a));
+    });
 
     // Schottky Diodes
     for (const auto &sd : netlist.globalBlock.schottkyDiodes) {
@@ -1597,27 +1602,6 @@ public:
       addRes(sd.cathode, i_d);
       attributions.push_back({sd.instanceName, "SchottkyDiode",
           {{sd.anode, -i_d}, {sd.cathode, i_d}}});
-    }
-
-    // BJTs (temperature-aware)
-    for (const auto &q : netlist.globalBlock.bjts) {
-      double v_c = getV(q.nodeCollector);
-      double v_b = getV(q.base);
-      double v_e = getV(q.emitter);
-      BJTParams<double> params;
-      params.Is = q.saturationCurrent_I_S_A;
-      params.BetaF = q.betaF;
-      params.BetaR = q.betaR;
-      params.Vt = q.thermalVoltage_V_T_V;
-      double ts_det = netlist.environment.ambient_temp_K / 300.15;
-      params.Vt *= ts_det;
-      params.Is *= std::pow(ts_det, 3.0) * exp(1.11 / q.thermalVoltage_V_T_V - 1.11 / params.Vt);
-      BJTCurrents<double> currents = bjt_ebers_moll(v_c, v_b, v_e, q.isNPN, params);
-      addRes(q.nodeCollector, -currents.Ic);
-      addRes(q.base, -currents.Ib);
-      addRes(q.emitter, -currents.Ie);
-      attributions.push_back({q.instanceName, "BJT",
-          {{q.nodeCollector, -currents.Ic}, {q.base, -currents.Ib}, {q.emitter, -currents.Ie}}});
     }
 
     // MOSFETs
@@ -1772,28 +1756,37 @@ public:
               if (r.nodeTerminal1 > 0) b_sens[r.nodeTerminal1-1] -= didp;
               if (r.nodeTerminal2 > 0) b_sens[r.nodeTerminal2-1] += didp; // I_leaving_n2 is -I -> d(-I)/dp = -dI/dp -> b = +dI/dp
           } 
-          else if (type == ComponentType::DIODE) {
-              if (index < 0 || index >= (int)netlist.globalBlock.diodes.size()) return {};
-              const auto& d = netlist.globalBlock.diodes[index];
-              
-              double v_diff = getV(d.anode) - getV(d.cathode);
-              
-              // Create DUAL parameters
-              // Example: paramName="Is" -> seed Is with grad=1.0
-              Dual<double> Is(d.saturationCurrent_I_S_A, (paramName == "Is" ? 1.0 : 0.0));
-              Dual<double> N(d.emissionCoefficient_N, (paramName == "N" ? 1.0 : 0.0));
-              Dual<double> Vt(d.thermalVoltage_V_T_V, (paramName == "Vt" ? 1.0 : 0.0));
-              
-              DiodeParams<Dual<double>> p_dual = {Is, N, Vt};
-              
-              // Evaluate physics with Dual params and Constant voltage
-              // v_diff is treated as constant (grad=0) for partial dF/dp
-              Dual<double> i_d = diode_current_clamped(Dual<double>(v_diff), p_dual);
-              
-              double didp = i_d.grad; // This is dI_anode / dp
-              
-              if (d.anode > 0) b_sens[d.anode-1] -= didp;
-              if (d.cathode > 0) b_sens[d.cathode-1] += didp;
+          else if (type == ComponentType::DIODE || type == ComponentType::BJT) {
+              // dI/dp of the same junctionCurrents() the solve used, by central
+              // difference on the instance's parameter (global-block devices).
+              // ponytail: finite difference (relative step 1e-6); Dual parameters if precision matters.
+              const bool isD = type == ComponentType::DIODE;
+              const size_t count = isD ? netlist.globalBlock.diodes.size() : netlist.globalBlock.bjts.size();
+              if (index < 0 || index >= (int)count) return {};
+              Diode d; BJT q;
+              double *par = nullptr;
+              const void *orig = nullptr;
+              if (isD) {
+                  d = netlist.globalBlock.diodes[index]; orig = &netlist.globalBlock.diodes[index];
+                  par = paramName == "Is" ? &d.saturationCurrent_I_S_A : paramName == "N" ? &d.emissionCoefficient_N
+                      : paramName == "Vt" ? &d.thermalVoltage_V_T_V : nullptr;
+              } else {
+                  q = netlist.globalBlock.bjts[index]; orig = &netlist.globalBlock.bjts[index];
+                  par = paramName == "Is" ? &q.saturationCurrent_I_S_A
+                      : (paramName == "BetaF" || paramName == "Beta") ? &q.betaF
+                      : paramName == "BetaR" ? &q.betaR : paramName == "Vt" ? &q.thermalVoltage_V_T_V : nullptr;
+              }
+              if (!par) return {};
+              Junction jj;
+              forEachJunction(netlist, [&](const Junction &j) { if ((const void *)(isD ? (const void *)j.d : (const void *)j.q) == orig) jj = j; });
+              jj.d = isD ? &d : nullptr; jj.q = isD ? nullptr : &q; jj.st = nullptr;
+              std::array<double, 7> x{};
+              for (int k = 0; k < jj.terms; ++k) x[k] = getV(jj.n[k]);
+              const double p0 = *par, dp = 1e-6 * std::max(std::abs(p0), 1e-30);
+              *par = p0 + dp; const auto Ip = junctionCurrents(jj, x, netlist.environment.ambient_temp_K, 0.0);
+              *par = p0 - dp; const auto Im = junctionCurrents(jj, x, netlist.environment.ambient_temp_K, 0.0);
+              for (int k = 0; k < jj.terms; ++k)
+                  if (jj.n[k] > 0 && jj.n[k] <= (int)b_sens.size()) b_sens[jj.n[k] - 1] -= (Ip[k] - Im[k]) / (2.0 * dp);
           }
           else if (type == ComponentType::MOSFET) {
               if (index < 0 || index >= (int)netlist.globalBlock.mosfets.size()) return {};
@@ -1823,73 +1816,6 @@ public:
               if (index < 0 || index >= (int)netlist.globalBlock.inductors.size()) return {};
               // DC: Inductors are short, no L term in DC model. dI/dL = 0.
           }
-          // BJT SENSITIVITY
-          else if (type == ComponentType::BJT) {
-
-               if (index < 0 || index >= (int)netlist.globalBlock.bjts.size()) return {};
-               const auto& q = netlist.globalBlock.bjts[index];
-               
-               double vc = getV(q.nodeCollector);
-               double vb = getV(q.base);
-               double ve = getV(q.emitter);
-               
-               // Seed Dual parameters based on what we are differentiating against
-               Dual<double> Is(q.saturationCurrent_I_S_A, (paramName == "Is" ? 1.0 : 0.0));
-               Dual<double> Bf(q.betaF, ((paramName == "BetaF" || paramName == "Beta") ? 1.0 : 0.0));
-               Dual<double> Br(q.betaR, (paramName == "BetaR" ? 1.0 : 0.0));
-               Dual<double> Vt(q.thermalVoltage_V_T_V, (paramName == "Vt" ? 1.0 : 0.0));
-               
-               // Reuse the existing templated physics kernel? 
-               // bjt_ebers_moll is currently hardcoded for double (inline double-only implementation).
-               // We need to look at device_physics.h. It seems I didn't verify if it's templated!
-               // Checking device_physics.h... it returns BJTCurrents struct with doubles.
-               // Ah, the implementation in device_physics.h lines 164 is:
-               // inline BJTCurrents bjt_ebers_moll(double v_c, ... const BJTParams<double>& p)
-               // It accepts double params. It is NOT templated for Dual<double> yet.
-               // Ideally, I should template it. But for now, I can replicate the simple Ebers-Moll equation logic here using Duals.
-               // Ebers-Moll is relatively simple.
-               
-               // voltages are constant for partial dF/dp
-               Dual<double> v_be_d = (q.isNPN ? 1.0 : -1.0) * (vb - ve);
-               Dual<double> v_bc_d = (q.isNPN ? 1.0 : -1.0) * (vb - vc);
-               
-               auto safe_exp = [&](Dual<double> v, Dual<double> vt) { 
-                    Dual<double> arg = v / vt;
-                    if (arg.val > 40.0) arg = Dual<double>(40.0, 0.0);
-                    using std::exp;
-                    return exp(arg); // Use ADL for Dual
-               };
-
-               Dual<double> i_f = Is * (safe_exp(v_be_d, Vt) - 1.0);
-               Dual<double> i_r = Is * (safe_exp(v_bc_d, Vt) - 1.0);
-               
-               Dual<double> i_ct = i_f - i_r;
-               Dual<double> i_b_f = i_f / Bf;
-               Dual<double> i_b_r = i_r / Br;
-               
-               Dual<double> ic = i_ct - i_b_r;
-               Dual<double> ib = i_b_f + i_b_r;
-               // Dual<double> ie = -ic - ib;
-               
-               // We need dIc/dp, dIb/dp, dIe/dp
-               // Note: These are currents INTO the terminal. 
-               // In RHS b_sens, we add +dI/dp if it enters?
-               // F_node = Sum(I_entering) = 0.
-               // dF/dp = Sum(dI_entering/dp)
-               // b = -dF/dp.
-               // So b -= dI_entering/dp.
-               
-               // Correct sign fix:
-               // If I_c enters Collector, residual R_c += I_c
-               // dR_c / dp = dI_c / dp
-               // b_c = - dR_c / dp = - dI_c / dp.
-               
-               double sign = (q.isNPN ? 1.0 : -1.0);
-               
-               if (q.nodeCollector > 0) b_sens[q.nodeCollector-1] -= (sign * ic.grad);
-               if (q.base > 0)          b_sens[q.base-1]          -= (sign * ib.grad);
-               if (q.emitter > 0)       b_sens[q.emitter-1]       -= (sign * (-ic.grad - ib.grad));
-            }
       } catch(...) {
           return {};
       }
@@ -2082,114 +2008,7 @@ public:
         }
         matrixBuilder.addBatch(rows, cols, vals);
     }
-    // 1. Batch Compute Physics (Updates internal state: v_d, i_d, g_d, etc.)
-    batchDiodePhysics(block.diodes, v_guess);
-    batchBJTPhysics(block.bjts, v_guess);
-
-    // 2. Batch Stamp (Iterate over contiguous arrays)
-    
-    // Diodes
-    // Diodes
-    size_t nD = block.diodes.size();
-    if (nD > 0) {
-        std::vector<int> rows, cols;
-        std::vector<double> vals;
-        rows.reserve(nD * 4);
-        cols.reserve(nD * 4);
-        vals.reserve(nD * 4);
-        
-        for (size_t i = 0; i < nD; ++i) {
-            int nA = block.diodes.node_a[i];
-            int nC = block.diodes.node_c[i];
-            double g = block.diodes.g_d[i];
-            double i_eq = block.diodes.i_d[i] - g * block.diodes.v_d[i];
-            
-            // Matrix Stamping (G)
-            if (nA != 0 && nC != 0) {
-                // Diagonal
-                rows.push_back(nA-1); cols.push_back(nA-1); vals.push_back(g);
-                rows.push_back(nC-1); cols.push_back(nC-1); vals.push_back(g);
-                // Off-Diagonal
-                rows.push_back(nA-1); cols.push_back(nC-1); vals.push_back(-g);
-                rows.push_back(nC-1); cols.push_back(nA-1); vals.push_back(-g);
-            } else if (nA != 0) {
-                rows.push_back(nA-1); cols.push_back(nA-1); vals.push_back(g);
-            } else if (nC != 0) {
-                rows.push_back(nC-1); cols.push_back(nC-1); vals.push_back(g);
-            }
-            
-            // RHS Stamping
-            if (nA != 0) rhsVector[nA-1] -= i_eq;
-            if (nC != 0) rhsVector[nC-1] += i_eq;
-        }
-        matrixBuilder.addBatch(rows, cols, vals);
-        
-        // GPU Hook (Future Integration)
-        /*
-        if (activeBackend == Backend::WEBGPU || activeBackend == Backend::CUDA) {
-            // Upload Tensors to GPU Storage Buffer
-            gpuAssembler.upload(block.diodes.g_d_buffer, block.diodes.g_d); 
-            // Dispatch Assembly Shader (Scatter-Add)
-            gpuAssembler.dispatchStamping("diode_stamp_kernel");
-        }
-        */
-    }
-
-
-    // MOSFETs: stampAllElements() (stampMos1, both paths)
-
-
-    
-    // BJTs
-    // MOSFETs (Omitted for brevity in previous view, following same pattern...)
-    
-    // BJTs
-    size_t nB = block.bjts.size();
-    if (nB > 0) {
-        std::vector<int> rows, cols;
-        std::vector<double> vals;
-        rows.reserve(nB * 9); cols.reserve(nB * 9); vals.reserve(nB * 9);
-        
-        for (size_t i = 0; i < nB; ++i) {
-            int nC = block.bjts.collectors[i];
-            int nB = block.bjts.bases[i];
-            int nE = block.bjts.emitters[i];
-            
-            double g_cc = block.bjts.g_cc[i]; double g_cb = block.bjts.g_cb[i]; double g_ce = block.bjts.g_ce[i];
-            double g_bc = block.bjts.g_bc[i]; double g_bb = block.bjts.g_bb[i]; double g_be = block.bjts.g_be[i];
-            double g_ec = block.bjts.g_ec[i]; double g_eb = block.bjts.g_eb[i]; double g_ee = block.bjts.g_ee[i];
-            
-            // Helper to push triplet
-            auto addG = [&](int r, int c, double v) { 
-                if(r!=0 && c!=0) { rows.push_back(r-1); cols.push_back(c-1); vals.push_back(v); }
-            };
-            
-            addG(nC, nC, g_cc); addG(nC, nB, g_cb); addG(nC, nE, g_ce);
-            addG(nB, nC, g_bc); addG(nB, nB, g_bb); addG(nB, nE, g_be);
-            addG(nE, nC, g_ec); addG(nE, nB, g_eb); addG(nE, nE, g_ee);
-            
-            // RHS
-             double v_c = (nC>0 ? v_guess[nC-1] : 0.0);
-             double v_b = (nB>0 ? v_guess[nB-1] : 0.0);
-             double v_e = (nE>0 ? v_guess[nE-1] : 0.0);
-             
-             double Iceq = block.bjts.Ic[i] - (g_cc*v_c + g_cb*v_b + g_ce*v_e);
-             double Ibeq = block.bjts.Ib[i] - (g_bc*v_c + g_bb*v_b + g_be*v_e);
-             double Ieeq = block.bjts.Ie[i] - (g_ec*v_c + g_eb*v_b + g_ee*v_e);
-             
-             if (nC != 0) rhsVector[nC-1] -= Iceq;
-             if (nB != 0) rhsVector[nB-1] -= Ibeq;
-             if (nE != 0) rhsVector[nE-1] -= Ieeq;
-        }
-        matrixBuilder.addBatch(rows, cols, vals);
-
-        // GPU Hook (Future Integration)
-        /*
-        if (activeBackend == Backend::WEBGPU) {
-             gpuAssembler.dispatchStamping("bjt_stamp_kernel");
-        }
-        */
-    }
+    // Diodes, BJTs and MOSFETs: stampAllElements() (stampByDual, both paths)
 
     // 3. Dynamic Models (ModelRegistry dispatch)
     auto& registry = ModelRegistry::instance();
@@ -2233,31 +2052,11 @@ public:
       return 0.0;
     };
 
-    // 1. Diodes
-    for (const auto &d : block.diodes) {
-      int nA = mapNode(d.anode);
-      int nC = mapNode(d.cathode);
-      stampDiode(d, nA, nC, getV(nA) - getV(nC), temp_K, matrixBuilder, rhsVector);
-    }
-
     // 1.5 Schottky Diodes (Reuse Unified Diode Logic)
     for (const auto &sd : block.schottkyDiodes) {
       int nA = mapNode(sd.anode);
       int nC = mapNode(sd.cathode);
       stampSchottky(sd, nA, nC, getV(nA) - getV(nC), temp_K, matrixBuilder, rhsVector);
-    }
-
-    // 3. BJTs
-    for (const auto &q : block.bjts) {
-        int nC = mapNode(q.nodeCollector);
-        int nB = mapNode(q.base);
-        int nE = mapNode(q.emitter);
-        int nS = 0; // Substrate not yet modeled
-
-        stampBJT(q, nC, nB, nE, nS,
-                 getV(nC), getV(nB), getV(nE), 0.0,
-                 temp_K,
-                 matrixBuilder, rhsVector);
     }
 
     // 4. JFETs
@@ -2347,10 +2146,15 @@ public:
         }
     }
 
-    // Branch-current elements (V, L+K, E, F, H) and MOSFETs: one implementation for both paths
+    // Branch-current elements (V, L+K, E, F, H), MOSFETs, diodes and BJTs: one implementation for both paths
     stampBranchSystem(netlist, h, time);
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
-                               const BlockState::MosfetCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
+                               const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
+    const double tempK = netlist.environment.ambient_temp_K;
+    forEachJunction(netlist, [&](const Junction &j) {
+        stampByDual(j.n, j.terms, v_guess,
+                    [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, tempK, h); });
+    });
 
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it

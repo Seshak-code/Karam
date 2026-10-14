@@ -472,6 +472,14 @@ struct Diode {
     double area_m2 = 1e-12;       // Junction Area
     double perimeter_m = 4e-6;    // Junction Perimeter
 
+    // SPICE level-1 .model values beyond IS/N (ngspice dio), resolved by the
+    // parser with SPICE defaults; area = the instance AREA factor.
+    struct Card {
+        double rs = 0.0, cjo = 0.0, vj = 1.0, m = 0.5, fc = 0.5, tt = 0.0;
+        double bv = 0.0, ibv = 1e-3;
+        bool bvGiven = false;
+    } card;
+    double area = 1.0;
 };
 
 /*
@@ -588,6 +596,7 @@ struct BJT {
     int nodeCollector = -1;                    // C terminal
     int base = -1;                             // B terminal
     int emitter = -1;                          // E terminal
+    int substrate = 0;                         // S terminal (ground when not given, as SPICE)
     std::string modelName = "default";
     bool isNPN = true;                           // true=NPN, false=PNP
     
@@ -597,10 +606,17 @@ struct BJT {
     double saturationCurrent_I_S_A = 1e-14;       // Is [A]
     double thermalVoltage_V_T_V = 0.02585;          // Vt [V]
 
-    // Noise Parameters
-    double r_bb = 0.0;   // Base spreading resistance [Ohm]
-    double KF = 0.0;     // Flicker noise coefficient
-    double AF = 1.0;     // Flicker noise exponent
+    // Gummel-Poon .model values beyond IS/BF/BR (ngspice bjt level 1), resolved
+    // by the parser with SPICE defaults; area = the instance AREA factor.
+    struct Card {
+        double nf = 1.0, nr = 1.0, vaf = 0.0, var = 0.0, ikf = 0.0, ikr = 0.0;
+        double ise = 0.0, ne = 1.5, isc = 0.0, nc = 2.0;
+        double rb = 0.0, rc = 0.0, re = 0.0;
+        double cje = 0.0, vje = 0.75, mje = 0.33, cjc = 0.0, vjc = 0.75, mjc = 0.33, xcjc = 1.0;
+        double cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
+        double tf = 0.0, xtf = 0.0, vtf = 0.0, itf = 0.0, tr = 0.0;
+    } card;
+    double area = 1.0;
 
     double temperature_K = 300.15;
 };
@@ -790,6 +806,7 @@ struct TensorBlock {
             // BJT: (C-E) and (B-E) edges
             edges.emplace_back(b.nodeCollector, b.emitter, 5);
             edges.emplace_back(b.base, b.emitter, 5);
+            if (b.substrate != 0) edges.emplace_back(b.nodeCollector, b.substrate, 5);  // C-S junction
         }
         
         // Ground is assumed to be node 0 for blocks
@@ -1103,18 +1120,19 @@ struct BlockState {
         void resize(size_t n) { v.resize(n, 0.0); i.resize(n, 0.0); }
     };
 
-    // MOSFET charge history after the last accepted step, per branch
-    // gs, gd, gb (Meyer + overlap) and bd, bs (bulk junctions), actual polarity.
-    struct MosfetCharge {
+    // Charge history of a nonlinear device after the last accepted step, per
+    // charge branch (type domain): MOSFET gs, gd, gb (Meyer + overlap), bd, bs;
+    // diode: the junction; BJT: be, bc, bx (external base), substrate.
+    struct DeviceCharge {
         double v[3][5] = {};  // branch voltages, last three accepted steps (v[0] latest; LTE)
         double q[5] = {}, i[5] = {};
-        double half[3] = {};  // Meyer half-capacitances gs, gd, gb (ngspice averages two)
+        double half[3] = {};  // MOSFET Meyer half-capacitances gs, gd, gb (ngspice averages two)
     };
 
     std::vector<History> capacitorState;
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
-    std::vector<MosfetCharge> mosfetState;
+    std::vector<DeviceCharge> mosfetState, diodeState, bjtState;
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
 
@@ -1130,6 +1148,8 @@ struct BlockState {
         for(auto& h : powerRailState) h.resize(3);
 
         mosfetState.resize(block.mosfets.size());
+        diodeState.resize(block.diodes.size());
+        bjtState.resize(block.bjts.size());
         busProbeState.resize(block.busProbes.size());
     }
 };
@@ -1284,11 +1304,13 @@ public:
     }
     void addDiode(const std::string& name, int anode, int cathode, double Is) {
         globalBlock.addDiode(name, anode, cathode, Is);
+        globalState.diodeState.emplace_back();
         if (anode > numGlobalNodes) numGlobalNodes = anode;
         if (cathode > numGlobalNodes) numGlobalNodes = cathode;
     }
     void addDiode(int anode, int cathode, double Is) {
         globalBlock.addDiode(anode, cathode, Is);
+        globalState.diodeState.emplace_back();
         if (anode > numGlobalNodes) numGlobalNodes = anode;
         if (cathode > numGlobalNodes) numGlobalNodes = cathode;
     }
@@ -1310,6 +1332,7 @@ public:
                 double betaF = 100.0, double betaR = 1.0, 
                 double Is = 1e-14, double Vt = 0.02585) {
         globalBlock.addBJT(name, C, B, E, model, isNPN, betaF, betaR, Is, Vt);
+        globalState.bjtState.emplace_back();
         numGlobalNodes = std::max({numGlobalNodes, C, B, E});
     }
     void addJFET(const std::string& name, int D, int G, int S, 
@@ -1463,6 +1486,7 @@ inline SubCircuitDefinition extractSubCircuit(
         allNodes.insert(b.nodeCollector);
         allNodes.insert(b.base);
         allNodes.insert(b.emitter);
+        allNodes.insert(b.substrate);
     }
     
     // Step 3: Map internal-only nodes
@@ -1550,6 +1574,7 @@ inline SubCircuitDefinition extractSubCircuit(
         newB.nodeCollector = remap(b.nodeCollector);
         newB.base = remap(b.base);
         newB.emitter = remap(b.emitter);
+        newB.substrate = remap(b.substrate);
         out.bjts.push_back(newB);
     }
     

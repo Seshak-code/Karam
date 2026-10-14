@@ -1,0 +1,15 @@
+* BJT and diode with internal nodes inside subcircuit instances (per-instance internal unknowns)
+.subckt stage in out vcc
+RC vcc out 2k
+Q1 out in e QS
+RE e 0 200
+D1 out 0 DS
+.ends
+VCC 1 0 DC 10
+VIN 2 0 PULSE(0.6 1.2 5n 5n 5n 40n 100n)
+X1 2 3 1 stage
+X2 3 4 1 stage
+.model QS NPN(IS=1e-15 BF=100 RB=100 RC=10 RE=1 CJE=1p CJC=1p TF=200p)
+.model DS D(IS=1e-15 RS=20 CJO=0.5p)
+.tran 0.5n 200n
+.end

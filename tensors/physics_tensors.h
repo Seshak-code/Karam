@@ -19,72 +19,6 @@
  * Each tensor stores device parameters in contiguous arrays for cache-optimal access.
  */
 
-// ============================================================================
-// DIODE TENSOR
-// ============================================================================
-
-struct DiodeTensor {
-    // Node indices (global node IDs)
-    std::vector<int> node_a;
-    std::vector<int> node_c;
-    
-    // Device parameters
-    std::vector<double> Is;   // Saturation current [A]
-    std::vector<double> N;    // Emission coefficient
-    std::vector<double> Vt;   // Thermal voltage [V]
-    std::vector<double> GMIN; // Minimum conductance [S]
-    
-    // Thermal parameters (static model)
-    std::vector<double> Rs;   // Series resistance [Ω] (parasitic)
-    std::vector<double> Temp; // Operating temperature [K]
-    
-    // Iteration state (updated each NR pass)
-    std::vector<double> v_d;  // Voltage across diode [V]
-    std::vector<double> i_d;  // Current through diode [A]
-    std::vector<double> g_d;  // Linearized conductance [S]
-    
-    // Design Rule Validation Masks (GPU-compatible uint8)
-    // 0 = PASS, bit flags indicate specific violations
-    std::vector<uint8_t> dr_validity;
-    static constexpr uint8_t DR_OK = 0;
-    static constexpr uint8_t DR_THERMAL_VIOLATION = 1 << 0;
-    static constexpr uint8_t DR_REVERSE_BIAS_LIMIT = 1 << 1;
-    
-    size_t size() const { return node_a.size(); }
-    
-    void reserve(size_t n) {
-        node_a.reserve(n); node_c.reserve(n);
-        Is.reserve(n); N.reserve(n); Vt.reserve(n); GMIN.reserve(n);
-        Rs.reserve(n); Temp.reserve(n);
-        v_d.reserve(n); i_d.reserve(n); g_d.reserve(n);
-        dr_validity.reserve(n);
-    }
-    
-    void clear() {
-        node_a.clear(); node_c.clear();
-        Is.clear(); N.clear(); Vt.clear(); GMIN.clear();
-        Rs.clear(); Temp.clear();
-        v_d.clear(); i_d.clear(); g_d.clear();
-        dr_validity.clear();
-    }
-    
-    void push(int anode, int cathode, double is, double n, double vt, 
-              double rs = 0.0, double temp = 300.0, double gmin = 1e-12) {
-        node_a.push_back(anode);
-        node_c.push_back(cathode);
-        Is.push_back(is);
-        N.push_back(n);
-        Vt.push_back(vt);
-        GMIN.push_back(gmin);
-        Rs.push_back(rs);
-        Temp.push_back(temp);
-        v_d.push_back(0.0);
-        i_d.push_back(0.0);
-        g_d.push_back(gmin); 
-        dr_validity.push_back(DR_OK);
-    }
-};
-
 // Level-1 parameters of a MOSFET instance from its parser-resolved .model card
 // (Mosfet::card). An unresolved card (the GUI's Verilog-A path) keeps the
 // engine's 200u/0.7 V/0.02 NMOS and 100u/-0.7 V/0.02 PMOS by model name, no caps.
@@ -116,91 +50,53 @@ inline Mos1Params<double> mos1Params(const Mosfet& m) {
     return p;
 }
 
-// ============================================================================
-// BJT TENSOR
-// ============================================================================
 
-struct BJTTensor {
-    // Node indices
-    std::vector<int> collectors;
-    std::vector<int> bases;
-    std::vector<int> emitters;
-    
-    // Device parameters
-    std::vector<double> Is;      // Saturation current [A]
-    std::vector<double> BetaF;   // Forward current gain
-    std::vector<double> BetaR;   // Reverse current gain
-    std::vector<double> Vt;      // Thermal voltage [V]
-    std::vector<bool> isNPN;     // true = NPN, false = PNP
-    
-    // Thermal parameters
-    std::vector<double> Temp;    // Operating temperature [K]
-    
-    // Iteration state (terminal currents)
-    std::vector<double> Ic;      // Collector current [A]
-    std::vector<double> Ib;      // Base current [A]
-    std::vector<double> Ie;      // Emitter current [A]
-    
-    // Conductance matrix (3x3 per device, flattened)
-    std::vector<double> g_cc, g_cb, g_ce;
-    std::vector<double> g_bc, g_bb, g_be;
-    std::vector<double> g_ec, g_eb, g_ee;
-    
-    // Design Rule Validation Masks (GPU-compatible uint8)
-    std::vector<uint8_t> dr_validity;
-    static constexpr uint8_t DR_OK = 0;
-    static constexpr uint8_t DR_FLOATING_BASE = 1 << 0;
-    static constexpr uint8_t DR_THERMAL_VIOLATION = 1 << 1;
-    
-    size_t size() const { return collectors.size(); }
-    
-    void reserve(size_t n) {
-        collectors.reserve(n); bases.reserve(n); emitters.reserve(n);
-        Is.reserve(n); BetaF.reserve(n); BetaR.reserve(n); Vt.reserve(n); isNPN.reserve(n);
-        Temp.reserve(n);
-        Ic.reserve(n); Ib.reserve(n); Ie.reserve(n);
-        g_cc.reserve(n); g_cb.reserve(n); g_ce.reserve(n);
-        g_bc.reserve(n); g_bb.reserve(n); g_be.reserve(n);
-        g_ec.reserve(n); g_eb.reserve(n); g_ee.reserve(n);
-        dr_validity.reserve(n);
-    }
-    
-    void clear() {
-        collectors.clear(); bases.clear(); emitters.clear();
-        Is.clear(); BetaF.clear(); BetaR.clear(); Vt.clear(); isNPN.clear();
-        Temp.clear();
-        Ic.clear(); Ib.clear(); Ie.clear();
-        g_cc.clear(); g_cb.clear(); g_ce.clear();
-        g_bc.clear(); g_bb.clear(); g_be.clear();
-        g_ec.clear(); g_eb.clear(); g_ee.clear();
-        dr_validity.clear();
-    }
-    
-    void push(int c, int b, int e, double is, double betaF, double betaR, 
-              double vt, bool npn, double temp = 300.0) {
-        collectors.push_back(c);
-        bases.push_back(b);
-        emitters.push_back(e);
-        Is.push_back(is);
-        BetaF.push_back(betaF);
-        BetaR.push_back(betaR);
-        Vt.push_back(vt);
-        isNPN.push_back(npn);
-        Temp.push_back(temp);
-        
-        // Initialize currents to zero
-        Ic.push_back(0.0);
-        Ib.push_back(0.0);
-        Ie.push_back(0.0);
-        
-        // Initialize conductances to GMIN
-        double gmin = 1e-12;
-        g_cc.push_back(gmin); g_cb.push_back(0.0); g_ce.push_back(0.0);
-        g_bc.push_back(0.0); g_bb.push_back(gmin); g_be.push_back(0.0);
-        g_ec.push_back(0.0); g_eb.push_back(0.0); g_ee.push_back(gmin);
-        dr_validity.push_back(DR_OK);
-    }
-};
+// Diode / Gummel-Poon parameters of an instance from its parser-resolved
+// .model values (AREA applied as ngspice does: currents and capacitances
+// scale, resistances divide). Devices built without a card keep the IS/N or
+// IS/BF/BR they were constructed with and SPICE defaults for the rest.
+// tempK: the engine's simple junction temperature law (Vt ~ T, IS with XTI = 3,
+// EG = 1.11), unchanged at 300.15 K; the other parameters do not track T.
+inline void junctionAtTemp(double tempK, double& vt, double& is) {
+    const double vt0 = vt, ts = tempK / 300.15;
+    vt *= ts;
+    is *= std::pow(ts, 3.0) * std::exp(1.11 / vt0 - 1.11 / vt);
+}
+
+inline DiodeModel<double> diodeModel(const Diode& d, double tempK = 300.15) {
+    const auto& c = d.card;
+    DiodeModel<double> p;
+    double vt = d.thermalVoltage_V_T_V, is = d.saturationCurrent_I_S_A;
+    if (tempK != 300.15) junctionAtTemp(tempK, vt, is);
+    p.is = is * d.area;
+    p.vte = d.emissionCoefficient_N * vt;
+    p.rs = c.rs / d.area;
+    p.cjo = c.cjo * d.area; p.vj = c.vj; p.m = c.m; p.fc = c.fc; p.tt = c.tt;
+    p.breakdown = c.bvGiven;
+    if (p.breakdown) p.xbv = diode_breakdown_xbv(c.bv, c.ibv * d.area, p.is, p.vte);
+    return p;
+}
+
+inline BjtModel<double> bjtModel(const BJT& q, double tempK = 300.15) {
+    const auto& c = q.card;
+    const double a = q.area;
+    double vt = q.thermalVoltage_V_T_V, is = q.saturationCurrent_I_S_A;
+    if (tempK != 300.15) junctionAtTemp(tempK, vt, is);
+    BjtModel<double> p;
+    p.type = q.isNPN ? 1.0 : -1.0;
+    p.is = is * a; p.bf = q.betaF; p.br = q.betaR;
+    p.vtf = c.nf * vt; p.vtr = c.nr * vt;
+    p.invVaf = c.vaf != 0.0 ? 1.0 / c.vaf : 0.0; p.invVar = c.var != 0.0 ? 1.0 / c.var : 0.0;
+    p.oikf = c.ikf != 0.0 ? 1.0 / (c.ikf * a) : 0.0; p.oikr = c.ikr != 0.0 ? 1.0 / (c.ikr * a) : 0.0;
+    p.ise = c.ise * a; p.vte = c.ne * vt; p.isc = c.isc * a; p.vtc = c.nc * vt;
+    p.rb = c.rb / a; p.rc = c.rc / a; p.re = c.re / a;
+    p.cje = c.cje * a; p.vje = c.vje; p.mje = c.mje;
+    p.cjcInt = c.cjc * c.xcjc * a; p.cjcExt = c.cjc * (1.0 - c.xcjc) * a; p.vjc = c.vjc; p.mjc = c.mjc;
+    p.cjs = c.cjs * a; p.vjs = c.vjs; p.mjs = c.mjs; p.fc = c.fc;
+    p.tf = c.tf; p.xtf = c.xtf; p.ovtf = c.vtf != 0.0 ? 1.0 / (1.44 * c.vtf) : 0.0;
+    p.xjtf = c.itf * a; p.tr = c.tr;
+    return p;
+}
 
 // ============================================================================
 // RESISTOR TENSOR (Linear - for completeness)
@@ -334,8 +230,6 @@ struct TensorizedBlock {
     InductorTensor inductors;
     VoltageSourceTensor voltageSources;
     CurrentSourceTensor currentSources;
-    DiodeTensor diodes;
-    BJTTensor bjts;
     
     // Dynamic Models (Type-Erased)
     // Key: DeviceType (e.g. "Diode", "MosfetLevel1") -> Value: tensor + instance count
@@ -351,8 +245,6 @@ struct TensorizedBlock {
         inductors.clear();
         voltageSources.clear();
         currentSources.clear();
-        diodes.clear();
-        bjts.clear();
         
         // Clear dynamic tensors
         auto& registry = ModelRegistry::instance();
@@ -388,22 +280,3 @@ TensorizedBlock tensorizeBlock(const struct TensorBlock& block);
  * All hierarchy is flattened into global node indices.
  */
 TensorizedBlock tensorizeNetlist(const class TensorNetlist& netlist);
-
-// ============================================================================
-// BATCH PHYSICS KERNELS (Vectorizable)
-// ============================================================================
-
-#include <cmath>
-
-/**
- * Batch Diode Physics - Evaluates all diodes in a tensor simultaneously.
- * Updates: i_d, g_d arrays in place.
- */
-void batchDiodePhysics(DiodeTensor& tensor, const std::vector<double>& voltages);
-
-/**
- * Batch BJT Physics - Evaluates all BJTs in a tensor simultaneously.
- * Updates: Ic, Ib, Ie, and conductance matrix arrays in place.
- */
-void batchBJTPhysics(BJTTensor& tensor, const std::vector<double>& voltages);
-
