@@ -143,7 +143,7 @@ waveform corners, all running through one transient loop shared by the API and t
 | `.lib` sections and process corners (PDK ingestion) | Established |
 | Dynamic gmin stepping (ngspice `dynamic_gmin`) | ✅ done |
 | Source stepping | Established |
-| **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so TreeSPICE must win there too, not only on resistor grids | Established techniques, open outcome |
+| **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so TreeSPICE must win there too, not only on resistor grids | ✅ measured 2026-10-13 (`bench/results-2026-10-13.md`): 3–1,900× slower than KLU on transistor-level matrices, from ordering fill. Gap accepted for now |
 | **Condition-number survey** of real MNA matrices, with and without gmin and scaling. This decides whether low-precision factors are viable | Open: no published data |
 | Per-front dirty flags with exact reuse of an unchanged subtree's Schur complement (CPU prototype) | Open integration |
 
@@ -232,6 +232,7 @@ ctest --test-dir build                      # engine regression suites
 python3 tests/ngspice_diff/run_diff.py      # waveform diff against ngspice (needs ngspice on PATH)
 python3 tests/xyce_diff.py                  # Xyce regression gold (needs datasets/xyce)
 python3 tests/ibmpg_diff.py -k ibmpg2       # IBM power-grid benchmarks (needs datasets/ibmpg)
+python3 bench/klu_bench.py                 # solver vs SuiteSparse KLU (needs KLU; downloads matrices)
 build/acutesim_engine_dump <netlist> cpu tran <step> <stop>   # machine-readable waveforms
 ```
 
