@@ -93,6 +93,16 @@ then the two Roadmap sections it points to. Everything below was verified by run
   residual worsens. Verified: ctest 3/3, ngspice 190/0 (+15 netlists), Xyce 92 PASS / 0 FAIL (+14 newly
   reachable), ibmpg2 PASS; OpenVLSI integration suites pass. Testing cadence (owner): Claude tests once per
   phase, no Cline hand-off for now.
+- **Update 2026-10-14 (Claude Code, Phase 3 completion, branch `phase3/osdi`):** BSIM4 / BSIM-CMG through
+  OSDI (`osdi/`, ngspice's `N` element and `.osdi`; one `osdiCurrents()` for stamp, audits, history, AC,
+  noise, LTE); `.include` and `.lib <file> <section>`; DC source stepping (ngspice gillespie_src) and
+  `.options gminsteps`. QA ran in parallel (Sonnet agent, worktree `TreeSPICE-qa`, report there in
+  `tests/QA_PHASE3_REPORT.md`): fixed BJT SUBS (lateral PNP substrate on B', the ngspice default), parameter
+  bounds (PHI=0 crawl, VAF<0), D/Q OFF/IC fail closed, clearer errors; 49 QA netlists imported. OSDI models are
+  built with `OPENVAF_DIR=... tests/build_osdi.sh` into git-ignored `datasets/osdi` (the harness SKIPs without
+  them). Open: `.param` arithmetic expressions and subckt `params:` (PDK libraries need both); OSDI models
+  with state/`$limit`; `tools/physics_compiler` + `models/*.yaml` are unused (owner to decide: delete, or keep
+  the WGSL backend for the GPU device-evaluation work).
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).
