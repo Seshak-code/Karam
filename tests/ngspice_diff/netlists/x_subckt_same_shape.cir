@@ -1,0 +1,17 @@
+* Two subcircuits of the same shape, different values: each instance must use its own block
+* (the scheduler grouped by topology hash and audited XB with sa's 20k: no convergence)
+.model nm nmos (vto=0.6 kp=80u)
+.subckt sa in out vcc
+RL vcc out 20k
+M1 out in 0 0 nm W=2u L=1u
+.ends
+.subckt sb in out vcc
+RL vcc out 40k
+M1 out in 0 0 nm W=2u L=1u
+.ends
+VCC 1 0 DC 3.3
+VIN 2 0 DC 1.2
+XA 2 3 1 sa
+XB 2 4 1 sb
+.op
+.end

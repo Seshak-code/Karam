@@ -54,6 +54,7 @@ def node_map(text):
     """Engine column order: first appearance in top-level element cards (name -> 1-based column)."""
     m, in_sub = {}, False
     models = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".model")}
+    subckts = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".subckt")}
     for line in cards(text):
         t = toks(line)
         if t[0][0] == ".":
@@ -64,6 +65,8 @@ def node_map(text):
         if in_sub: continue
         c = t[0][0].upper()
         pos = range(1, len(t) - 1) if c == "X" else NODE_POS.get(c, [])
+        if c == "X":  # X<name> <nodes...> <subckt> [params]: nodes precede the subcircuit name
+            pos = range(1, next((k for k in range(len(t) - 1, 0, -1) if t[k].upper() in subckts), len(t) - 1))
         if c == "N":  # N<name> <terminals...> <model> [params]: terminals precede the first model name
             pos = range(1, next((k for k in range(1, len(t)) if t[k].upper() in models), 1))
         # Q c b e [s] model ...: the 4th field is a substrate node when the 5th is a name (engine rule)

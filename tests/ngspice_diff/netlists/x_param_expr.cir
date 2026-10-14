@@ -1,0 +1,13 @@
+* .param expressions: arithmetic, functions, comparisons, ternary, forward references, SI suffixes
+.param rtot = {rbase*2}
+.param rbase = 1k
+.param ratio = 'max(0.25, min(0.75, 1/3))'
+.param vin = {sqrt(16) + floor(2.7) - pwr(2,3)/8}
+.param sel = {vin > 4 ? 1 : 0}
+V1 1 0 DC {vin}
+R1 1 2 {rtot*(1-ratio)}
+R2 2 0 'rtot*ratio + sel*1k'
+R3 2 3 {10meg/1e4}
+C3 3 0 1p
+.op
+.end

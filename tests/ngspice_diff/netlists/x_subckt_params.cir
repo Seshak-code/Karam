@@ -1,0 +1,27 @@
+* Parameterized subcircuits: defaults, overrides, params:, .if/.elseif/.else, a local .model
+* whose values follow the parameters, nesting with parameter passing
+.param vdd = 3.3
+.subckt stage in out vcc w=2u l=1u flavour=0
+.model nloc nmos (vto={0.6 + 0.1*flavour} kp=80u)
+.if (flavour == 0)
+RL vcc out 20k
+.elseif (flavour == 1)
+RL vcc out 10k
+.else
+RL vcc out 40k
+.endif
+M1 out in 0 0 nloc W={w} L=l
+.ends
+.subckt pair in out vcc params: wp=4u
+X1 in mid vcc stage w=wp
+X2 mid out vcc stage w={wp/2} flavour=1
+.ends
+VCC 1 0 DC {vdd}
+VIN 2 0 DC 1.2
+XA 2 3 1 stage
+XB 2 4 1 stage flavour=2 l=2u
+XC 2 5 1 pair
+XD 2 6 1 pair wp=8u
+XE 2 7 1 stage
+.op
+.end

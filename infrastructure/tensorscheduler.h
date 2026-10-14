@@ -86,32 +86,21 @@ public:
      * Analyzes the netlist and groups identical blocks into jobs.
      *
      * Optimizations:
-     * 1. Groups by Topology Hash (Research-Grade Reuse).
+     * 1. Groups instances by block definition (one template per block).
      * 2. Calculates expected Job Cost for backend load balancing.
      */
 
     void schedule(const TensorNetlist& netlist) {
         jobs.clear();
         
-        // Phase 4 research: Group by structural topology, not just block names.
-        // This allows instances of DIFFERENT blocks to be batched if their graphs match.
-        std::map<size_t, std::vector<int>> groupedByHash;
-        
-        for (int i = 0; i < (int)netlist.instances.size(); ++i) {
-            const auto& inst = netlist.instances[i];
-            auto it = netlist.blockDefinitions.find(inst.blockName);
-            if (it != netlist.blockDefinitions.end()) {
-                groupedByHash[it->second.topologyHash].push_back(i);
-            }
-        }
-        
-        for (auto const& [hash, instances] : groupedByHash) {
-            // Pick any instance from the group to get the template
-            const auto& firstInst = netlist.instances[instances[0]];
-            auto it = netlist.blockDefinitions.find(firstInst.blockName);
-            if (it != netlist.blockDefinitions.end()) {
-                jobs.push_back({ &(it->second), instances });
-            }
-        }
+        // Group by block definition: instances of one block share its element
+        // values. Grouping by topology hash (which ignores values) audited and
+        // stamped every same-shaped block with the first one's values.
+        std::map<std::string, std::vector<int>> byBlock;
+        for (int i = 0; i < (int)netlist.instances.size(); ++i)
+            if (netlist.blockDefinitions.count(netlist.instances[i].blockName))
+                byBlock[netlist.instances[i].blockName].push_back(i);
+        for (auto const& [name, instances] : byBlock)
+            jobs.push_back({ &netlist.blockDefinitions.at(name), instances });
     }
 };

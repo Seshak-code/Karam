@@ -116,6 +116,7 @@ target_sources(acutesim_engine_objects PRIVATE
 
     # === Netlist ===
     ${CMAKE_CURRENT_SOURCE_DIR}/netlist/spice_parser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/netlist/numparam.cpp
 
     # === OSDI devices (compiled Verilog-A: BSIM4, BSIM-CMG, ... from OpenVAF) ===
     ${CMAKE_CURRENT_SOURCE_DIR}/osdi/osdi_device.cpp

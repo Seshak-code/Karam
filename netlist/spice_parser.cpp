@@ -6,6 +6,7 @@
  */
 
 #include "spice_parser.h"
+#include "numparam.h"
 #include "../osdi/osdi_device.h"
 #include "../physics/physics_constants.h"
 #include <sstream>
@@ -271,8 +272,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     };
 
     int incLine = 0;
-    try { lines = expandIncludes(lines, baseDir, 0, incLine); }
-    catch (const std::exception& e) { return fail(incLine, e.what()); }
+    try {
+        lines = expandIncludes(lines, baseDir, 0, incLine);
+        lines = numparam::expand(lines, incLine);  // .param expressions, subckt parameters, .if
+    } catch (const std::exception& e) { return fail(incLine, e.what()); }
 
     // .param values are global in SPICE: resolve them before any card uses one
     for (const auto& [lineNum, line] : lines) {
