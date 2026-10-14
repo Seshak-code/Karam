@@ -11,6 +11,8 @@
 #include <iostream>
 #include "graph_canonical.h"
 
+namespace osdi { class Model; class Instance; }
+
 /*
  * circuit.h
  * Circuit Netlist - Component definitions and hierarchical storage.
@@ -623,6 +625,20 @@ struct BJT {
 };
 
 /*
+ * OSDI device (N): a compiled Verilog-A model (OpenVAF -> .osdi, e.g. BSIM4,
+ * BSIM-CMG), as ngspice: N<name> <terminals...> <model> [param value ...];
+ * the .model card's type names the OSDI module and its values are the model
+ * parameters. Runtime instances live in BlockState::osdiState.
+ */
+struct OsdiDevice {
+    std::string instanceName;
+    std::string modelName;
+    std::vector<int> nodes;                                    // connected terminals, in module order
+    std::vector<std::pair<std::string, double>> params;        // instance parameters
+    std::shared_ptr<osdi::Model> model;                        // resolved by the parser
+};
+
+/*
  * JFET (J) - Junction Field Effect Transistor
  * Shichman-Hodges Model:
  *   Cutoff:     Vgs <= Vto (for N-ch) or Vgs >= -Vto (for P-ch)
@@ -732,6 +748,7 @@ struct TensorBlock {
     std::vector<Mosfet> mosfets;
     std::vector<BJT> bjts;
     std::vector<JFET> jfets;
+    std::vector<OsdiDevice> osdiDevices;
     std::vector<ZenerDiode> zenerDiodes;
     
     // Interconnects
@@ -809,6 +826,8 @@ struct TensorBlock {
             edges.emplace_back(b.base, b.emitter, 5);
             if (b.substrate != 0) edges.emplace_back(b.nodeCollector, b.substrate, 5);  // C-S junction
         }
+        for (const auto& o : osdiDevices)  // OSDI device: terminal 0 to each other terminal
+            for (size_t k = 1; k < o.nodes.size(); ++k) edges.emplace_back(o.nodes[0], o.nodes[k], 6);
         
         // Ground is assumed to be node 0 for blocks
         topologyHash = GraphCanonical::computeTopologyHash(edges, 0);
@@ -1139,6 +1158,7 @@ struct BlockState {
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
     std::vector<DeviceCharge> mosfetState, diodeState, bjtState;
+    std::vector<std::shared_ptr<osdi::Instance>> osdiState;  // per OsdiDevice (TensorNetlist::instantiateOsdi)
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
 
@@ -1156,6 +1176,7 @@ struct BlockState {
         mosfetState.resize(block.mosfets.size());
         diodeState.resize(block.diodes.size());
         bjtState.resize(block.bjts.size());
+        osdiState.resize(block.osdiDevices.size());
         busProbeState.resize(block.busProbes.size());
     }
 };
@@ -1173,6 +1194,11 @@ public:
 
     std::vector<BlockInstance> instances;                // Placed block instances
     int numGlobalNodes = 0;
+
+    // Create the OSDI runtime instance of every OSDI device (global block and
+    // every placed instance) whose state slot is empty; tempK is the device
+    // temperature handed to setup_instance. Throws on model errors.
+    void instantiateOsdi(double tempK);
     
     // Hierarchical Support
     std::vector<std::pair<std::string, std::string>> probes; // Name, GlobalNodeString
@@ -1494,6 +1520,8 @@ inline SubCircuitDefinition extractSubCircuit(
         allNodes.insert(b.emitter);
         allNodes.insert(b.substrate);
     }
+    for (const auto& o : block.osdiDevices)
+        for (int n : o.nodes) allNodes.insert(n);
     
     // Step 3: Map internal-only nodes
     for (int node : allNodes) {
@@ -1582,6 +1610,11 @@ inline SubCircuitDefinition extractSubCircuit(
         newB.emitter = remap(b.emitter);
         newB.substrate = remap(b.substrate);
         out.bjts.push_back(newB);
+    }
+    for (const auto& o : block.osdiDevices) {
+        OsdiDevice newO = o;
+        for (auto& n : newO.nodes) n = remap(n);
+        out.osdiDevices.push_back(newO);
     }
     
     // Note: Probes, BusProbes, and other runtime-only structures are NOT copied

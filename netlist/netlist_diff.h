@@ -166,6 +166,16 @@ public:
             [](const ZenerDiode& d) { return std::vector<int>{d.anode, d.cathode}; }
         );
 
+        diffByInstanceName<OsdiDevice>(oldBlock.osdiDevices, newBlock.osdiDevices, "OSDI", report,
+            [](const OsdiDevice& a, const OsdiDevice& b) {
+                std::string details;
+                if (a.modelName != b.modelName) details += "model: " + a.modelName + " -> " + b.modelName + "; ";
+                if (a.params != b.params) details += "instance parameters changed; ";
+                return details;
+            },
+            [](const OsdiDevice& o) { return o.nodes; }
+        );
+
         // ---- Anonymous components (keyed by index) ----
         diffByIndex<Diode>(oldBlock.diodes, newBlock.diodes, "Diode", report,
             [](const Diode& a, const Diode& b) {

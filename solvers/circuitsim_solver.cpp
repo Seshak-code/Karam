@@ -209,7 +209,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       if (gmin_factor > 0.0) {  // device-internal nodes are nodes too (ngspice CKTdiagGmin)
         int totalRows = 0;
         for (const auto &sl : branchSlots(netlist, totalRows))
-          for (int r = sl.dev, e = sl.dev + junctionInternals(*sl.blk); r < e; ++r)
+          for (int r = sl.dev, e = sl.dev + deviceInternals(*sl.blk, *sl.st); r < e; ++r)
             matrixBuilder.add(r, r, gmin_factor);
       }
 
@@ -572,6 +572,8 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
     junctionCurrents(j, x, netlist.environment.ambient_temp_K, h, j.st);
   });
+  // OSDI charges, likewise (osdiCurrents with accept)
+  forEachOsdi(netlist, [&](const OsdiRef &r) { osdiCurrents(r, v, h, nullptr, true); });
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);
@@ -632,6 +634,11 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     *j.st = {};
     for (auto &vh : j.st->v) std::copy(v, v + K, vh);
     std::copy(q, q + K, j.st->q);
+  });
+  // OSDI charges at x, zero current
+  forEachOsdi(netlist, [&](const OsdiRef &r) {
+    osdiCurrents(r, x, 0.0, nullptr, true);
+    r.in->vHist[1] = r.in->vHist[2] = r.in->vHist[0];
   });
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
@@ -794,6 +801,13 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
       for (int t = 0; t < j.terms; ++t) if (Q[t] != 0.0) addC(j.n[t] - 1, j.n[u] - 1, Q[t]);
     }
   });
+  // OSDI devices: the reactive Jacobian dq/dx at the operating point
+  forEachOsdi(netlist, [&](const OsdiRef &r) {
+    osdiCurrents(r, lastSolution_, 0.0);
+    for (size_t a = 0; a < r.n.size(); ++a)
+      for (size_t b = 0; b < r.n.size(); ++b)
+        if (const double c = r.in->C(a, b); c != 0.0) addC(r.n[a] - 1, r.n[b] - 1, c);
+  });
   return true;
 }
 
@@ -871,7 +885,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
   }
 
   // Generators: current noise of `psd` [A^2/Hz] between global nodes a, b (0 = ground)
-  struct Gen { int a, b; double psd; };
+  struct Gen { int a, b; double psd; std::function<double(double)> psdAt = nullptr; };  // psdAt(f): coloured
   std::vector<Gen> gens;
   const double kT4 = 4.0 * PhysicsConstants::K_BOLTZMANN * netlist.environment.ambient_temp_K;
   const double q2 = 2.0 * PhysicsConstants::Q_ELECTRON;
@@ -918,6 +932,18 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     gens.push_back({j.n[4], j.n[6], q2 * std::abs(e.cc)});
     gens.push_back({j.n[5], j.n[6], q2 * std::abs(e.cb)});
   });
+  // OSDI devices: the model's own noise sources (white and flicker) at the OP
+  forEachOsdi(netlist, [&](const OsdiRef &r) {
+    std::vector<double> x(r.n.size());
+    for (size_t k = 0; k < x.size(); ++k) x[k] = V(r.n[k]);
+    r.in->evaluate(x.data(), osdi::ANALYSIS_NOISE | osdi::CALC_NOISE, 0.0);
+    const auto srcs = r.in->noise(1.0);
+    for (size_t s = 0; s < srcs.size(); ++s) {
+      auto node = [&](int l) { return l < 0 ? 0 : r.n[l]; };
+      gens.push_back({node(srcs[s].a), node(srcs[s].b), 0.0,
+                      [in = r.in, s](double f) { return in->noise(f)[s].psd; }});
+    }
+  });
 
   // ngspice Nintegrate: integral of a density varying as a power of f between points
   constexpr double kMinLog = 1e-38;
@@ -954,7 +980,8 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     const double lnF = std::log(std::max(f, kMinLog));
     double S = 0.0;
     for (size_t g = 0; g < gens.size(); ++g) {
-      const double dens = std::norm(cx(z.solution, gens[g].a) - cx(z.solution, gens[g].b)) * gens[g].psd;
+      const double dens = std::norm(cx(z.solution, gens[g].a) - cx(z.solution, gens[g].b)) *
+                          (gens[g].psdAt ? gens[g].psdAt(f) : gens[g].psd);
       const double lnD = std::log(std::max(dens, kMinLog));
       if (k > 0) {
         onTot += nint(dens, lnD, lnLast[g], lnF, lnF0, f - f0);
@@ -1191,6 +1218,11 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
               double v[5], q[5];
               const int K = junctionCharges(j, x, netlist.environment.ambient_temp_K, v, q);
               for (int k = 0; k < K; ++k) visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]});
+            });
+            // OSDI devices: their local node voltages
+            forEachOsdi(netlist, [&](const OsdiRef &r) {
+              const auto &h = r.in->vHist;
+              for (size_t k = 0; k < r.n.size(); ++k) visit(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]});
             });
           });
 

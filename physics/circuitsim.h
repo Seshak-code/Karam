@@ -22,6 +22,7 @@
 
 #include "../autodiff/dual.h"
 #include "device_physics.h"
+#include "../osdi/osdi_device.h"
 #include "physics_constants.h"
 #include "../tensors/physics_tensors.h"
 #include "stamps.h"
@@ -664,6 +665,89 @@ public:
     }
   }
 
+  // OSDI devices (compiled Verilog-A: BSIM4, BSIM-CMG, ...). An instance's local
+  // nodes are its terminals, then the internal nodes left after collapsing; the
+  // internal nodes are unknowns after the junction internals (BranchSlot::dev).
+  static int osdiInternals(const BlockState &st) {
+    int k = 0;
+    for (const auto &in : st.osdiState) k += in ? (int)in->numInternal() : 0;
+    return k;
+  }
+  static int deviceInternals(const TensorBlock &blk, const BlockState &st) {
+    return junctionInternals(blk) + osdiInternals(st);
+  }
+  struct OsdiRef {
+    const OsdiDevice *dev;
+    osdi::Instance *in;
+    std::vector<int> n;  // 1-based unknown of each local node (0 = ground)
+  };
+  template <class F> void forEachOsdi(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      int next = sl.dev + junctionInternals(*sl.blk) + 1;
+      for (size_t i = 0; i < sl.blk->osdiDevices.size() && i < sl.st->osdiState.size(); ++i) {
+        osdi::Instance *in = sl.st->osdiState[i].get();
+        if (!in) continue;
+        OsdiRef r{&sl.blk->osdiDevices[i], in, {}};
+        for (int t : r.dev->nodes) r.n.push_back(sl.map(t));
+        for (uint32_t k = 0; k < in->numInternal(); ++k) r.n.push_back(next++);
+        f(r);
+      }
+    }
+  }
+
+  // Currents into an OSDI device's local nodes at the unknowns v: the resistive
+  // residual plus, in transient, its charges' current integrated from the last
+  // accepted step (TRAP, else BE, as mosCurrents). One definition for the stamp,
+  // the KCL audit and the history update. J: dI/dx = G + coef*C (row-major).
+  // accept: store this point as the accepted step. A fatal model error gives NaN.
+  std::vector<double> osdiCurrents(const OsdiRef &r, const std::vector<double> &v, double h,
+                                   std::vector<double> *J = nullptr, bool accept = false) const {
+    const size_t L = r.n.size();
+    std::vector<double> x(L), I(L);
+    for (size_t k = 0; k < L; ++k) x[k] = r.n[k] > 0 && r.n[k] <= (int)v.size() ? v[r.n[k] - 1] : 0.0;
+    const bool tran = h > 1e-15 && integrator;
+    osdi::Instance &in = *r.in;
+    if (!in.evaluate(x.data(), tran ? osdi::ANALYSIS_TRAN : osdi::ANALYSIS_DC | osdi::ANALYSIS_STATIC, 0.0)) {
+      std::fill(I.begin(), I.end(), NAN);
+      if (J) J->assign(L * L, 0.0);
+      return I;
+    }
+    const bool trap = tran && integrator->getType() == IntegrationType::TRAPEZOIDAL;
+    const double coef = !tran ? 0.0 : trap ? 2.0 / h : 1.0 / h;
+    for (size_t k = 0; k < L; ++k) {
+      const double iq = tran ? coef * (in.q()[k] - in.qPrev[k]) - (trap ? in.iPrev[k] : 0.0) : 0.0;
+      I[k] = in.f()[k] + iq;
+      if (accept) { in.qPrev[k] = in.q()[k]; in.iPrev[k] = iq; }
+    }
+    if (accept) { in.vHist[2] = in.vHist[1]; in.vHist[1] = in.vHist[0]; in.vHist[0] = x; }
+    if (J) {
+      J->assign(L * L, 0.0);
+      for (size_t a = 0; a < L; ++a)
+        for (size_t b = 0; b < L; ++b) (*J)[a * L + b] = in.G(a, b) + coef * in.C(a, b);
+    }
+    return I;
+  }
+
+  // Newton stamp of osdiCurrents() at v (a node shared by two terminals sums).
+  void stampOsdi(const OsdiRef &r, const std::vector<double> &v, double h) {
+    std::vector<double> J;
+    const auto I = osdiCurrents(r, v, h, &J);
+    const size_t L = r.n.size();
+    auto V = [&](int g) { return g > 0 && g <= (int)v.size() ? v[g - 1] : 0.0; };
+    for (size_t t = 0; t < L; ++t) {
+      if (r.n[t] <= 0) continue;
+      double ieq = I[t];
+      for (size_t u = 0; u < L; ++u) {
+        const double g = J[t * L + u];
+        if (g == 0.0) continue;
+        ieq -= g * V(r.n[u]);
+        if (r.n[u] > 0) matrixBuilder.add(r.n[t] - 1, r.n[u] - 1, g);
+      }
+      rhsVector[r.n[t] - 1] -= ieq;
+    }
+  }
+
   // Charge branches (terminal pairs, q flows from -> to): diode A'->C; BJT
   // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C').
   static constexpr int diodeFrom[1] = {2}, diodeTo[1] = {1};
@@ -1134,7 +1218,7 @@ public:
     for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
-    for (auto &s : branchList) { s.dev = next; next += junctionInternals(*s.blk); }
+    for (auto &s : branchList) { s.dev = next; next += deviceInternals(*s.blk, *s.st); }
     total = next;
     return branchList;
   }
@@ -1171,6 +1255,8 @@ public:
       for (const auto &e : b.zenerDiodes) mark({e.anode, e.cathode});
       for (const auto &e : b.mosfets) mark({e.drain, e.gate, e.source, e.body});
       for (const auto &e : b.bjts) mark({e.nodeCollector, e.base, e.emitter, e.substrate});
+      for (const auto &e : b.osdiDevices)
+        for (int t : e.nodes) mark({t});
       for (const auto &e : b.jfets) mark({e.drain, e.gate, e.source});
       for (const auto &e : b.voltageControlledVoltageSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
@@ -1365,6 +1451,12 @@ public:
         const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, h);
         for (int k = 0; k < j.terms; ++k)
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
+    });
+    // 3.65 OSDI devices: the stamped osdiCurrents(), internal-node rows included
+    forEachOsdi(netlist, [&](const OsdiRef &r) {
+        const auto I = osdiCurrents(r, v_candidate, h);
+        for (size_t k = 0; k < r.n.size(); ++k)
+          if (r.n[k] > 0 && r.n[k] <= (int)node_residuals.size()) node_residuals[r.n[k] - 1] -= I[k];
     });
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
@@ -1660,6 +1752,16 @@ public:
       for (int k = 0; k < j.terms; ++k) {
         addRes(j.n[k], -I[k]);
         if (j.n[k] > 0 && j.n[k] <= n) a.nodeCurrents.push_back({j.n[k], -I[k]});
+      }
+      attributions.push_back(std::move(a));
+    });
+    // OSDI devices, likewise (DC, external nodes)
+    forEachOsdi(netlist, [&](const OsdiRef &r) {
+      const auto I = osdiCurrents(r, v_candidate, 0.0);
+      DeviceAttribution a{r.dev->instanceName, "OSDI", {}};
+      for (size_t k = 0; k < r.dev->nodes.size(); ++k) {
+        addRes(r.n[k], -I[k]);
+        if (r.n[k] > 0 && r.n[k] <= n) a.nodeCurrents.push_back({r.n[k], -I[k]});
       }
       attributions.push_back(std::move(a));
     });
@@ -2226,6 +2328,7 @@ public:
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     const double tempK = netlist.environment.ambient_temp_K;
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
+    forEachOsdi(netlist, [&](const OsdiRef &r) { stampOsdi(r, v_guess, h); });
 
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it

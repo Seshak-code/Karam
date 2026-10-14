@@ -1,0 +1,12 @@
+* OSDI: BSIM-CMG FinFET inverter pair, transient (charges and thermal node from the model)
+.osdi bsimcmg.osdi
+VDD 1 0 DC 0.8
+VIN 2 0 PULSE(0 0.8 20p 5p 5p 60p 150p)
+NP1 3 2 1 1 pfin
+NN1 3 2 0 0 nfin
+NP2 4 3 1 1 pfin
+NN2 4 3 0 0 nfin
+.model nfin bsimcmg_va type=1
+.model pfin bsimcmg_va type=-1
+.tran 0.5p 200p
+.end

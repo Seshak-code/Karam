@@ -6,6 +6,8 @@
  */
 
 #include "spice_parser.h"
+#include "../osdi/osdi_device.h"
+#include "../physics/physics_constants.h"
 #include <sstream>
 #include <cctype>
 #include <cmath>
@@ -218,6 +220,15 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
         auto tok = tokenize(line);
         if (!tok.empty() && toUpper(tok[0]) == ".GLOBAL")  // global in every .subckt, wherever declared
             for (size_t i = 1; i < tok.size(); ++i) globals_.insert(toUpper(tok[i]));
+        if (!tok.empty() && toUpper(tok[0]) == ".MODEL" && tok.size() > 1)  // N lines need every model name
+            modelNames_.insert(toUpper(tok[1]));
+        if (!tok.empty() && toUpper(tok[0]) == ".OSDI") {  // load compiled Verilog-A modules up front
+            try {
+                if (tok.size() != 2) throw std::runtime_error(".osdi needs exactly one library path");
+                osdi::loadLibrary(tok[1]);
+            } catch (const std::exception& e) { return fail(lineNum, e.what()); }
+            continue;
+        }
         if (tok.empty() || toUpper(tok[0]) != ".PARAM") continue;
         try { parseParam(tok); }
         catch (const std::exception& e) { return fail(lineNum, e.what()); }
@@ -236,6 +247,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             // Directives start with '.'
             if (keyword[0] == '.') {
                 if (keyword == ".MODEL")  parseModelCard(tok);
+                else if (keyword == ".OSDI") {}   // loaded in the first pass
                 else if (keyword == ".SUBCKT") parseSubcktBegin(tok);
                 else if (keyword == ".ENDS")   parseSubcktEnd();
                 else if (keyword == ".PARAM")  {} // handled in the first pass
@@ -326,6 +338,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 case 'M': parseMosfet(tok, blk);      break;
                 case 'Q': parseBJT(tok, blk);         break;
                 case 'J': parseJFET(tok, blk);        break;
+                case 'N': parseOsdiDevice(tok, blk);  break;
                 case 'E': parseVCVS(tok, blk);        break;
                 case 'G': parseVCCS(tok, blk);        break;
                 case 'H': parseCCVS(tok, blk);        break;
@@ -487,6 +500,15 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 throw std::runtime_error("model " + c->name + ": needs MJE/MJC/MJS < 1, VJE/VJC/VJS > 0, FC < 1, "
                                          "0 <= XCJC <= 1, NF/NR/BF/BR > 0, RB/RC/RE >= 0");
         }
+        for (auto& o : blk.osdiDevices) {
+            const ModelCard* c = card(o.modelName);
+            const osdi::Descriptor* d = osdi::findModule(c->type);
+            if (!d) throw std::runtime_error("model " + c->name + ": type " + c->type +
+                                             " is not a loaded OSDI module (load it with .osdi <file>)");
+            auto& m = osdiModels_[toUpper(c->name)];
+            if (!m) m = std::make_shared<osdi::Model>(d, c->name, c->params);
+            o.model = m;
+        }
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
             supported(c, {"BETA", "VTO", "LAMBDA"});
             j.isNChannel = (c->type == "NJF" || c->type == "NJFET");
@@ -517,6 +539,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
 
     // Initialize global state
     result_.netlist.globalState.initialize(result_.netlist.globalBlock);
+    try {  // OSDI instances: parameters, setup_instance, node collapsing
+        result_.netlist.instantiateOsdi(result_.netlist.environment.ambient_temp_K - 300.15 +
+                                        PhysicsConstants::T_DEVICE_NOMINAL_K);
+    } catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
 
     return result_;
 }
@@ -767,6 +793,24 @@ void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& bl
     j.source = nodeIndex(tok[3]);
     j.modelName = tok[4];
     blk.jfets.push_back(j);
+}
+
+// N<name> <terminal>... <modelName> [<param> <value>]...   (OSDI device, as ngspice)
+// The model name is the first field naming a .model card (all are known after
+// the first pass), so the terminals are numbered in order like any element.
+void SPICEParser::parseOsdiDevice(const std::vector<std::string>& tok, TensorBlock& blk) {
+    requireFields(tok, 3);
+    size_t m = 1;
+    while (m < tok.size() && !modelNames_.count(toUpper(tok[m]))) ++m;
+    if (m == tok.size()) throw std::runtime_error(tok[0] + ": no field names a .model card");
+    if (m == 1) throw std::runtime_error(tok[0] + ": no terminals before the model name");
+    if ((tok.size() - m - 1) % 2) throw std::runtime_error(tok[0] + ": instance parameters must be name=value pairs");
+    OsdiDevice o;
+    o.instanceName = tok[0];
+    o.modelName = tok[m];
+    for (size_t i = 1; i < m; ++i) o.nodes.push_back(nodeIndex(tok[i]));
+    for (size_t i = m + 1; i + 1 < tok.size(); i += 2) o.params.push_back({tok[i], parseValue(tok[i + 1])});
+    blk.osdiDevices.push_back(o);
 }
 
 // E<name> <n+> <n-> <nc+> <nc-> <gain>

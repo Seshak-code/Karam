@@ -20,6 +20,10 @@ constexpr double K_BOLTZMANN = 1.380649e-23; // J/K
 
 /** Electron charge */
 constexpr double Q_ELECTRON = 1.602176634e-19; // Coulombs
+/** Temperature at which V_THERMAL_300K is kT/q (299.98 K). Built-in devices use that
+ *  fixed Vt; OSDI devices get ambient - 300.15 K + this so the two agree.
+ *  ponytail: the fixed Vt vs ambient_temp_K mismatch is a known issue (handoff §6). */
+constexpr double T_DEVICE_NOMINAL_K = V_THERMAL_300K * Q_ELECTRON / K_BOLTZMANN;
 
 // =============================================================================
 // DEVICE DEFAULTS (Silicon)

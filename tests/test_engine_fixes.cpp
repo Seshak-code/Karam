@@ -342,6 +342,16 @@ int main() {
               "MOS1 M=3 triples the current: V(drain) = 4.97 (" + std::to_string(V(r, 3)) + ")");
         r = run(mode, "* mos NF\nVDD 1 0 DC 5\nM1 1 1 0 0 NM NF=2\n.model NM NMOS\n.op\n");
         check(!r.converged && r.errorDetail.find("NF") != std::string::npos, "MOS1 NF=2 is an explicit error");
+        // OSDI (N devices) fails closed: missing library, no model card, card type not a loaded module
+        r = run(mode, "* osdi lib\n.osdi no_such_model.osdi\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+        check(!r.converged && r.errorDetail.find("not found") != std::string::npos,
+              "OSDI: a missing .osdi library is an explicit error (" + r.errorDetail + ")");
+        r = run(mode, "* osdi card\nV1 1 0 DC 1\nN1 1 0 0 0 nomodel\n.op\n");
+        check(!r.converged && r.errorDetail.find(".model") != std::string::npos,
+              "OSDI: an N device without a .model card is an explicit error (" + r.errorDetail + ")");
+        r = run(mode, "* osdi module\nV1 1 0 DC 1\nN1 1 0 0 0 nch\n.model nch bsim4va type=1\n.op\n");
+        check(!r.converged && r.errorDetail.find("OSDI module") != std::string::npos,
+              "OSDI: a card whose type is no loaded module is an explicit error (" + r.errorDetail + ")");
         r = run(mode, "* mos LD\nVDD 1 0 DC 5\nM1 1 1 0 0 NM L=1u\n.model NM NMOS LD=0.5u\n.op\n");
         check(!r.converged && r.errorDetail.find("LD") != std::string::npos, "MOS1 Leff <= 0 is an explicit error");
         // TOX without KP: KP = UO * 1e-4 * 3.9 eps0 / TOX (ngspice), here 500 cm^2/Vs and 20 nm
