@@ -83,6 +83,16 @@ then the two Roadmap sections it points to. Everything below was verified by run
   root-pivot fallback were dropped (no wrong answer fixed; 180× steps). Verified: 17 suites, ngspice
   160/0, Xyce 78/0 (1 pre-existing TIMEOUT), ibmpg2. Also: `acutesim_engine/README.md` (PR #5) is the
   Karam README via the weekly subtree sync. **Next:** QA retest (`qa-queue.md`), then diode RS/CJO/TT/BV.
+- **Update 2026-10-14 (Claude Code, Phase 3 devices):** SPICE diode (RS, CJO/VJ/M/FC, TT, BV/IBV, AREA/M) and
+  Gummel–Poon BJT (NF/NR, VAF/VAR, IKF/IKR, ISE/NE, ISC/NC, RB/RC/RE, CJE/CJC/XCJC, CJS + ISS substrate
+  junction, TF/XTF/VTF/ITF, TR, AREA, substrate node). One path: `diodeModel`/`bjtModel` →
+  `junctionCurrents` → `stampJunction` (Dual), audits, history, LTE, AC, noise; series-resistance internal
+  nodes are unknowns after the branch currents (`BranchSlot::dev`). Junction limiting is ngspice's,
+  device-local (DEVpnjlim exactly, MODEINITJCT start). Deleted: Ebers–Moll, SoA diode/BJT tensors, all SIMD
+  kernels + KernelDispatcher. Convergence fixes: no "KCL < 1 nA ⇒ converged" shortcut, damping only when the
+  residual worsens. Verified: ctest 3/3, ngspice 190/0 (+15 netlists), Xyce 92 PASS / 0 FAIL (+14 newly
+  reachable), ibmpg2 PASS; OpenVLSI integration suites pass. Testing cadence (owner): Claude tests once per
+  phase, no Cline hand-off for now.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).
@@ -288,10 +298,9 @@ From `Roadmap.md` Phase 2, with pointers:
   iteration cap on the direct attempt.
 - Instance KCL audit: diodes use the unclamped equation and MOSFETs hard-coded params (global audit uses
   model cards) — inconsistent for model-card MOSFETs inside subcircuits.
-- MOSFET level 1: no source/drain swap for Vds < 0, no body effect. Diode: no RS/CJO/TT. BJT: no VAF, RB/RC/RE,
-  junction caps. AREA, EXP/PWL/SFFM/AM, T lines: explicit errors.
+- BJT: bias-dependent base resistance (IRB, RBM != RB), excess phase (PTF), flicker noise (KF), temperature
+  coefficients away from TNOM: explicit errors or no effect. JFET AREA, EXP/PWL/SFFM/AM, T lines: explicit errors.
 - Subcircuit parameters (`params:`) unsupported. `.include/.lib/.options/.ic/.print` silently ignored.
-- Floating high-impedance nodes: the "KCL < 1e-9 A ⇒ converged" shortcut can accept stale voltages.
 - Junction-cap shortcut and other simplifications are marked `ponytail:` in code (grep for it).
 - AVX2/AVX-512 kernels are x86-only and were not built on this Mac; they mirror the NEON code.
 - Engine CLI (`acutesim_engine_cli`) parses `.tran 10u` with `istringstream` (no SI suffixes).
