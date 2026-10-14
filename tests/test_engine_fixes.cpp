@@ -11,6 +11,7 @@
 #include "engine_api/simulation_dto.h"
 #include "engine_api/engine_callbacks.h"
 #include "physics/circuitsim.h"
+#include "netlist/spice_parser.h"
 
 #include <array>
 #include <cmath>
@@ -331,6 +332,22 @@ int main() {
         d.addVoltageSource(1, 0, 1.0); d.addResistor("R1", 1, 2, 1e3); d.addResistor("R2", 2, 0, 1e3);
         SolverStep s = sim.solveDC(d);
         check(s.stats.converged && !s.stats.gminSteppingUsed, "linear divider: no GMIN stepping reported");
+    }
+
+    // Source stepping (ngspice gillespie_src): with gmin stepping off, a 50-stage RTL
+    // chain that plain Newton cannot solve converges by ramping the sources
+    {
+        std::string net = "* rtl\n.options gminsteps=0\nVCC 1 0 DC 5\nVIN 2 0 DC 0\n";
+        for (int i = 0; i < 50; ++i)
+            net += "RB" + std::to_string(i) + " " + std::to_string(2 + i) + " b" + std::to_string(i) + " 10k\nQ" +
+                   std::to_string(i) + " " + std::to_string(3 + i) + " b" + std::to_string(i) + " 0 NP\nRC" +
+                   std::to_string(i) + " 1 " + std::to_string(3 + i) + " 1k\n";
+        net += ".model NP NPN(IS=1e-15 BF=100)\n.op\n.end\n";
+        auto p = SPICEParser().parse(net);
+        CircuitSim sim;
+        SolverStep s = sim.solveDC(p.netlist);
+        check(p.success && s.stats.converged && s.stats.sourceSteppingUsed,
+              "DC source stepping solves a 50-stage RTL chain with gminsteps=0");
     }
 
     // Phase 3 MOS1: SPICE card defaults (KP 2e-5, VTO 0, W = L = 100u) give

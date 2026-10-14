@@ -123,6 +123,8 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // physics (voltage-only, no branch currents). Phase 4 replaces it with GPU
   // device evaluation + batched front contraction.
 
+  struct RestoreSources { double &f; ~RestoreSources() { f = 1.0; } } restoreSources{srcFact_};
+
   // Ensure topology hash is fresh
   netlist.globalBlock.computeTopologyHash();
 
@@ -184,6 +186,11 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   double gmin_factor = 0.0;               // current node gmin (0 = plain Newton)
   double stepFactor = GMIN_FACTOR, oldGmin = 1e-2;
   bool finalStep = true, gminSteppingUsed = false;
+  // Source stepping (ngspice gillespie_src), when gmin stepping fails too: all
+  // independent sources scaled by srcFact_ from 0 up to 1, the increment grown
+  // after easy steps, cut tenfold after a failed one (from the last good point).
+  bool sourceSteppingUsed = false;
+  double srcConv = 0.0, srcRaise = 1e-3;
   const std::vector<double> seededGuess = voltageEstimate;
   std::vector<double> lastGood;
   for (int si = 0; si < 1000; ++si) {  // ponytail: hard cap; ngspice has none (factor -> 1 ends it)
@@ -361,12 +368,36 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       total_iterations += iteration + 1;
     }
 
+    if (sourceSteppingUsed) {
+      if (gmin_converged) {
+        lastGood = voltageEstimate;
+        srcConv = srcFact_;
+        if (srcConv >= 1.0) { converged = true; break; }
+        if (iteration + 1 <= ITL2 / 4) srcRaise *= 1.5;
+        if (iteration + 1 > 3 * ITL2 / 4) srcRaise *= 0.5;
+      } else {
+        if (srcFact_ == 0.0 || srcRaise < 1e-7) break;  // zero sources fail, or the ramp stalled
+        srcRaise /= 10.0;
+        voltageEstimate = lastGood;
+        syncJunctionLimits(netlist, voltageEstimate);
+      }
+      srcFact_ = std::min(1.0, srcConv + srcRaise);
+      continue;
+    }
     // Only a gmin = 0 solve marks the simulation as converged
     if (finalStep && gmin_converged) {
       converged = true;
       break;
     }
-    if (finalStep && gminSteppingUsed) break;  // final solve after the ladder failed
+    if (finalStep && (gminSteppingUsed || !netlist.environment.gmin_stepping)) {  // gmin stepping failed (or off): sources from zero
+      sourceSteppingUsed = true;
+      std::cerr << "Note: starting source stepping\n";  // as ngspice
+      srcFact_ = 0.0;
+      voltageEstimate = lastGood = std::vector<double>(nTot, 0.0);
+      resetJunctionLimits(netlist);
+      stagnationDetected = divergenceDetected = false;
+      continue;
+    }
 
     if (!gminSteppingUsed) {  // direct attempt failed: start from the seed
       gminSteppingUsed = true;
@@ -463,7 +494,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   stats.method = "Newton-Raphson";
   stats.integrationMethod = ""; // DC has no integration
   stats.gminSteppingUsed = gminSteppingUsed;  // the direct attempt failed: ladder walked
-  stats.sourceSteppingUsed = false; // Not implemented yet
+  stats.sourceSteppingUsed = sourceSteppingUsed;
   stats.failureType = failureType;
   stats.convergenceHistory = std::move(convergenceHistory);
   stats.worstDevices = std::move(worstDevices);

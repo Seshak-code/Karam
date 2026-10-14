@@ -430,6 +430,7 @@ struct SimulationEnvironment {
     double vdd_variation_sigma = 0.0; // σ for MC
     double global_voltage_scale = 1.0; // PVT Voltage Scale
     int monte_carlo_seed = 0;          // Deterministic seed for MC runs
+    bool gmin_stepping = true;         // .options gminsteps=0 (ngspice): DC goes straight to source stepping
     
     // Noise Profile
     bool thermal_noise_enabled = false;

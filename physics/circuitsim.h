@@ -665,6 +665,13 @@ public:
     }
   }
 
+  // Independent source value: its waveform in transient, else DC, times the
+  // source-stepping factor (1 except while solveDC ramps the sources).
+  double srcFact_ = 1.0;
+  template <class S> double sourceValue(const S &s, double dc, double h, double time) const {
+    return srcFact_ * (h > 1e-15 ? waveformValue(s, dc, time) : dc);
+  }
+
   // OSDI devices (compiled Verilog-A: BSIM4, BSIM-CMG, ...). An instance's local
   // nodes are its terminals, then the internal nodes left after collapsing; the
   // internal nodes are unknowns after the junction internals (BranchSlot::dev).
@@ -1312,7 +1319,7 @@ public:
         const auto &v = blk.voltageSources[i];
         const int b = sl.vs + (int)i;
         branch(b, node(v.nodePositive), node(v.nodeNegative));
-        S.rhs[b] += scale * (tran ? waveformValue(v, v.voltage_V, time) : v.voltage_V);
+        S.rhs[b] += scale * sourceValue(v, v.voltage_V, tran ? h : 0.0, time);
       }
       // Inductors (+ mutual coupling K: off-diagonal L_ab terms between branch rows)
       const auto &L = blk.inductors;
@@ -1408,7 +1415,7 @@ public:
     // 2.5. Current Sources (Ideal Current Injection)
     // Current sources inject fixed current regardless of voltage
     for (const auto &cs : netlist.globalBlock.currentSources) {
-      double is = (h > 1e-15) ? waveformValue(cs, cs.current_A, time) : cs.current_A;
+      double is = sourceValue(cs, cs.current_A, h, time);
       // Current flows from + to - inside source, leaves + externally
       addRes(cs.nodePositive, -is); // Current leaving + node
       addRes(cs.nodeNegative, is);  // Current entering - node
@@ -1562,7 +1569,7 @@ public:
 
         // Current sources inside the subcircuit (V sources are branch elements)
         for (const auto &cs : block.currentSources) {
-          double is = (h > 1e-15) ? waveformValue(cs, cs.current_A, time) : cs.current_A;
+          double is = sourceValue(cs, cs.current_A, h, time);
           addRes(mapNode(cs.nodePositive), -is);
           addRes(mapNode(cs.nodeNegative), is);
         }
@@ -1735,10 +1742,11 @@ public:
 
     // Current Sources
     for (const auto &cs : netlist.globalBlock.currentSources) {
-      addRes(cs.nodePositive, -cs.current_A);
-      addRes(cs.nodeNegative, cs.current_A);
+      const double is = sourceValue(cs, cs.current_A, 0.0, 0.0);
+      addRes(cs.nodePositive, -is);
+      addRes(cs.nodeNegative, is);
       attributions.push_back({cs.type.empty() ? "I?" : cs.type, "CurrentSource",
-          {{cs.nodePositive, -cs.current_A}, {cs.nodeNegative, cs.current_A}}});
+          {{cs.nodePositive, -is}, {cs.nodeNegative, is}}});
     }
 
 
@@ -2051,7 +2059,7 @@ public:
     // 3. Current Sources
     // 3. Current Sources
     for (const auto &i : block.currentSources) {
-      double val = (h > 1e-15) ? waveformValue(i, i.current_A, time) : i.current_A;
+      double val = sourceValue(i, i.current_A, h, time);
 
       int nP = mapNode(i.nodePositive);
       int nN = mapNode(i.nodeNegative);
@@ -2137,7 +2145,7 @@ public:
     for (size_t i = 0; i < nIS; ++i) {
         int nP = block.currentSources.nodesPos[i];
         int nN = block.currentSources.nodesNeg[i];
-        double I = block.currentSources.currents[i];
+        double I = srcFact_ * block.currentSources.currents[i];  // (refreshed to the waveform in transient)
         if (nP != 0) rhsVector[nP-1] -= I;
         if (nN != 0) rhsVector[nN-1] += I;
     }

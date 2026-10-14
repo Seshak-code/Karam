@@ -312,6 +312,12 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 else if (keyword == ".ENDS")   parseSubcktEnd();
                 else if (keyword == ".PARAM")  {} // handled in the first pass
                 else if (keyword == ".OP")     result_.hasOP = true;
+                else if (keyword == ".OPTION" || keyword == ".OPTIONS") {
+                    // gminsteps changes the DC homotopy; the other options are still ignored
+                    for (size_t i = 1; i + 1 < tok.size(); ++i)
+                        if (toUpper(tok[i]) == "GMINSTEPS")
+                            result_.netlist.environment.gmin_stepping = parseValue(tok[i + 1]) != 0.0;
+                }
                 else if (keyword == ".TRAN") {
                     result_.hasTRAN = true;
                     if (tok.size() >= 3) {
@@ -377,7 +383,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 // ignored silently.
                 else if (keyword != ".GLOBAL" && keyword != ".PRINT" && keyword != ".PLOT" &&
                          keyword != ".SAVE" && keyword != ".PROBE" && keyword != ".MEAS" &&
-                         keyword != ".MEASURE" && keyword != ".OPTION" && keyword != ".OPTIONS" &&
+                         keyword != ".MEASURE" &&
                          keyword != ".WIDTH" && keyword != ".TITLE" && keyword != ".FOUR")
                     throw std::runtime_error(tok[0] + " is not supported yet");
                 continue;
