@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <filesystem>
+#include <fstream>
 
 using namespace acutesim;
 using namespace acutesim::compute::orchestration;
@@ -342,6 +344,18 @@ int main() {
               "MOS1 M=3 triples the current: V(drain) = 4.97 (" + std::to_string(V(r, 3)) + ")");
         r = run(mode, "* mos NF\nVDD 1 0 DC 5\nM1 1 1 0 0 NM NF=2\n.model NM NMOS\n.op\n");
         check(!r.converged && r.errorDetail.find("NF") != std::string::npos, "MOS1 NF=2 is an explicit error");
+        // .lib section missing and an .include cycle are explicit errors (absolute paths: no baseDir here)
+        {
+            const std::string dir = std::filesystem::temp_directory_path().string();
+            std::ofstream(dir + "/tf_corner.lib") << ".lib tt\n.model nm nmos\n.endl tt\n";
+            std::ofstream(dir + "/tf_cycle.inc") << ".include " + dir + "/tf_cycle.inc\n";
+            r = run(mode, "* lib\n.lib " + dir + "/tf_corner.lib ss\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+            check(!r.converged && r.errorDetail.find("no section ss") != std::string::npos,
+                  ".lib: a missing corner section is an explicit error (" + r.errorDetail + ")");
+            r = run(mode, "* inc\n.include " + dir + "/tf_cycle.inc\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+            check(!r.converged && r.errorDetail.find("cycle") != std::string::npos,
+                  ".include: a cycle is an explicit error (" + r.errorDetail + ")");
+        }
         // OSDI (N devices) fails closed: missing library, no model card, card type not a loaded module
         r = run(mode, "* osdi lib\n.osdi no_such_model.osdi\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
         check(!r.converged && r.errorDetail.find("not found") != std::string::npos,

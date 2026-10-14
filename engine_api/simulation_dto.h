@@ -98,6 +98,7 @@ enum class NetlistFormatDTO : int {
 struct SimulationSourceDTO {
     NetlistFormatDTO format  = NetlistFormatDTO::JSON;
     std::string      payload;
+    std::string      baseDir;   // .include / .lib paths resolve against it (empty: working directory)
 };
 
 struct TransientConfigDTO {

@@ -62,7 +62,8 @@ public:
     SPICEParser() = default;
 
     /// Parse a complete SPICE netlist string.
-    SPICEParseResult parse(const std::string& netlistText);
+    // baseDir: directory .include / .lib paths are relative to (empty: working directory)
+    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "");
 
 private:
     // ── Value and Token Helpers ────────────────────────────────────────
@@ -79,6 +80,9 @@ private:
 
     // ── Line Pre-Processing ───────────────────────────────────────────
     /// Merge continuation lines ('+' prefix), strip comments.
+    // Splice .include files and .lib sections into the lines (recursively).
+    std::vector<std::pair<int, std::string>> expandIncludes(const std::vector<std::pair<int, std::string>>& lines,
+                                                            const std::string& dir, int depth, int& errLine);
     static std::vector<std::pair<int, std::string>> preprocessLines(
         const std::string& text);
 

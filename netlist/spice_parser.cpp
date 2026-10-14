@@ -9,6 +9,7 @@
 #include "../osdi/osdi_device.h"
 #include "../physics/physics_constants.h"
 #include <sstream>
+#include <fstream>
 #include <cctype>
 #include <cmath>
 #include <algorithm>
@@ -180,11 +181,64 @@ std::vector<std::pair<int, std::string>> SPICEParser::preprocessLines(
     return merged;
 }
 
+// .include <file> splices a file; .lib <file> <section> splices the lines between
+// `.lib <section>` and `.endl` of <file> (PDK corners: .lib models.lib tt). Paths
+// are relative to the including file. Spliced lines carry the including card's
+// line number, which is also reported (errLine) when a file or section is missing.
+std::vector<std::pair<int, std::string>> SPICEParser::expandIncludes(
+    const std::vector<std::pair<int, std::string>>& lines, const std::string& dir, int depth, int& errLine)
+{
+    if (depth > 16) throw std::runtime_error(".include/.lib nested deeper than 16 files (a cycle?)");
+    auto unquote = [](std::string s) {
+        if (s.size() >= 2 && (s[0] == '"' || s[0] == '\'') && s.back() == s[0]) s = s.substr(1, s.size() - 2);
+        return s;
+    };
+    auto fields = [&](const std::string& l) {  // first three fields, upper-case keyword
+        std::istringstream t(l);
+        std::vector<std::string> f(4);
+        t >> f[0] >> f[1] >> f[2] >> f[3];
+        f[0] = toUpper(f[0]);
+        return f;
+    };
+    std::vector<std::pair<int, std::string>> out;
+    for (const auto& [num, line] : lines) {
+        const auto f = fields(line);
+        const bool inc = f[0] == ".INCLUDE" || f[0] == ".INC", lib = f[0] == ".LIB" && !f[2].empty();
+        if (!inc && !lib) { out.push_back({num, line}); continue; }
+        errLine = num;
+        if (f[1].empty() || (inc && !f[2].empty()) || !f[3].empty())
+            throw std::runtime_error(inc ? ".include takes one file" : ".lib takes a file and a section");
+        const std::string file = unquote(f[1]);
+        const std::string path = file[0] == '/' || dir.empty() ? file : dir + "/" + file;
+        std::ifstream in(path);
+        if (!in) throw std::runtime_error(f[0] + ": cannot open '" + path + "'");
+        std::stringstream buf;
+        buf << in.rdbuf();
+        auto body = preprocessLines(buf.str());
+        if (lib) {  // keep .lib <section> ... .endl
+            const std::string want = toUpper(unquote(f[2]));
+            size_t from = 0, to;
+            while (from < body.size() && !(fields(body[from].second)[0] == ".LIB" &&
+                                           toUpper(unquote(fields(body[from].second)[1])) == want &&
+                                           fields(body[from].second)[2].empty()))
+                ++from;
+            if (from == body.size()) throw std::runtime_error(".lib: no section " + f[2] + " in '" + path + "'");
+            for (to = from + 1; to < body.size() && fields(body[to].second)[0] != ".ENDL"; ++to) {}
+            body = {body.begin() + from + 1, body.begin() + to};
+        }
+        for (auto& b : body) b.first = num;
+        const size_t slash = path.rfind('/');
+        const auto sub = expandIncludes(body, slash == std::string::npos ? "" : path.substr(0, slash), depth + 1, errLine);
+        out.insert(out.end(), sub.begin(), sub.end());
+    }
+    return out;
+}
+
 // ============================================================================
 // Main Parse Entry Point
 // ============================================================================
 
-SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
+SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::string& baseDir) {
     result_ = SPICEParseResult{};
     nodeMap_.clear();
     nextNode_ = 1;
@@ -199,6 +253,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
     modelCards_.clear();
     params_.clear();
     inductorIndex_.clear();
+    modelNames_.clear();
+    osdiModels_.clear();
 
     auto lines = preprocessLines(netlistText);
     if (lines.empty()) {
@@ -213,6 +269,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
         result_.errorLine = lineNum;
         return result_;
     };
+
+    int incLine = 0;
+    try { lines = expandIncludes(lines, baseDir, 0, incLine); }
+    catch (const std::exception& e) { return fail(incLine, e.what()); }
 
     // .param values are global in SPICE: resolve them before any card uses one
     for (const auto& [lineNum, line] : lines) {
@@ -313,7 +373,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
                 }
                 else if (keyword == ".END") break;
                 // Output-only (.four only prints a Fourier table) and first-pass cards; anything else changes the
-                // circuit or analysis (.step, .temp, .nodeset, .include, ...) and used to be
+                // circuit or analysis (.step, .temp, .nodeset, ...) and used to be
                 // ignored silently.
                 else if (keyword != ".GLOBAL" && keyword != ".PRINT" && keyword != ".PLOT" &&
                          keyword != ".SAVE" && keyword != ".PROBE" && keyword != ".MEAS" &&

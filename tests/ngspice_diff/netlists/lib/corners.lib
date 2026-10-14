@@ -1,0 +1,16 @@
+* Corner library: .lib <file> <corner> selects a section; sections call a shared one
+.lib tt
+.param vtn=0.7 vtp=-0.8
+.lib 'corners.lib' devices
+.endl tt
+
+.lib ff
+.param vtn=0.55 vtp=-0.65
+.lib 'corners.lib' devices
+.endl ff
+
+.lib devices
+.model nm nmos (vto={vtn} kp=80u lambda=0.02)
+.model pm pmos (vto={vtp} kp=35u lambda=0.03)
+.include cells.inc
+.endl devices

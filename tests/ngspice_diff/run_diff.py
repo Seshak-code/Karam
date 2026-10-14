@@ -276,6 +276,8 @@ def main():
         sys.exit(f"engine not found: {args.engine}  (cmake -S . -B build && cmake --build build --target acutesim_engine_dump)")
     args.tmp = tempfile.mkdtemp(prefix="ngdiff_")
     atexit.register(shutil.rmtree, args.tmp, True)
+    if os.path.isdir(os.path.join(HERE, "netlists", "lib")):  # .include/.lib targets, beside the temp netlists
+        shutil.copytree(os.path.join(HERE, "netlists", "lib"), os.path.join(args.tmp, "lib"))
     fails = 0
     for path in sorted(glob.glob(os.path.join(HERE, "netlists", "*.cir"))):
         name = os.path.basename(path)
