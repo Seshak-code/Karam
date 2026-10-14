@@ -118,60 +118,27 @@ inline T diode_current_clamped(T vd, const DiodeParams<P>& p, double max_arg = P
 }
 
 /**
- * pnjlim - SPICE-Style PN Junction Voltage Limiting
- * 
- * Limits the change in junction voltage during Newton-Raphson iteration to 
- * prevent the exponential from overshooting and causing non-convergence.
- * 
- * Algorithm (SPICE3f5):
- *   - If new voltage is increasing significantly, limit the step.
- *   - vcrit = Vt * ln(Vt / (sqrt(2) * Is))  (critical turn-on voltage)
- *   - Allow larger steps when turning on, smaller when conducting.
- * 
- * @param vnew  Proposed new junction voltage
- * @param vold  Previous junction voltage
- * @param vt    Thermal voltage (kT/q ≈ 26mV at room temp)
- * @param vcrit Critical voltage (pre-computed for efficiency)
- * @return      Limited junction voltage
+ * pnjlim - ngspice DEVpnjlim (devsup.c), exactly: a forward step past vcrit
+ * larger than 2 vt is compressed logarithmically; a reverse step is limited to
+ * 2*vold - 1 (or -vold - 1 from forward bias). The engine's earlier variant
+ * skipped limiting above the exponent cap and capped reverse steps at 5 vt,
+ * which let large BJT circuits (a 555 timer) diverge where ngspice converges.
  */
 template <typename T>
 inline T pnjlim(T vnew, T vold, T vt, T vcrit) {
-    T vlim = vnew;
-    
-    // Bypass limiting in the linear continuation region (above the model's
-    // exponent cap) — must track JUNCTION_EXP_ARG_MAX or junctions between
-    // the two thresholds go unlimited.
-    if (vold > T(PhysicsConstants::JUNCTION_EXP_ARG_MAX) * vt && vnew > T(PhysicsConstants::JUNCTION_EXP_ARG_MAX) * vt) {
-        return vnew;
-    }
-    
-    // Bypass limiting in deep reverse bias (constant current region)
-    if (vold < T(-5.0) * vt && vnew < T(-5.0) * vt) {
-        return vnew;
-    }
-
-    using std::abs;
-    if (vnew > vcrit && abs(vnew - vold) > T(2.0) * vt) {
-        // Large forward step - apply limiting
+    using std::abs; using std::log;
+    if (vnew > vcrit && abs(vnew - vold) > vt + vt) {
         if (vold > T(0.0)) {
-            T arg = T(1.0) + (vnew - vold) / vt;
-            if (arg > T(0.0)) {
-                using std::log;
-                vlim = vold + vt * log(arg);
-            } else {
-                vlim = vcrit;
-            }
-        } else {
-            using std::log;
-            vlim = vt * log(vnew / vt);
+            const T arg = T(1.0) + (vnew - vold) / vt;
+            return arg > T(0.0) ? vold + vt * log(arg) : vcrit;
         }
-    } else if (vnew < T(-5.0) * vt) {
-        // Deep reverse bias - limit negative swing
-        using std::max;
-        vlim = max(vnew, vold - T(5.0) * vt);
+        return vt * log(vnew / vt);
     }
-    
-    return vlim;
+    if (vnew < T(0.0)) {
+        const T arg = vold > T(0.0) ? -vold - T(1.0) : T(2.0) * vold - T(1.0);
+        if (vnew < arg) return arg;
+    }
+    return vnew;
 }
 
 /**
@@ -397,13 +364,15 @@ struct BjtModel {
     P cje = 0.0, vje = 0.75, mje = 0.33;                        // *AREA
     P cjcInt = 0.0, cjcExt = 0.0, vjc = 0.75, mjc = 0.33;       // CJC*XCJC*AREA (B'-C'), rest (B-C')
     P cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
+    P iss = 0.0, vts = PhysicsConstants::V_THERMAL_300K;       // substrate junction: ISS*AREA, NS*Vt
     P tf = 0.0, xtf = 0.0, ovtf = 0.0, xjtf = 0.0, tr = 0.0;   // ovtf = 1/(1.44 VTF), xjtf = ITF*AREA
 };
 
-// DC terminal currents (into C', B') and the four charges qbe (B'-E'),
-// qbc (B'-C'), qbx (B-C'), qsub (S-C'), all in the type domain, of ngspice
-// bjtload at junction voltages vbe, vbc (internal), vbx (external base) and vsub.
-template <typename T> struct BjtEval { T cc, cb, q[4]; };
+// DC terminal currents (into C', B'), the substrate junction current cs (S -> C',
+// ISS diode + GMIN, as ngspice 4 bjtload: it exists even with ISS = 0) and the
+// four charges qbe (B'-E'), qbc (B'-C'), qbx (B-C'), qsub (S-C'), all in the
+// type domain, at junction voltages vbe, vbc (internal), vbx (external base), vsub.
+template <typename T> struct BjtEval { T cc, cb, cs, q[4]; };
 
 template <typename T, typename P>
 inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
@@ -424,6 +393,7 @@ inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
     BjtEval<T> r;
     r.cc = (cbe - cbc) / qb - cbc / p.br - cbcn;
     r.cb = cbe / p.bf + cben + cbc / p.br + cbcn;
+    r.cs = (p.iss != P(0.0) ? spice_junction(vsub, p.iss, p.vts) : T(0.0)) + gmin * vsub;
 
     T cbeq = cbe;  // transit-time current, XTF/VTF/ITF-modulated (ngspice bjtload)
     if (p.tf != P(0.0) && vbe > P(0.0)) {

@@ -110,47 +110,6 @@ void CircuitSim::seedInitialGuess(const TensorNetlist &netlist,
   });
 }
 
-void CircuitSim::applyPnJunctionLimits(const TensorNetlist &netlist,
-                                       std::vector<double> &v_new,
-                                       const std::vector<double> &v_old) {
-  if (v_new.empty() || v_old.size() != v_new.size())
-    return;
-  const int N = (int)v_new.size();
-  const double tempK = netlist.environment.ambient_temp_K;
-  // ngspice DEVpnjlim on junction p-n (sign: type domain); lim(vnew, vold) is
-  // the limited junction voltage. The correction is split between the unknowns.
-  auto V = [](const std::vector<double> &x, int k) { return k > 0 ? x[k - 1] : 0.0; };
-  auto limitWith = [&](int p, int n, double sign, auto &&lim) {
-    if ((p <= 0 && n <= 0) || p > N || n > N || p == n) return;
-    const double vo = sign * (V(v_old, p) - V(v_old, n)), vn = sign * (V(v_new, p) - V(v_new, n));
-    const double corr = sign * (vn - lim(vn, vo));
-    if (std::abs(corr) <= 1e-12) return;
-    if (p > 0 && n > 0) { v_new[p - 1] -= corr * 0.5; v_new[n - 1] += corr * 0.5; }
-    else if (p > 0) v_new[p - 1] -= corr;
-    else v_new[n - 1] += corr;
-  };
-  auto limitJunction = [&](int p, int n, double vt, double vcrit, double sign) {
-    limitWith(p, n, sign, [&](double vn, double vo) { return pnjlim(vn, vo, vt, vcrit); });
-  };
-  forEachJunction(netlist, [&](const Junction &j) {
-    if (j.d) {  // diode: A'-C at N*Vt; past the breakdown knee, the mirrored voltage (ngspice dioload)
-      const auto m = diodeModel(*j.d, tempK);
-      const double vcrit = compute_vcrit(m.vte, m.is);
-      limitWith(j.n[2], j.n[1], 1.0, [&](double vn, double vo) {
-        if (m.breakdown && vn < std::min(0.0, -m.xbv + 10.0 * m.vte))
-          return -(pnjlim(-(vn + m.xbv), -(vo + m.xbv), m.vte, vcrit) + m.xbv);
-        return pnjlim(vn, vo, m.vte, vcrit);
-      });
-      return;
-    }
-    // BJT: B'-E' and B'-C' at Vt (ngspice bjtload limits with vt, not NF*vt)
-    const auto m = bjtModel(*j.q, tempK);
-    const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
-    limitJunction(j.n[5], j.n[6], vt, vcrit, m.type);
-    limitJunction(j.n[5], j.n[4], vt, vcrit, m.type);
-  });
-}
-
 // =============================================================================
 // MAIN SOLVER METHODS
 // =============================================================================
@@ -194,6 +153,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // Phase 1 Hardening: Use extracted helper for initial guess seeding
   // Runs on top of neural seed to enforce supply rail / PN junction constraints
   seedInitialGuess(netlist, voltageEstimate);
+  resetJunctionLimits(netlist);  // first iteration: junctions at vcrit (ngspice MODEINITJCT)
 
   bool converged = false;
   int total_iterations = 0;
@@ -246,6 +206,12 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
       stampAllElements(netlist, 0.0, voltageEstimate, 0.0);
       addDiagonalConditioning(netlist.numGlobalNodes, gmin_factor);
+      if (gmin_factor > 0.0) {  // device-internal nodes are nodes too (ngspice CKTdiagGmin)
+        int totalRows = 0;
+        for (const auto &sl : branchSlots(netlist, totalRows))
+          for (int r = sl.dev, e = sl.dev + junctionInternals(*sl.blk); r < e; ++r)
+            matrixBuilder.add(r, r, gmin_factor);
+      }
 
       // Sparse Merge (D5): Use cached pattern for O(N) assembly on iterations >
       // 0
@@ -305,16 +271,17 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       // NaN Protection using SafeUtils
       SafeUtils::sanitize_vector(v_new, 0.0);
 
-      // Phase 1 Hardening: Use extracted helper for PN junction limiting
-      applyPnJunctionLimits(netlist, v_new, voltageEstimate);
 
       // Check 1 + 2: Voltage Convergence AND Physical KCL Accuracy
       double kcl_error = kclExcess(netlist, v_new, matrix);
 
       // Limit Cycle Breaker: Damping
-      // If residual is not improving, dampen the step to force a different path
-      if (iteration > 0 &&
-          kcl_error >= final_kcl_error) { // final_kcl_error holds prev_error
+      // If the residual got worse (and is above tolerance), dampen the step to
+      // force a different path. ">=" also fired on 0 >= 0 (both below the
+      // scale-aware floor), halving every step until the update looked
+      // converged: a 555 output node stopped 0.4 V short of its solution.
+      const double dampTol = finalStep ? PhysicsConstants::KCL_TOL : 1.0;
+      if (iteration > 0 && kcl_error > final_kcl_error && kcl_error > dampTol) { // final_kcl_error holds prev_error
         // Apply damping: v_new = v_old + 0.5 * (v_new - v_old)
         for (size_t i = 0; i < v_new.size(); ++i) {
           v_new[i] = voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
@@ -323,7 +290,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         kcl_error = kclExcess(netlist, v_new, matrix);
 
         // If still bad, dampen again (aggressive backoff)
-        if (kcl_error >= final_kcl_error) {
+        if (kcl_error > final_kcl_error) {
           for (size_t i = 0; i < v_new.size(); ++i) {
             v_new[i] =
                 voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
@@ -404,6 +371,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     if (!gminSteppingUsed) {  // direct attempt failed: start from the seed
       gminSteppingUsed = true;
       voltageEstimate = lastGood = seededGuess;
+      resetJunctionLimits(netlist);  // ngspice dynamic_gmin starts in MODEINITJCT
       stagnationDetected = divergenceDetected = false;
       gmin_factor = oldGmin / stepFactor;
     } else if (gmin_converged) {
@@ -428,6 +396,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       stepFactor = std::sqrt(std::sqrt(stepFactor));
       gmin_factor = oldGmin / stepFactor;
       voltageEstimate = lastGood;
+      syncJunctionLimits(netlist, voltageEstimate);
     }
     finalStep = gmin_factor == 0.0;
   } // End GMIN stepping loop
@@ -764,7 +733,9 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   matrixBuilder.clear();
   matrixBuilder.setDimensions(sys.n, sys.n);
   rhsVector.assign(sys.n, 0.0);
+  limitJunctions_ = false;  // the Jacobian at the operating point itself
   stampAllElements(netlist, 0.0, lastSolution_, 0.0);
+  limitJunctions_ = true;
   sys.G = matrixBuilder.createCsr();
   auto addC = [&](int r, int c, double v) {
     if (r >= 0 && c >= 0) { sys.cr.push_back(r); sys.cc.push_back(c); sys.cv.push_back(v); }
@@ -1025,6 +996,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
     integrator->prepareStep(dt_sub);
 
     // Inner NR loop — identical structure to the one in stepTransient.
+    syncJunctionLimits(netlist, nrEstimate);
     bool nrConverged = false;
     SolverResult subResult{};
     for (int iteration = 0; iteration < MAX_NR_ITER; ++iteration) {
@@ -1166,6 +1138,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       arbiter.rejectHistory(nrEstimate, actualTimeStep);
 
       bool nrConverged = false;
+      syncJunctionLimits(netlist, nrEstimate);  // limit relative to this step's start
       for (int iteration = 0; iteration < MAX_NR_ITER; ++iteration) {
         scheduler.schedule(netlist);
         matrixBuilder.clear();

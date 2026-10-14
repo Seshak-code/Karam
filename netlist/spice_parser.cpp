@@ -458,7 +458,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             supported(c, {"IS", "BF", "BR", "NF", "NR", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR",
                           "ISE", "NE", "ISC", "NC", "RB", "RC", "RE", "CJE", "VJE", "PE", "MJE", "ME",
                           "CJC", "VJC", "PC", "MJC", "MC", "XCJC", "CJS", "CCS", "VJS", "PS", "MJS", "MS",
-                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM"});
+                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS"});
             q.isNPN = (c->type != "PNP");
             q.saturationCurrent_I_S_A = c->get("IS", 1e-16);
             q.betaF = c->get("BF", 100.0);
@@ -475,6 +475,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText) {
             k.xcjc = c->get("XCJC", 1.0);
             k.cjs = first(c, {"CJS", "CCS"}, 0.0); k.vjs = first(c, {"VJS", "PS"}, 0.75); k.mjs = first(c, {"MJS", "MS"}, 0.0);
             k.fc = c->get("FC", 0.5);
+            k.iss = c->get("ISS", 0.0); k.ns = c->get("NS", 1.0);
             k.tf = c->get("TF", 0.0); k.xtf = c->get("XTF", 0.0); k.vtf = c->get("VTF", 0.0);
             k.itf = c->get("ITF", 0.0); k.tr = c->get("TR", 0.0);
             // RBM != RB makes the base resistance bias dependent (qb), which is not modelled

@@ -670,16 +670,28 @@ public:
   static constexpr int bjtFrom[4] = {5, 5, 1, 3}, bjtTo[4] = {6, 4, 4, 4};
 
   // Branch voltages and charges (type domain) of j at terminal values x.
+  // Junction-limiting shifts (junctionLimit): added to the junction voltages
+  // (diode vd; BJT vbe, vbc) so the device is evaluated at its limited point.
+  // seed: the shift carries derivative 1 (the G*(vl - v) correction pass).
+  struct JShift { double d[2] = {0.0, 0.0}; bool seed = false; };
+  template <typename T> static T shifted(const T &v, const JShift *sh, int k) {
+    if (!sh || sh->d[k] == 0.0) return v;
+    if constexpr (std::is_same_v<T, double>) return v + sh->d[k];
+    else return v + T(sh->d[k], sh->seed ? sh->d[k] : 0.0);
+  }
+
   template <typename T>
-  int junctionCharges(const Junction &j, const std::array<T, 7> &x, double tempK, T *v, T *q) const {
+  int junctionCharges(const Junction &j, const std::array<T, 7> &x, double tempK, T *v, T *q,
+                      const JShift *sh = nullptr) const {
     if (j.d) {
-      v[0] = x[2] - x[1];
+      v[0] = shifted(T(x[2] - x[1]), sh, 0);
       q[0] = diode_iq(v[0], diodeModel(*j.d, tempK)).second;
       return 1;
     }
     const auto p = bjtModel(*j.q, tempK);
     const double t = p.type;
     for (int k = 0; k < 4; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
+    v[0] = shifted(v[0], sh, 0); v[1] = shifted(v[1], sh, 1);
     const auto e = bjt_gp(v[0], v[1], v[2], v[3], p);
     for (int k = 0; k < 4; ++k) q[k] = e.q[k];
     return 4;
@@ -695,7 +707,7 @@ public:
   // next != null: write the accepted charge state (history update).
   template <typename T>
   std::array<T, 7> junctionCurrents(const Junction &j, const std::array<T, 7> &x, double tempK, double h,
-                                    BlockState::DeviceCharge *next = nullptr) const {
+                                    BlockState::DeviceCharge *next = nullptr, const JShift *sh = nullptr) const {
     std::array<T, 7> I{};
     for (auto &i : I) i = T(0.0);
     double type = 1.0;
@@ -703,7 +715,7 @@ public:
     if (j.d) {
       const auto p = diodeModel(*j.d, tempK);
       if (p.rs > 0.0) { const T ir = (x[0] - x[2]) / p.rs; I[0] += ir; I[2] -= ir; }
-      const T id = diode_iq(x[2] - x[1], p).first;
+      const T id = diode_iq(shifted(T(x[2] - x[1]), sh, 0), p).first;
       I[2] += id; I[1] -= id;
       from = diodeFrom; to = diodeTo;
     } else {
@@ -713,15 +725,16 @@ public:
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
       };
       res(0, 4, p.rc); res(1, 5, p.rb); res(2, 6, p.re);
-      const auto e = bjt_gp(type * (x[5] - x[6]), type * (x[5] - x[4]), type * (x[1] - x[4]),
-                            type * (x[3] - x[4]), p);
+      const auto e = bjt_gp(shifted(T(type * (x[5] - x[6])), sh, 0), shifted(T(type * (x[5] - x[4])), sh, 1),
+                            T(type * (x[1] - x[4])), T(type * (x[3] - x[4])), p);
       I[4] += type * e.cc; I[5] += type * e.cb; I[6] -= type * (e.cc + e.cb);
+      I[3] += type * e.cs; I[4] -= type * e.cs;  // substrate junction S -> C'
       from = bjtFrom; to = bjtTo;
     }
     const BlockState::DeviceCharge *st = j.st;
     if (!st || !(h > 1e-15) || !integrator || !junctionHasCharge(j)) return I;
     T v[5], q[5];
-    const int K = junctionCharges(j, x, tempK, v, q);
+    const int K = junctionCharges(j, x, tempK, v, q, sh);
     if constexpr (std::is_same_v<T, double>)
       if (next) {  // shift the voltage history (next may alias st)
         std::copy(st->v[1], st->v[1] + 5, next->v[2]);
@@ -765,6 +778,71 @@ public:
     if (!any) return;  // every terminal grounded
     for (int t = 0; t < terms; ++t)
       if (n[t] > 0) rhsVector[n[t] - 1] -= I[t];
+  }
+
+  // ngspice junction limiting (DEVpnjlim in dioload/bjtload), device-local: the
+  // raw junction voltages at x are limited against the last iteration's
+  // (DeviceCharge::jv) and the device is linearised there; node voltages are
+  // left alone. First iteration of a solve: vcrit (BJT vbc = 0), as MODEINITJCT.
+  JShift junctionLimit(const Junction &j, const std::vector<double> &x, double tempK) const {
+    JShift sh;
+    if (!j.st) return sh;
+    auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
+    auto *st = j.st;
+    if (j.d) {
+      const auto m = diodeModel(*j.d, tempK);
+      const double vcrit = compute_vcrit(m.vte, m.is), raw = V(2) - V(1);
+      double vl = vcrit;
+      if (st->jvState) {
+        vl = (m.breakdown && raw < std::min(0.0, -m.xbv + 10.0 * m.vte))
+                 ? -(pnjlim(-(raw + m.xbv), -(st->jv[0] + m.xbv), m.vte, vcrit) + m.xbv)
+                 : pnjlim(raw, st->jv[0], m.vte, vcrit);
+      }
+      st->jv[0] = vl; st->jvState = 1;
+      sh.d[0] = vl - raw;
+      return sh;
+    }
+    const auto m = bjtModel(*j.q, tempK);
+    const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
+    const double raw[2] = {m.type * (V(5) - V(6)), m.type * (V(5) - V(4))};
+    for (int k = 0; k < 2; ++k) {
+      const double vl = st->jvState ? pnjlim(raw[k], st->jv[k], vt, vcrit) : (k == 0 ? vcrit : 0.0);
+      st->jv[k] = vl;
+      sh.d[k] = vl - raw[k];
+    }
+    st->jvState = 1;
+    return sh;
+  }
+  // Limiting state from x (a Newton restart point) or back to MODEINITJCT.
+  void syncJunctionLimits(const TensorNetlist &nl, const std::vector<double> &x) const {
+    forEachJunction(nl, [&](const Junction &j) {
+      if (!j.st) return;
+      auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
+      const double t = j.q ? (j.q->isNPN ? 1.0 : -1.0) : 1.0;
+      j.st->jv[0] = j.d ? V(2) - V(1) : t * (V(5) - V(6));
+      j.st->jv[1] = j.d ? 0.0 : t * (V(5) - V(4));
+      j.st->jvState = 1;
+    });
+  }
+  void resetJunctionLimits(const TensorNetlist &nl) const {
+    forEachJunction(nl, [&](const Junction &j) { if (j.st) j.st->jvState = 0; });
+  }
+  bool limitJunctions_ = true;  // off for the AC / sensitivity Jacobian at a converged point
+
+  // Newton stamp of a junction device: I(x) ~ I(vl) + G (v(x) - vl) at the
+  // limited junction voltages vl (ngspice's companion), i.e. stampByDual at the
+  // shifted point plus the G*(vl - v) correction from one seeded pass.
+  void stampJunction(const Junction &j, const std::vector<double> &v, double tempK, double h) {
+    const JShift sh = limitJunctions_ ? junctionLimit(j, v, tempK) : JShift{};
+    stampByDual(j.n, j.terms, v, [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, tempK, h, nullptr, &sh); });
+    if (sh.d[0] == 0.0 && sh.d[1] == 0.0) return;
+    JShift seeded = sh;
+    seeded.seed = true;
+    std::array<Dual<double>, 7> x;
+    for (int k = 0; k < 7; ++k) x[k] = Dual<double>(j.n[k] > 0 && j.n[k] <= (int)v.size() ? v[j.n[k] - 1] : 0.0, 0.0);
+    const auto cur = junctionCurrents(j, x, tempK, h, nullptr, &seeded);
+    for (int t = 0; t < j.terms; ++t)
+      if (j.n[t] > 0) rhsVector[j.n[t] - 1] += cur[t].grad;
   }
 
   void stampJFET(const JFET& j, int nD, int nG, int nS,
@@ -947,13 +1025,6 @@ private:
    */
   void seedInitialGuess(const TensorNetlist& netlist, std::vector<double>& v);
 
-  /**
-   * applyPnJunctionLimits - Apply SPICE-style pnjlim to prevent NR overshoot.
-   * Modifies v_new in-place based on v_old.
-   */
-  void applyPnJunctionLimits(const TensorNetlist& netlist,
-                              std::vector<double>& v_new,
-                              const std::vector<double>& v_old);
 
   /**
    * coldStartSweep - SPICE3-accurate cold-start using dt_init = tstep/100 micro-steps.
@@ -1014,17 +1085,18 @@ private:
     for (size_t i = 0; i < v_new.size(); ++i)
       if (!std::isfinite(v_new[i])) return false;
 
-    // 1. Check Physical KCL Conservation (Primary Truth)
-    if (max_kcl_error < 1e-9) return true;
+    // Both the update (RELTOL/VNTOL, as ngspice) and KCL must pass. A former
+    // "KCL < 1 nA => converged" shortcut accepted stale voltages at
+    // high-impedance nodes (a 555 output stage settled 0.5 V off, above VCC).
 
-    // 2. Check Voltage Updates (Standard RELTOL/VNTOL)
+    // 1. Check Voltage Updates (Standard RELTOL/VNTOL)
     for (size_t i = 0; i < v_new.size(); ++i) {
       double diff = std::abs(v_new[i] - v_old[i]);
       double limit = RELTOL * std::max(std::abs(v_new[i]), std::abs(v_old[i])) + VNTOL;
       if (!(diff <= limit)) return false;
     }
 
-    // 3. Check Physical KCL Conservation (Research-Grade)
+    // 2. Check Physical KCL Conservation (Research-Grade)
     // Relax ABSTOL slightly for Norton-stamped voltage sources (which are
     // stiff)
     return max_kcl_error <= kcl_tol;
@@ -1727,7 +1799,9 @@ public:
       std::vector<double> x_converged = v_converged;
       if ((int)lastSolution_.size() == nTot) x_converged = lastSolution_;  // with branch currents
       x_converged.resize(nTot, 0.0);
+      limitJunctions_ = false;  // linearise at the converged point itself
       stampAllElements(netlist, 0.0, x_converged, 0.0); // h=0, time=0 for DC sensitivity
+      limitJunctions_ = true;
       // (no node gmin: the Jacobian of the converged OP has only junction GMIN)
       Csr_matrix J = matrixBuilder.createCsr(); /* Explicitly J */
       
@@ -2151,10 +2225,7 @@ public:
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     const double tempK = netlist.environment.ambient_temp_K;
-    forEachJunction(netlist, [&](const Junction &j) {
-        stampByDual(j.n, j.terms, v_guess,
-                    [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, tempK, h); });
-    });
+    forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
 
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it

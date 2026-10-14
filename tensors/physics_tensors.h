@@ -93,6 +93,7 @@ inline BjtModel<double> bjtModel(const BJT& q, double tempK = 300.15) {
     p.cje = c.cje * a; p.vje = c.vje; p.mje = c.mje;
     p.cjcInt = c.cjc * c.xcjc * a; p.cjcExt = c.cjc * (1.0 - c.xcjc) * a; p.vjc = c.vjc; p.mjc = c.mjc;
     p.cjs = c.cjs * a; p.vjs = c.vjs; p.mjs = c.mjs; p.fc = c.fc;
+    p.iss = c.iss * a; p.vts = c.ns * vt;
     p.tf = c.tf; p.xtf = c.xtf; p.ovtf = c.vtf != 0.0 ? 1.0 / (1.44 * c.vtf) : 0.0;
     p.xjtf = c.itf * a; p.tr = c.tr;
     return p;

@@ -614,6 +614,7 @@ struct BJT {
         double rb = 0.0, rc = 0.0, re = 0.0;
         double cje = 0.0, vje = 0.75, mje = 0.33, cjc = 0.0, vjc = 0.75, mjc = 0.33, xcjc = 1.0;
         double cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
+        double iss = 0.0, ns = 1.0;                        // substrate junction
         double tf = 0.0, xtf = 0.0, vtf = 0.0, itf = 0.0, tr = 0.0;
     } card;
     double area = 1.0;
@@ -1127,6 +1128,11 @@ struct BlockState {
         double v[3][5] = {};  // branch voltages, last three accepted steps (v[0] latest; LTE)
         double q[5] = {}, i[5] = {};
         double half[3] = {};  // MOSFET Meyer half-capacitances gs, gd, gb (ngspice averages two)
+        // Diode / BJT junction limiting (ngspice state0): the limited junction
+        // voltages of the last Newton iteration (diode vd; BJT vbe, vbc).
+        // jvState 0: none yet -> start at vcrit (ngspice MODEINITJCT).
+        double jv[2] = {};
+        int jvState = 0;
     };
 
     std::vector<History> capacitorState;
