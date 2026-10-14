@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -397,6 +398,8 @@ void parallelFor(int n, double work, Fn&& fn) {
 #ifdef ACUTESIM_THREADS_ENABLED
     constexpr double kMinParallelWork = 2e6;  // flops-ish
     unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    if (const char* t = std::getenv("TREESPICE_THREADS"))  // e.g. 1 to compare with serial solvers
+        hw = (unsigned)std::max(1, std::atoi(t));
     int nt = (n > 1 && work >= kMinParallelWork) ? (int)std::min<unsigned>(hw, (unsigned)n) : 1;
     if (nt > 1) {
         std::atomic<int> next{0};
