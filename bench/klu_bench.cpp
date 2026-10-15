@@ -5,6 +5,8 @@
 // tree: TreeSPICE's contraction solver. plan = planContraction (ordering + tree,
 //       once per pattern); fs = factor + solve without refinement (what every
 //       Newton iteration pays); omega after the engine's default 2 refinement steps.
+//       gpu_fronts / fp64_redo: fronts factored in FP32 on the GPU, and whether that
+//       solve's refinement failed and was redone in FP64 (TREESPICE_GPU_FRONT=0: CPU only).
 // klu:  SuiteSparse KLU (BTF + AMD, the circuit-simulation baseline). analyze +
 //       factor once; fs = klu_refactor + klu_solve (KLU's per-iteration cost).
 // cond: KLU's 1-norm condition estimate (klu_condest) of A as given, after two-sided
@@ -131,9 +133,10 @@ int main(int argc, char** argv) {
         SolverResult res;
         double tFs = timeMin(reps, [&] { res = solveContraction(A, b, plan, 0); });
         res = solveContraction(A, b, plan, 2);
-        std::printf(" ok=%d plan=%.6g fs=%.6g flops=%.6g peak_front=%.0f fronts=%zu omega=%.3g",
+        std::printf(" ok=%d plan=%.6g fs=%.6g flops=%.6g peak_front=%.0f fronts=%zu gpu_fronts=%d fp64_redo=%d omega=%.3g",
                     res.converged ? 1 : 0, tPlan, tFs, plan.flopEstimate, std::sqrt(plan.peakEntries),
-                    plan.fronts.size(), res.converged ? omega(A, res.solution, b) : INFINITY);
+                    plan.fronts.size(), res.gpuFronts, res.fp64Refactor ? 1 : 0,
+                    res.converged ? omega(A, res.solution, b) : INFINITY);
     } else if (solver == "klu") {
         std::vector<int> Ap, Ai; std::vector<double> Ax;
         compress(t, true, Ap, Ai, Ax);  // CSC
