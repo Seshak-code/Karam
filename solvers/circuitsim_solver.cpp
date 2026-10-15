@@ -183,6 +183,11 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // independent sources scaled by srcFact_ from 0 up to 1, the increment grown
   // after easy steps, cut tenfold after a failed one (from the last good point).
   bool sourceSteppingUsed = false;
+  // A node with no DC path (a floating gate, a capacitor-only node) leaves the
+  // final gmin = 0 solve singular. ngspice 47 then runs its transient OP: from all
+  // nodes at 0 V and every capacitor uncharged, sources applied, to steady state,
+  // so such a node keeps zero net charge (a capacitive divider decides it).
+  bool finalSingular = false, floatingNodes = false;
   double srcConv = 0.0, srcRaise = 1e-3;
   const std::vector<double> &seededGuess = coldSeed;  // gmin stepping restarts cold
   std::vector<double> lastGood;
@@ -252,6 +257,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         final_kcl_error = 1e9; // Flag as bad residual
         singularMatrixDetected = true;
         singularRow = result.rankDeficientRow;
+        if (finalStep && gminSteppingUsed && !sourceSteppingUsed) finalSingular = true;
         // If singular, retrying with same Jacobian won't help. Abort this GMIN
         // step.
         total_iterations += iteration + 1;
@@ -398,6 +404,21 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     finalStep = gmin_factor == 0.0;
   } // End GMIN stepping loop
 
+  if (!converged && finalSingular) {
+    // ngspice's defaults: 100 ns steps to 10 us (optran ... 100n 10u)
+    srcFact_ = 1.0;  // source stepping may have left the sources scaled down
+    TensorNetlist pseudo = netlist;
+    // ngspice keeps a node gmin during its transient OP: a node with no capacitance
+    // either (an isolated MOS1 gate) would leave even the transient singular.
+    struct GminOn { double &g; ~GminOn() { g = 0.0; } } gminOn{ptranGmin_};
+    ptranGmin_ = PhysicsConstants::JUNCTION_GMIN;
+    if (runTransient(pseudo, 100e-9, 10e-6, /*uic=*/true, [](const SolverStep &) { return true; }).empty()) {
+      voltageEstimate = lastSolution_;
+      voltageEstimate.resize(nTot, 0.0);
+      converged = floatingNodes = true;
+    }
+  }
+
   // Phase 2.9: Final per-node residual for RMS + worst-node tracking
   std::vector<double> perNodeResiduals;
   final_kcl_error =
@@ -469,7 +490,10 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   stats.failureType = failureType;
   stats.convergenceHistory = std::move(convergenceHistory);
   stats.worstDevices = std::move(worstDevices);
-  stats.convergenceJustification = justification;
+  stats.convergenceJustification = floatingNodes
+      ? std::string("Operating point has nodes without a DC path (singular matrix): taken from a transient "
+                    "from zero to 10 us, as ngspice's transient OP")
+      : justification;
   stats.convergenceTolerance = 1e-6;
   // Phase 2.9: Numerical Intelligence fields
   stats.rmsResidual = rmsResidual;
@@ -682,6 +706,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     x0 = lastSolution_;
     x0.resize(nTot, 0.0);
   }
+  arbiterInitialized = false;  // this run's cold start (the DC bias may itself have run a transient OP)
   seedReactiveHistory(netlist, x0, uic);
   lastSolution_ = x0;  // seeds the first Newton iteration
 
@@ -1057,6 +1082,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
       rhsVector.assign(nTot, 0.0);
 
       stampAllElements(netlist, dt_sub, nrEstimate, dt_sub * (k + 1));
+      addDiagonalConditioning(netlist.numGlobalNodes, ptranGmin_);  // 0 except in a transient OP
       // (no node-to-ground gmin in transient: junction GMIN in the device
       // models keeps floating junction nodes referenced, like ngspice)
 
@@ -1198,6 +1224,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
 
         stampAllElements(netlist, actualTimeStep, nrEstimate,
                          currentTime + actualTimeStep);
+        addDiagonalConditioning(netlist.numGlobalNodes, ptranGmin_);  // 0 except in a transient OP
         // (no node-to-ground gmin in transient: junction GMIN in the device
         // models keeps floating junction nodes referenced, like ngspice)
 

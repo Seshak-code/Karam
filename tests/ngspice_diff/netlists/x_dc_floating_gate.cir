@@ -1,0 +1,7 @@
+* floating mos1 gate
+VD 1 0 DC 1
+R1 1 2 1k
+M1 2 3 0 0 NM
+.model NM NMOS
+.op
+.end

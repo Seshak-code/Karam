@@ -969,13 +969,13 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
         else if (upper == "SD")  m.geo.sd = parseValue(tok[++i]) * s;
         else if (upper == "NF")  m.extra.nf = (int)std::lround(parseValue(tok[++i]));
         else if (upper == "M" || upper == "MULT") m.extra.mult = parseValue(tok[++i]);
-        if (i < tok.size() && upper != "M" && upper != "MULT") {  // the value just read, as stored
+        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
+        if (upper != "M" && upper != "MULT") {  // as written (scaled): a BSIM4 device gets exactly these
             const std::map<std::string, double> v = {{"W", m.w}, {"L", m.l}, {"AD", m.geo.ad}, {"AS", m.geo.as},
                 {"PD", m.geo.pd}, {"PS", m.geo.ps}, {"NRD", m.geo.nrd}, {"NRS", m.geo.nrs}, {"SA", m.geo.sa},
                 {"SB", m.geo.sb}, {"SD", m.geo.sd}, {"NF", (double)m.extra.nf}};
-            if (v.count(upper)) m.given[upper] = v.at(upper);
+            m.given[upper] = v.at(upper);
         }
-        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
     if (!(m.l > 0.0) || !(m.w > 0.0)) throw std::runtime_error(tok[0] + ": W and L must be > 0");
     blk.mosfets.push_back(m);

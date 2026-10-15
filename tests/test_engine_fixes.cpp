@@ -316,14 +316,16 @@ int main() {
               "noise: 1k/1k divider gives sqrt(4kT*500) out, x2 input-referred, white total");
     }
 
-    // No node gmin: a node with no DC path must fail closed and be named (the
-    // contraction solver left a root front's pivot-less rows at x = 0 and the
-    // solve "converged" — series caps gave V(2)=0, an undriven gate -5 V), and a
-    // linear circuit converging on the direct attempt must not report GMIN stepping
+    // No node gmin: a node with no DC path is not silently 0 (the contraction
+    // solver once left a root front's pivot-less rows at x = 0 and "converged":
+    // series caps gave V(2)=0); a linear circuit converging on the direct attempt
+    // must not report GMIN stepping
     for (PrecisionMode mode : {PrecisionMode::Native_F64, PrecisionMode::Mixed}) {
+        // ngspice 47 resolves it with its transient OP (from uncharged capacitors):
+        // the series caps divide, V(2) = 2.5 V
         auto r = run(mode, "* series caps\nV1 1 0 DC 5\nC1 1 2 1u\nC2 2 0 1u\nR1 1 0 1k\n.op\n");
-        check(!r.converged && r.errorDetail.find("check node 2") != std::string::npos,
-              "floating node fails closed: " + r.errorDetail.substr(0, 40));
+        check(r.converged && near(V(r, 2), 2.5, 1e-4),
+              "node without a DC path: transient OP gives the capacitive divider V(2) = 2.5 (" + std::to_string(V(r, 2)) + ")");
     }
     {
         CircuitSim sim;

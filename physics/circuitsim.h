@@ -673,7 +673,8 @@ public:
   // A fatal OSDI model error during the current analysis (the model's own text):
   // it fails the analysis at once instead of retrying ever smaller steps.
   mutable std::string osdiFatal_;
-  mutable std::string osdiNonFinite_;  // the last non-finite OSDI evaluation: reported if the analysis fails
+  mutable std::string osdiNonFinite_;
+  double ptranGmin_ = 0.0;  // node-to-ground gmin while solveDC runs its transient OP  // the last non-finite OSDI evaluation: reported if the analysis fails
   template <class S> double sourceValue(const S &s, double dc, double h, double time) const {
     return srcFact_ * (h > 1e-15 ? waveformValue(s, dc, time) : dc);
   }
