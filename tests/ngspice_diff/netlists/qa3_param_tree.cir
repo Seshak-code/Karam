@@ -1,0 +1,30 @@
+* qa3: parameter tree 4 levels x fanout 5, every leaf a distinct parameter set (625 specializations); DC divider chain
+.subckt leaf a b params: r=1k
+R1 a b {r}
+.ends
+.subckt lv3 a b params: r=1k d=1
+X0 a b leaf r={r+0*d}
+X1 a b leaf r={r+1*d}
+X2 a b leaf r={r+2*d}
+X3 a b leaf r={r+3*d}
+X4 a b leaf r={r+4*d}
+.ends
+.subckt lv2 a b params: r=1k d=1
+X0 a b lv3 r={r+0*d} d={d*5}
+X1 a b lv3 r={r+1*d} d={d*5}
+X2 a b lv3 r={r+2*d} d={d*5}
+X3 a b lv3 r={r+3*d} d={d*5}
+X4 a b lv3 r={r+4*d} d={d*5}
+.ends
+.subckt lv1 a b params: r=1k d=1
+X0 a b lv2 r={r+0*d} d={d*5}
+X1 a b lv2 r={r+1*d} d={d*5}
+X2 a b lv2 r={r+2*d} d={d*5}
+X3 a b lv2 r={r+3*d} d={d*5}
+X4 a b lv2 r={r+4*d} d={d*5}
+.ends
+V1 1 0 DC 1
+X1 1 2 lv1 r=1k d=1
+R9 2 0 100
+.op
+.end

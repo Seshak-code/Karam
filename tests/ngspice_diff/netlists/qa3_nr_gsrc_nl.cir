@@ -1,0 +1,13 @@
+* qa3: G sources with cubic-ish behaviour via diode, high transconductance loop, E gain stages chained (1e3 each x4)
+.model dd d (is=1e-12)
+VIN 1 0 DC 0.01
+E1 2 0 1 0 1e3
+E2 3 0 2 0 1e3
+D1 3 4 dd
+R4 4 5 1k
+E3 6 0 5 0 1e3
+D2 6 7 dd
+R7 7 0 1k
+RF 7 1 1meg
+.op
+.end

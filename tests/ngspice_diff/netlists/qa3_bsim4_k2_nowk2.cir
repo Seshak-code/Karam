@@ -1,0 +1,8 @@
+* qa3 BUG: level=54 card giving k2 but not wk2: engine 1.529 V vs ngspice 1.868 V (adding "wk2=0" makes them agree); the value of k2 is irrelevant
+.model nb nmos (level=54 version=4.5 vth0=0.45 toxe=4n tnom=26.83 k2=-0.05)
+V1 1 0 DC 2
+VG 2 0 DC 1.2
+M1 3 2 0 0 nb W=1u L=1u
+R1 1 3 2k
+.op
+.end

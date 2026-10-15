@@ -1,0 +1,18 @@
+* qa3: 5 resistive-feedback CMOS inverter amplifiers cascaded (high gain, biased at midpoint)
+.model nm nmos (level=1 vto=0.5 kp=200u lambda=0.02)
+.model pm pmos (level=1 vto=-0.5 kp=100u lambda=0.02)
+VDD 1 0 DC 1.8
+VIN 2 0 DC 0.9
+.subckt ainv in out vdd
+MN out g 0 0 nm W=2u L=1u
+MP out g vdd vdd pm W=4u L=1u
+RF out g 100k
+RI in g 10k
+.ends
+X1 2 3 1 ainv
+X2 3 4 1 ainv
+X3 4 5 1 ainv
+X4 5 6 1 ainv
+X5 6 7 1 ainv
+.op
+.end

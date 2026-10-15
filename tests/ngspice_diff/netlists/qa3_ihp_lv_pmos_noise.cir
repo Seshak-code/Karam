@@ -1,0 +1,10 @@
+* qa3: IHP lv pmos noise
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOSlv.lib mos_tt
+VDD 1 0 DC 1.2
+VG 2 0 DC 0.6 AC 1
+RD 3 0 2k
+XP 3 2 1 1 sg13_lv_pmos w=2u l=0.13u ng=2
+CL 3 0 50f
+.noise v(3) VG dec 5 1k 1g
+.end

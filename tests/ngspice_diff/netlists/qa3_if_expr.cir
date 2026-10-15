@@ -1,0 +1,25 @@
+* qa3: .if condition forms: bare param, negation, comparison chains, && ||, spaces, nested parens
+.param a = 3 b = 0
+.if (a)
+R1 1 2 1k
+.endif
+.if (!b)
+R2 2 3 1k
+.endif
+.if ((a > 2) && (b == 0 || a == 9))
+R3 3 4 1k
+.endif
+.if (a >= 3 && a <= 3)
+R4 4 5 1k
+.endif
+.if (b)
+R5 5 6 1k
+.else
+R5 5 6 2k
+.endif
+.if ( a*2 == 6 )
+R6 6 0 1k
+.endif
+V1 1 0 DC 1
+.op
+.end

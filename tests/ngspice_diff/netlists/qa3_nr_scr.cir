@@ -1,0 +1,10 @@
+* qa3: npn/pnp latch (SCR) with gate trigger: bistable, DC op after gate current removed
+.model npn1 npn (is=1e-16 bf=50 br=1)
+.model pnp1 pnp (is=1e-16 bf=50 br=1)
+V1 1 0 DC 10
+RL 1 2 1k
+Q1 3 4 0 npn1
+Q2 4 3 2 pnp1
+RG 4 0 10k
+.op
+.end

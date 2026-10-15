@@ -1,0 +1,14 @@
+* qa3: BJT diff pair with mirror load, high tail current, input offset large
+.model npn1 npn (is=1e-16 bf=100 vaf=60)
+.model pnp1 pnp (is=1e-16 bf=50 vaf=40)
+VCC 1 0 DC 5
+IT 5 0 DC 2m
+Q1 3 2 5 npn1
+Q2 4 6 5 npn1
+Q3 3 3 1 pnp1
+Q4 4 3 1 pnp1
+V2 2 0 DC 2.6
+V6 6 0 DC 2.5
+RL 4 0 10k
+.op
+.end

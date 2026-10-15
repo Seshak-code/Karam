@@ -1,0 +1,16 @@
+* qa3: ".else if" / ".elif" spellings
+.param s = 2
+.if (s == 1)
+R1 1 0 1k
+.elseif (s == 2)
+R1 1 0 2k
+.endif
+V1 1 0 DC 1
+R2 1 2 1k
+.if (s == 1)
+R3 2 0 1k
+.elif (s == 2)
+R3 2 0 3k
+.endif
+.op
+.end

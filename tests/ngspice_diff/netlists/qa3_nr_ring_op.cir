@@ -1,0 +1,12 @@
+* qa3: 3-stage MOS1 ring oscillator DC operating point (symmetric midpoint is the solution)
+.model nm nmos (level=1 vto=0.5 kp=200u lambda=0.02)
+.model pm pmos (level=1 vto=-0.5 kp=100u lambda=0.02)
+VDD 1 0 DC 1.8
+MN1 b a 0 0 nm W=2u L=1u
+MP1 b a 1 1 pm W=4u L=1u
+MN2 c b 0 0 nm W=2u L=1u
+MP2 c b 1 1 pm W=4u L=1u
+MN3 a c 0 0 nm W=2u L=1u
+MP3 a c 1 1 pm W=4u L=1u
+.op
+.end

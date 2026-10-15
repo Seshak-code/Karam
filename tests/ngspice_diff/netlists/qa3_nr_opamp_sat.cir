@@ -1,0 +1,13 @@
+* qa3: op-amp from G source into a diode-limited node, unity-gain follower, rail clamp via diode pairs
+.model dd d (is=1e-14 n=1)
+VP 1 0 DC 2.5
+G1 0 5 1 2 1m
+R5 5 0 1meg
+DH 5 6 dd
+VH 6 0 DC 5
+DL 7 5 dd
+VL 7 0 DC -5
+E2 2 0 5 0 1
+RL 2 0 10k
+.op
+.end

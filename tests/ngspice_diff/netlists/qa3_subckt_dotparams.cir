@@ -1,0 +1,11 @@
+* qa3: ".params" continuation line form used by IHP schottky: .subckt name pins / .params / + k=v
+.subckt blk a b
+.params
++ r1=1k  r2={r1*2}
+R1 a b {r1}
+R2 b 0 {r2}
+.ends
+V1 1 0 DC 1
+X1 1 2 blk
+.op
+.end

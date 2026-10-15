@@ -1,0 +1,12 @@
+* qa3: global .param defined after use and after subckt, redefined; subckt body refs global resolved at instantiation; chain
+.subckt s a b params: k=1
+R1 a b {k*base}
+.ends
+V1 1 0 DC 2
+X1 1 2 s k=2
+X2 2 3 s
+R3 3 0 {base*3}
+.param base = {u*2}
+.param u = 500
+.op
+.end

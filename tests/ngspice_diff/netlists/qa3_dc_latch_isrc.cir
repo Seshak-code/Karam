@@ -1,0 +1,11 @@
+* qa3: CMOS cross-coupled inverter latch; .dc of a current source injected into node q (bistable), up then past switching
+.model nm nmos (level=1 vto=0.5 kp=200u lambda=0.02)
+.model pm pmos (level=1 vto=-0.5 kp=100u lambda=0.02)
+VDD 1 0 DC 1.8
+MN1 qb q 0 0 nm W=2u L=1u
+MP1 qb q 1 1 pm W=4u L=1u
+MN2 q qb 0 0 nm W=2u L=1u
+MP2 q qb 1 1 pm W=4u L=1u
+I1 0 q DC 0
+.dc I1 -100u 100u 10u
+.end

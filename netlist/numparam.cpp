@@ -37,6 +37,7 @@ public:
         const double v = ternary();
         ws();
         if (p_ != s_.size()) fail("unexpected '" + s_.substr(p_) + "'");
+        if (!std::isfinite(v)) fail("the result is not a finite number");  // ln(0), sqrt(-1), 1e400 (ngspice errors)
         return v;
     }
 
@@ -76,7 +77,7 @@ private:
         double v = add();
         for (;;) {
             if (eat("==")) v = v == add();
-            else if (eat("!=")) v = v != add();
+            else if (eat("!=") || eat("<>")) v = v != add();
             else if (eat("<=")) v = v <= add();
             else if (eat(">=")) v = v >= add();
             else if (eat("<")) v = v < add();
@@ -98,18 +99,24 @@ private:
             ws();
             if (s_.compare(p_, 2, "**") == 0) return v;  // power, handled in unary's pow()
             if (eat("*")) v *= unary();
-            else if (eat("/")) v /= unary();
-            else if (eat("%")) v = std::fmod(v, unary());
+            else if (eat("/")) v /= nonzero(unary());
+            else if (eat("%")) v = std::fmod(v, nonzero(unary()));
             else return v;
         }
     }
+    double nonzero(double d) { if (d == 0.0) fail("division by zero"); return d; }
     double unary() {
         if (eat("-")) return -unary();
         if (eat("+")) return unary();
         if (eat("!")) return unary() == 0.0;
-        const double b = primary();
-        if (eat("**") || eat("^")) return std::pow(b, unary());  // right-associative
+        double b = primary();  // ** and ^ are left-associative in ngspice (2**3**2 = 64),
+        while (eat("**") || eat("^")) b = std::pow(b, signedPrimary());  // binding tighter than unary -
         return b;
+    }
+    double signedPrimary() {  // an exponent: 2**-1
+        if (eat("-")) return -signedPrimary();
+        if (eat("+")) return signedPrimary();
+        return primary();
     }
     double number() {
         const char *start = s_.c_str() + p_;
@@ -118,8 +125,7 @@ private:
         p_ += (size_t)(end - start);
         std::string suf;  // SI scale factor, then unit letters (ignored)
         while (p_ < s_.size() && std::isalpha((unsigned char)s_[p_])) suf += (char)std::toupper((unsigned char)s_[p_++]);
-        if (suf.rfind("MEG", 0) == 0) return v * 1e6;
-        if (suf.rfind("MIL", 0) == 0) return v * 25.4e-6;
+        if (suf.rfind("MEG", 0) == 0) return v * 1e6;  // MIL is milli here, as ngspice's numparam
         if (suf.empty()) return v;
         switch (suf[0]) {
             case 'T': return v * 1e12;
@@ -137,17 +143,12 @@ private:
     double call(const std::string &f, const std::vector<double> &a) {
         auto need = [&](size_t n) { if (a.size() != n) fail(f + "() takes " + std::to_string(n) + " argument(s)"); };
         auto need2 = [&](size_t lo, size_t hi) { if (a.size() < lo || a.size() > hi) fail(f + "(): wrong argument count"); };
-        if (f == "MIN" || f == "MAX") {
-            if (a.empty()) fail(f + "() needs arguments");
-            double r = a[0];
-            for (double x : a) r = f == "MIN" ? std::min(r, x) : std::max(r, x);
-            return r;
-        }
+        if (f == "MIN" || f == "MAX") { need(2); return f == "MIN" ? std::min(a[0], a[1]) : std::max(a[0], a[1]); }
         // Statistical functions return their nominal value: no Monte Carlo yet.
         // ponytail: agauss/gauss/aunif/unif/limit are deterministic (nominal); a corner
         // that switches them on (e.g. sky130 mismatch with mc_mm_switch=1) is not random.
         if (f == "AGAUSS" || f == "GAUSS" || f == "AUNIF" || f == "UNIF" || f == "LIMIT") { need2(2, 3); return a[0]; }
-        if (f == "POW" || f == "PWR") { need(2); return f == "PWR" ? std::copysign(std::pow(std::abs(a[0]), a[1]), a[0]) : std::pow(a[0], a[1]); }
+        if (f == "POW" || f == "PWR") { need(2); return std::pow(f == "PWR" ? std::abs(a[0]) : a[0], a[1]); }
         if (f == "ATAN2") { need(2); return std::atan2(a[0], a[1]); }
         if (f == "HYPOT") { need(2); return std::hypot(a[0], a[1]); }
         need(1);
@@ -160,7 +161,8 @@ private:
         if (f == "FLOOR") return std::floor(x);
         if (f == "CEIL") return std::ceil(x);
         if (f == "INT") return std::trunc(x);
-        if (f == "NINT") return std::round(x);
+        if (f == "NINT") return std::nearbyint(x);  // half to even: nint(2.5) = 2
+        if (f == "SQR") return x * x;
         if (f == "SGN" || f == "SIGN") return (x > 0) - (x < 0);
         if (f == "SIN") return std::sin(x);
         if (f == "COS") return std::cos(x);
@@ -171,6 +173,9 @@ private:
         if (f == "SINH") return std::sinh(x);
         if (f == "COSH") return std::cosh(x);
         if (f == "TANH") return std::tanh(x);
+        if (f == "ASINH") return std::asinh(x);
+        if (f == "ACOSH") return std::acosh(x);
+        if (f == "ATANH") return std::atanh(x);
         fail("function " + f + "() is not supported yet");
     }
     double primary() {
@@ -201,6 +206,7 @@ private:
             return call(name, args);
         }
         if (name == "PI") return M_PI;
+        if (name == "TEMPER") return 27.0;  // circuit temperature in C: .temp is not supported, always 27
         double v;
         if (look_(name, v)) return v;
         fail("unknown parameter " + name);
@@ -212,6 +218,7 @@ private:
 // references work; a cycle is an error), then cached. Parent: the enclosing scope.
 struct Scope {
     std::map<std::string, std::string> raw;
+    std::map<std::string, int> line;  // where each raw parameter was defined
     std::map<std::string, double> val;
     std::set<std::string> busy;
     Scope *parent = nullptr;
@@ -264,7 +271,11 @@ std::vector<std::pair<std::string, std::string>> pairs(const std::string &t, siz
     for (size_t s = 0; s < starts.size(); ++s) {
         const size_t eq = t.find('=', starts[s]);
         const size_t end = s + 1 < starts.size() ? starts[s + 1] : t.size();
-        out.push_back({upper(trim(t.substr(starts[s], eq - starts[s]))), trim(t.substr(eq + 1, end - eq - 1))});
+        std::string v = trim(t.substr(eq + 1, end - eq - 1));
+        // "r=3k PARAMS: q=2": a params: keyword between pairs ends up after the previous value
+        if (v.size() > 7 && upper(v.substr(v.size() - 7)) == "PARAMS:" && std::isspace((unsigned char)v[v.size() - 8]))
+            v = trim(v.substr(0, v.size() - 7));
+        out.push_back({upper(trim(t.substr(starts[s], eq - starts[s]))), v});
     }
     return out;
 }
@@ -361,11 +372,11 @@ public:
             if (i == in.size()) throw std::runtime_error(".subckt " + s.name + " has no .ends");
             subckts_[s.name] = std::move(s);
         }
-        for (const auto &[n, l] : top) collectParams(l, global_);
+        for (const auto &[n, l] : top) collectParams(l, global_, n);
         Lines out = walk(top, global_, "", nullptr);
         Lines params;  // the evaluated global parameters, for the parser's {NAME} / bare-name values
         for (const auto &[name, e] : global_.raw) {
-            errLine_ = 0;
+            errLine_ = global_.line[name];
             double v;
             global_.lookup(name, v);
             params.push_back({0, ".param " + name + "=" + num(v)});
@@ -388,12 +399,12 @@ private:
 
     static bool isParam(const std::string &l) {
         const auto w = words(l);
-        return !w.empty() && upper(w[0]) == ".PARAM";
+        return !w.empty() && (upper(w[0]) == ".PARAM" || upper(w[0]) == ".PARAMS");
     }
-    void collectParams(const std::string &l, Scope &sc) {
+    void collectParams(const std::string &l, Scope &sc, int n = 0) {
         if (!isParam(l)) return;
         const auto w = words(l);
-        for (auto &[k, v] : pairs(l.substr(l.find(w[0]) + w[0].size()))) sc.raw[k] = v;
+        for (auto &[k, v] : pairs(l.substr(l.find(w[0]) + w[0].size()))) { sc.raw[k] = v; sc.line[k] = n; }
     }
 
     // Lines of one scope: .if resolved, .param consumed, X cards specialized,
@@ -401,6 +412,7 @@ private:
     Lines walk(const Lines &in, Scope &sc, const std::string &prefix, std::map<std::string, std::string> *localModels) {
         Lines out;
         std::vector<std::pair<bool, bool>> ifs;  // (this branch active, some branch taken)
+        std::vector<bool> elses;                 // per open .if: its .else seen
         auto active = [&] { for (auto &f : ifs) if (!f.first) return false; return true; };
         for (const auto &[n, raw] : in) {
             errLine_ = n;
@@ -412,11 +424,14 @@ private:
             if (k == ".IF") {
                 const bool on = active() && sc.evaluate(rest) != 0.0;
                 ifs.push_back({on, on});
+                elses.push_back(false);
                 continue;
             }
             if (k == ".ELSEIF" || k == ".ELSE") {
                 if (ifs.empty()) throw std::runtime_error(k + " without .if");
-                auto &f = ifs.back();
+                if (elses.back()) throw std::runtime_error(k + " after .else");
+                elses.back() = k == ".ELSE";
+                const auto f = ifs.back();  // a copy: pop_back ends the element's lifetime
                 ifs.pop_back();
                 const bool outer = active();
                 const bool on = outer && !f.second && (k == ".ELSE" || sc.evaluate(rest) != 0.0);
@@ -426,10 +441,11 @@ private:
             if (k == ".ENDIF") {
                 if (ifs.empty()) throw std::runtime_error(".endif without .if");
                 ifs.pop_back();
+                elses.pop_back();
                 continue;
             }
             if (!active()) continue;
-            if (k == ".PARAM") { if (!prefix.empty()) collectParams(raw, sc); continue; }  // top level: collected
+            if (k == ".PARAM" || k == ".PARAMS") { if (!prefix.empty()) collectParams(raw, sc); continue; }  // top level: collected
             if (k == ".OSDI" || k == ".INCLUDE" || k == ".INC" || k == ".LIB" || k == ".TITLE") { out.push_back({n, raw}); continue; }
             std::string line = raw;
             if (localModels)  // names of this subcircuit's own models -> hoisted names
@@ -477,6 +493,8 @@ private:
         for (const auto &[bn, bl] : s.body) collectParams(bl, body);
         std::string given;
         for (const auto &[k, v] : pairs(line)) {
+            if (k == "M" && !sc.raw.count(k) && !body.raw.count(k))  // ngspice scales every device inside
+                throw std::runtime_error(hw[0] + ": m= on a subcircuit instance is not supported yet");
             if (!sc.raw.count(k) && !body.raw.count(k)) throw std::runtime_error(hw[0] + ": " + s.name + " has no parameter " + k);
             sc.raw.erase(k);
             sc.val[k] = caller.evaluate(v);
@@ -484,16 +502,18 @@ private:
         }
         std::string key = s.name + given;
         for (const auto &[k, v] : s.defaults) { double x; sc.lookup(k, x); key += " " + k + "=" + num(x); }
-        auto [spec, isNew] = specialized_.emplace(key, s.defaults.empty() ? s.name : s.name + "__" + std::to_string(specialized_.size() + 1));
+        // Generated names use '|', which SPICE names never hold (sky130's hold "__"): the parser's
+        // messages map them back to the user's names (SPICEParser::parse, fail)
+        auto [spec, isNew] = specialized_.emplace(key, s.defaults.empty() ? s.name : s.name + "|" + std::to_string(specialized_.size() + 1));
         if (isNew) {
             for (const auto &[bn, bl] : s.body) collectParams(bl, sc);  // body .params (any order)
             std::map<std::string, std::string> models;
             for (const auto &[bn, bl] : s.body)
                 if (const auto w = words(bl); w.size() > 1 && upper(w[0]) == ".MODEL") {
                     const std::string m = upper(w[1]);
-                    models[m] = spec->second + "__" + m;
+                    models[m] = spec->second + "|" + m;
                     if (const size_t dot = m.rfind('.'); dot != std::string::npos)  // binned family NAME.N:
-                        models[m.substr(0, dot)] = spec->second + "__" + m.substr(0, dot);  // devices name NAME
+                        models[m.substr(0, dot)] = spec->second + "|" + m.substr(0, dot);  // devices name NAME
                 }
             std::string hdr = ".subckt " + spec->second;
             for (const auto &p : s.ports) hdr += " " + p;

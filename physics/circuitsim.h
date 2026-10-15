@@ -754,16 +754,16 @@ public:
       for (size_t a = 0; a < L; ++a)
         for (size_t b = 0; b < L; ++b) (*J)[a * L + b] = in.G(a, b) + coef * in.C(a, b);
     }
-    // Internal unknowns the model leaves without a DC reference (ngspice's OSDI run
-    // warns "singular matrix" there): an internal node gets JUNCTION_GMIN to ground;
-    // a branch-current unknown (V(a,b) <+ 0 branches, e.g. BSIM4's body network with
+    // A branch-current unknown (V(a,b) <+ 0 branches, e.g. BSIM4's body network with
     // rbodymod off, which closes a loop of zero-volt branches) gets 1 uOhm in series,
     // so roundoff cannot drive a circulating current (1e-12 there gave 1e-4 A).
-    for (size_t k = in.terminals(); k < L; ++k) {
-      const double reg = in.isFlow(k) ? 1e-6 : PhysicsConstants::JUNCTION_GMIN;
-      I[k] += reg * x[k];
-      if (J) (*J)[k * L + k] += reg;
-    }
+    // Internal nodes get nothing, as in ngspice: a floating one (an unconnected bulk)
+    // is set by the model's own junction gmin, which a leak to ground would override.
+    for (size_t k = in.terminals(); k < L; ++k)
+      if (in.isFlow(k)) {
+        I[k] += 1e-6 * x[k];
+        if (J) (*J)[k * L + k] += 1e-6;
+      }
     return I;
   }
 
@@ -1143,11 +1143,6 @@ private:
   // PHASE 1 HARDENING: Helper Methods (Decomposition of solveDC)
   // =========================================================================
 
-  /**
-   * seedInitialGuess - Initialize voltage estimates for Newton-Raphson.
-   * Encapsulates heuristic seeding for Diodes, BJTs, and supply nodes.
-   */
-  void seedInitialGuess(const TensorNetlist& netlist, std::vector<double>& v);
 
 
   /**

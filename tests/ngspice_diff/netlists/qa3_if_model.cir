@@ -1,0 +1,21 @@
+* qa3: .model inside .if branches in a subckt, selected by param; model name reused across branches
+.subckt dev a b params: typ=0 is0=1e-14
+.if (typ == 0)
+.model dm d (is={is0} n=1.0)
+D1 a b dm
+.elseif (typ == 1)
+.model dm d (is={is0*10} n=1.2 rs=5)
+D1 a b dm
+.else
+R1 a b 1k
+.endif
+.ends
+V1 1 0 DC 1
+R1 1 2 1k
+R2 1 3 1k
+R3 1 4 1k
+X1 2 0 dev
+X2 3 0 dev typ=1
+X3 4 0 dev typ=2
+.op
+.end
