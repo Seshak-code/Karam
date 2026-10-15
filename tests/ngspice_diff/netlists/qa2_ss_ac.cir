@@ -1,0 +1,19 @@
+* AC after a source-stepped OP: RTL stage with gmin stepping off
+.options gminsteps=0
+VCC 1 0 DC 5
+VIN 2 0 DC 0.7 AC 1
+RB0 2 b0 10k
+Q0 3 b0 0 NP
+RC0 1 3 1k
+RB1 3 b1 10k
+Q1 4 b1 0 NP
+RC1 1 4 1k
+RB2 4 b2 10k
+Q2 5 b2 0 NP
+RC2 1 5 1k
+RB3 5 b3 10k
+Q3 6 b3 0 NP
+RC3 1 6 1k
+.model NP NPN(IS=1e-15 BF=100 CJE=1p CJC=1p TF=1n)
+.ac dec 5 1k 1g
+.end

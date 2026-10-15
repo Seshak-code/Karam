@@ -1,0 +1,4 @@
+.lib cells
+R1 in out {ra}
+R2 out 0 {rb}
+.endl cells

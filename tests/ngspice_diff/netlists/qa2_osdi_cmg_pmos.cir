@@ -1,0 +1,9 @@
+* bsimcmg PMOS dc
+.osdi bsimcmg.osdi
+VDD 1 0 DC 0.8
+VG 2 0 DC 0
+RD 3 0 20k
+N1 3 2 1 1 pfin
+.model pfin bsimcmg_va type=0
+.dc VG 0 0.8 0.05
+.end

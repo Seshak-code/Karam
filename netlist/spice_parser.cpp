@@ -11,6 +11,7 @@
 #include "../physics/physics_constants.h"
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 #include <cctype>
 #include <cmath>
 #include <algorithm>
@@ -199,10 +200,17 @@ std::vector<std::pair<int, std::string>> SPICEParser::expandIncludes(
         if (s.size() >= 2 && (s[0] == '"' || s[0] == '\'') && s.back() == s[0]) s = s.substr(1, s.size() - 2);
         return s;
     };
-    auto fields = [&](const std::string& l) {  // first three fields, upper-case keyword
-        std::istringstream t(l);
+    auto fields = [&](const std::string& l) {  // first four fields (a quoted one may hold spaces), upper-case keyword
         std::vector<std::string> f(4);
-        t >> f[0] >> f[1] >> f[2] >> f[3];
+        size_t i = 0;
+        for (auto& x : f) {
+            while (i < l.size() && std::isspace(static_cast<unsigned char>(l[i]))) ++i;
+            if (i == l.size()) break;
+            const size_t start = i;
+            if (l[i] == '"' || l[i] == '\'') { const size_t e = l.find(l[i], i + 1); i = e == std::string::npos ? l.size() : e + 1; }
+            else while (i < l.size() && !std::isspace(static_cast<unsigned char>(l[i]))) ++i;
+            x = l.substr(start, i - start);
+        }
         f[0] = toUpper(f[0]);
         return f;
     };
@@ -217,7 +225,7 @@ std::vector<std::pair<int, std::string>> SPICEParser::expandIncludes(
         const std::string file = unquote(f[1]);
         const std::string path = file[0] == '/' || dir.empty() ? file : dir + "/" + file;
         std::ifstream in(path);
-        if (!in) throw std::runtime_error(f[0] + ": cannot open '" + path + "'");
+        if (!in || !std::filesystem::is_regular_file(path)) throw std::runtime_error(f[0] + ": cannot open '" + path + "'");
         std::stringstream buf;
         buf << in.rdbuf();
         auto body = preprocessLines(buf.str());
@@ -230,8 +238,12 @@ std::vector<std::pair<int, std::string>> SPICEParser::expandIncludes(
                 ++from;
             if (from == body.size()) throw std::runtime_error(".lib: no section " + f[2] + " in '" + path + "'");
             for (to = from + 1; to < body.size() && fields(body[to].second)[0] != ".ENDL"; ++to) {}
+            if (to == body.size()) throw std::runtime_error(".lib: section " + f[2] + " in '" + path + "' has no .endl");
             body = {body.begin() + from + 1, body.begin() + to};
         }
+        // An included file's own .end ends that file, not the netlist (ngspice)
+        for (size_t k = 0; k < body.size(); ++k)
+            if (fields(body[k].second)[0] == ".END") { body.resize(k); break; }
         for (auto& b : body) b.first = num;
         const size_t slash = path.rfind('/');
         const auto sub = expandIncludes(body, slash == std::string::npos ? "" : path.substr(0, slash), depth + 1, errLine);
@@ -260,6 +272,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     params_.clear();
     inductorIndex_.clear();
     modelNames_.clear();
+    cardLine_.clear();
     osdiModels_.clear();
 
     auto lines = preprocessLines(netlistText);
@@ -292,8 +305,11 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             modelNames_.insert(toUpper(tok[1]));
         if (!tok.empty() && toUpper(tok[0]) == ".OSDI") {  // load compiled Verilog-A modules up front
             try {
-                if (tok.size() != 2) throw std::runtime_error(".osdi needs exactly one library path");
-                osdi::loadLibrary(tok[1]);
+                std::string path = line.substr(line.find_first_of(" \t") == std::string::npos ? line.size() : line.find_first_of(" \t"));
+                path.erase(0, path.find_first_not_of(" \t"));
+                if (path.size() >= 2 && (path[0] == '"' || path[0] == '\'') && path.back() == path[0]) path = path.substr(1, path.size() - 2);
+                else if (tok.size() != 2) throw std::runtime_error(".osdi needs exactly one library path");
+                osdi::loadLibrary(path);
             } catch (const std::exception& e) { return fail(lineNum, e.what()); }
             continue;
         }
@@ -314,17 +330,20 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         try {
             // Directives start with '.'
             if (keyword[0] == '.') {
-                if (keyword == ".MODEL")  parseModelCard(tok);
+                if (keyword == ".MODEL")  { parseModelCard(tok); cardLine_[".MODEL/" + toUpper(tok.size() > 1 ? tok[1] : "")] = lineNum; }
                 else if (keyword == ".OSDI") {}   // loaded in the first pass
                 else if (keyword == ".SUBCKT") parseSubcktBegin(tok);
                 else if (keyword == ".ENDS")   parseSubcktEnd();
                 else if (keyword == ".PARAM")  {} // handled in the first pass
                 else if (keyword == ".OP")     result_.hasOP = true;
                 else if (keyword == ".OPTION" || keyword == ".OPTIONS") {
-                    // gminsteps changes the DC homotopy; the other options are still ignored
-                    for (size_t i = 1; i + 1 < tok.size(); ++i)
-                        if (toUpper(tok[i]) == "GMINSTEPS")
-                            result_.netlist.environment.gmin_stepping = parseValue(tok[i + 1]) != 0.0;
+                    // gminsteps changes the DC homotopy; temp/tnom would change every device
+                    // and are not modelled yet (like .temp); the other options are ignored
+                    for (size_t i = 1; i + 1 < tok.size(); ++i) {
+                        const std::string k = toUpper(tok[i]);
+                        if (k == "GMINSTEPS") result_.netlist.environment.gmin_stepping = parseValue(tok[i + 1]) != 0.0;
+                        if (k == "TEMP" || k == "TNOM") throw std::runtime_error(".options " + k + " is not supported yet");
+                    }
                 }
                 else if (keyword == ".TRAN") {
                     result_.hasTRAN = true;
@@ -435,6 +454,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                     throw std::runtime_error("unknown element '" + tok[0] + "'");
             }
             result_.elementsCreated++;
+            cardLine_[(inSubckt_ ? subcktName_ : std::string()) + "/" + toUpper(tok[0])] = lineNum;
         } catch (const std::exception& e) {
             return fail(lineNum, e.what());
         }
@@ -628,10 +648,22 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             for (auto& i : blk.currentSources) edges(i);
         }
     };
+    // Errors found here belong to a card: the .model card for "model X: ...",
+    // else the device being resolved (resolveAt_), not the end of the file.
     try {
+        resolveAt_ = "";
         resolveBlock(result_.netlist.globalBlock);
-        for (auto& [name, blk] : result_.netlist.blockDefinitions) resolveBlock(blk);
-    } catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
+        for (auto& [name, blk] : result_.netlist.blockDefinitions) { resolveAt_ = name; resolveBlock(blk); }
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        int at = lines.back().first;
+        if (what.rfind("model ", 0) == 0) {
+            const auto m = cardLine_.find(".MODEL/" + toUpper(what.substr(6, what.find(':') - 6)));
+            if (m != cardLine_.end()) at = m->second;
+        } else if (const auto d = cardLine_.find(resolveAt_ + "/" + toUpper(what.substr(0, what.find(':'))));
+                   d != cardLine_.end()) at = d->second;
+        return fail(at, what);
+    }
 
     // Merge model cards into netlist
     for (auto& [name, card] : modelCards_) {
@@ -644,7 +676,13 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     try {  // OSDI instances: parameters, setup_instance, node collapsing
         result_.netlist.instantiateOsdi(result_.netlist.environment.ambient_temp_K - 300.15 +
                                         PhysicsConstants::T_DEVICE_NOMINAL_K);
-    } catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
+    } catch (const std::exception& e) {  // "<BLOCK>#<k>.<name>: ..." or "<name>: ...": the device's line
+        const std::string what = e.what(), who = what.substr(0, what.find(':'));
+        const size_t hash = who.find('#'), dot = who.rfind('.');
+        const std::string blk = hash == std::string::npos ? "" : who.substr(0, hash);
+        const auto it = cardLine_.find(blk + "/" + toUpper(dot == std::string::npos ? who : who.substr(dot + 1)));
+        return fail(it == cardLine_.end() ? lines.back().first : it->second, what);
+    }
 
     return result_;
 }
@@ -971,7 +1009,8 @@ void SPICEParser::parseModelCard(const std::vector<std::string>& tok) {
         if (key == "LEVEL") card.level = static_cast<int>(val);
     }
 
-    modelCards_[toUpper(card.name)] = card;
+    if (!modelCards_.emplace(toUpper(card.name), card).second)  // ngspice warns and keeps the first
+        throw std::runtime_error("model " + card.name + " defined twice");
 }
 
 // .SUBCKT <name> <port1> <port2> ...

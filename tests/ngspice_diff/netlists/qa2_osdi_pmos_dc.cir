@@ -1,0 +1,9 @@
+* bsim4 PMOS dc sweep
+.osdi bsim4.osdi
+VDD 1 0 DC 1.2
+VG 2 0 DC 0
+RD 3 0 20k
+N1 3 2 1 1 pch
+.model pch bsim4va type=-1 w=2u l=100n
+.dc VG 0 1.2 0.05
+.end

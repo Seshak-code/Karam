@@ -670,6 +670,9 @@ public:
   // Independent source value: its waveform in transient, else DC, times the
   // source-stepping factor (1 except while solveDC ramps the sources).
   double srcFact_ = 1.0;
+  // A fatal OSDI model error during the current analysis (the model's own text):
+  // it fails the analysis at once instead of retrying ever smaller steps.
+  mutable std::string osdiFatal_;
   template <class S> double sourceValue(const S &s, double dc, double h, double time) const {
     return srcFact_ * (h > 1e-15 ? waveformValue(s, dc, time) : dc);
   }
@@ -718,10 +721,19 @@ public:
     const bool tran = h > 1e-15 && integrator;
     osdi::Instance &in = *r.in;
     if (!in.evaluate(x.data(), tran ? osdi::ANALYSIS_TRAN : osdi::ANALYSIS_DC | osdi::ANALYSIS_STATIC, 0.0)) {
+      osdiFatal_ = r.dev->instanceName + ": " + in.error();  // reported instead of a singular matrix
       std::fill(I.begin(), I.end(), NAN);
       if (J) J->assign(L * L, 0.0);
       return I;
     }
+    for (size_t k = 0; k < L; ++k)
+      if (!std::isfinite(in.f()[k]) || !std::isfinite(in.q()[k])) {  // parameters outside the model's range
+        osdiFatal_ = r.dev->instanceName + ": the model returned a non-finite current or charge "
+                                           "(parameters outside its valid range?)";
+        std::fill(I.begin(), I.end(), NAN);
+        if (J) J->assign(L * L, 0.0);
+        return I;
+      }
     const bool trap = tran && integrator->getType() == IntegrationType::TRAPEZOIDAL;
     const double coef = !tran ? 0.0 : trap ? 2.0 / h : 1.0 / h;
     for (size_t k = 0; k < L; ++k) {

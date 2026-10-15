@@ -383,6 +383,13 @@ int main() {
             {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 QM IC=0.6,5\n.model QM NPN\n", "IC is not supported"},
             {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 NM\n.model NM NMOS\n", "is NMOS, not a NPN/PNP model"},
             {"V1 1 0 DC 1\nR1 1 2 1k\nM1 2 2 0 NM W=10u\n.model NM NMOS\n", "expected 4 nodes"},
+            // QA round 2 and the parameter front end
+            {"V1 1 0 DC 1\nR1 1 0 1k\n.options temp=50\n", "TEMP is not supported"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D\n.model DM D IS=1e-15\n", "defined twice"},
+            {"V1 1 0 DC {nosuch*2}\nR1 1 0 1k\n", "unknown parameter NOSUCH"},
+            {".param a={b+1} b={a}\nV1 1 0 DC {a}\nR1 1 0 1k\n", "depends on itself"},
+            {".if (1)\nV1 1 0 DC 1\nR1 1 0 1k\n", ".if without .endif"},
+            {".subckt rr a b r=1k\nR1 a b {r}\n.ends\nV1 1 0 DC 1\nX1 1 0 rr q=2\n", "has no parameter Q"},
         };
         for (const auto &[net, want] : bad) {
             r = run(mode, std::string("* bad\n") + net + ".op\n");

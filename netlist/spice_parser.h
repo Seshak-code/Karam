@@ -146,7 +146,9 @@ private:
 
     // Model cards collected during parse, merged into netlist at end
     std::map<std::string, ModelCard> modelCards_;
-    std::set<std::string> modelNames_;                              // every .model name (first pass)
+    std::set<std::string> modelNames_;
+    std::map<std::string, int> cardLine_;   // "<subckt>/<CARD NAME>" and ".MODEL/<NAME>" -> line (deferred errors)
+    std::string resolveAt_;                 // block being resolved                              // every .model name (first pass)
     std::map<std::string, std::shared_ptr<osdi::Model>> osdiModels_; // per card, shared by its N devices
 
     // .param expressions (name -> value)

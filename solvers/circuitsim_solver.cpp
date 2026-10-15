@@ -124,6 +124,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // device evaluation + batched front contraction.
 
   struct RestoreSources { double &f; ~RestoreSources() { f = 1.0; } } restoreSources{srcFact_};
+  osdiFatal_.clear();
 
   // Ensure topology hash is fresh
   netlist.globalBlock.computeTopologyHash();
@@ -135,27 +136,18 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   const int nTot = systemSize(netlist);
   std::vector<double> voltageEstimate(nTot, 0.0);
 
-  // Gap 4: Neural seeder — use dV/dt extrapolation or EMA history if available.
-  // The heuristic seedInitialGuess() always runs on top for supply rails / PN
-  // junctions.
-  if (!prevVoltages_.empty() &&
-      prevVoltages_.size() == voltageEstimate.size()) {
-    // dV/dt extrapolation from last two converged solutions (DC: dt=1.0)
-    auto seed = neuralSeeder_.predict(prevVoltages_, prevVoltages_, 1.0);
-    if (!seed.empty()) {
-      voltageEstimate = std::move(seed);
-    }
-  } else if (neuralSeeder_.hasHistory()) {
-    auto seed = neuralSeeder_.predictSeed(voltageEstimate.size());
-    if (!seed.empty()) {
-      voltageEstimate = std::move(seed);
-    }
-  }
-
-  // Phase 1 Hardening: Use extracted helper for initial guess seeding
-  // Runs on top of neural seed to enforce supply rail / PN junction constraints
-  seedInitialGuess(netlist, voltageEstimate);
-  resetJunctionLimits(netlist);  // first iteration: junctions at vcrit (ngspice MODEINITJCT)
+  // Start: the last converged operating point when there is one (a .dc sweep's
+  // previous point; ngspice continues from it with its junction-limiting state),
+  // else the heuristic seed (supply rails, PN junctions) from a cold start. The
+  // heuristic seed used to be applied on top of the previous point and every
+  // point restarted its junctions at vcrit, so long-chain sweeps lost the
+  // continuation and failed where ngspice sweeps through.
+  std::vector<double> coldSeed(nTot, 0.0);
+  seedInitialGuess(netlist, coldSeed);
+  const bool warm = !prevVoltages_.empty() && prevVoltages_.size() == voltageEstimate.size();
+  voltageEstimate = warm ? prevVoltages_ : coldSeed;
+  if (warm) syncJunctionLimits(netlist, voltageEstimate);
+  else resetJunctionLimits(netlist);  // first iteration: junctions at vcrit (ngspice MODEINITJCT)
 
   bool converged = false;
   int total_iterations = 0;
@@ -191,7 +183,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // after easy steps, cut tenfold after a failed one (from the last good point).
   bool sourceSteppingUsed = false;
   double srcConv = 0.0, srcRaise = 1e-3;
-  const std::vector<double> seededGuess = voltageEstimate;
+  const std::vector<double> &seededGuess = coldSeed;  // gmin stepping restarts cold
   std::vector<double> lastGood;
   for (int si = 0; si < 1000; ++si) {  // ponytail: hard cap; ngspice has none (factor -> 1 ends it)
     bool gmin_converged = false;
@@ -274,36 +266,16 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       // Check 1 + 2: Voltage Convergence AND Physical KCL Accuracy
       double kcl_error = kclExcess(netlist, v_new, matrix);
 
-      // Limit Cycle Breaker: Damping
-      // If the residual got worse (and is above tolerance), dampen the step to
-      // force a different path. ">=" also fired on 0 >= 0 (both below the
-      // scale-aware floor), halving every step until the update looked
-      // converged: a 555 output node stopped 0.4 V short of its solution.
-      const double dampTol = finalStep ? PhysicsConstants::KCL_TOL : 1.0;
-      if (iteration > 0 && kcl_error > final_kcl_error && kcl_error > dampTol) { // final_kcl_error holds prev_error
-        // Apply damping: v_new = v_old + 0.5 * (v_new - v_old)
-        for (size_t i = 0; i < v_new.size(); ++i) {
-          v_new[i] = voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
-        }
-        // Re-evaluate residual after damping
-        kcl_error = kclExcess(netlist, v_new, matrix);
-
-        // If still bad, dampen again (aggressive backoff)
-        if (kcl_error > final_kcl_error) {
-          for (size_t i = 0; i < v_new.size(); ++i) {
-            v_new[i] =
-                voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
-          }
-          kcl_error = kclExcess(netlist, v_new, matrix);
-        }
-      }
+      // No residual-based damping (ngspice has none): the residual is measured at
+      // the raw node voltages, where junction exponentials are not limited, so
+      // damping on it fought the device-local junction limiting. Without it a cold
+      // 60-stage RTL chain converges in 37 iterations instead of 131.
       // Record convergence step for diagnostics
       {
         ConvergenceStep cs;
         cs.iteration = iteration;
         cs.residualNorm = kcl_error;
-        cs.dampingFactor =
-            (iteration > 0 && kcl_error >= final_kcl_error) ? 0.5 : 1.0;
+        cs.dampingFactor = 1.0;  // full Newton steps
         cs.linearSolverResidual = result.finalResidual; // Phase 2.9
 
         // Compute max voltage delta
@@ -355,6 +327,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       voltageEstimate = v_new;
     }
 
+    if (!osdiFatal_.empty()) break;  // a fatal model error does not go away with homotopy
     // If we finished the loop without converging, accumulate iterations
     if (!gmin_converged) {
       total_iterations += iteration + 1;
@@ -482,6 +455,10 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                    : "Singular matrix: check branch " + std::to_string(singularRow - netlist.numGlobalNodes + 1) +
                          " (a loop of voltage sources or inductors?)") +
               (details.empty() ? "" : "\n" + details);
+  if (!converged && !osdiFatal_.empty()) details = "OSDI model error: " + osdiFatal_;
+  if (!converged && details.empty())
+    details = std::string("DC operating point did not converge (Newton") +
+              (gminSteppingUsed ? ", gmin stepping" : "") + (sourceSteppingUsed ? ", source stepping" : "") + " failed)";
   stats.error_detail = details;
   stats.method = "Newton-Raphson";
   stats.integrationMethod = ""; // DC has no integration
@@ -677,6 +654,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
                                      const std::function<bool(const SolverStep &)> &onPoint) {
   if (step == 0.0) step = stop / 50.0;  // .tran 0 tstop: ngspice's default TMAX
   if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step >= 0 and stop time > 0.";
+  osdiFatal_.clear();
 
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
@@ -726,6 +704,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   // by a ramp that stops) and LTE rejection then shrinks h until it gives up.
   double h = step, t = 0.0;
   bool landedOnCorner = false;
+  int tinySteps = 0;
   while (stop - t > endTol) {
     double hTry = std::min(h, stop - t);
     bool toCorner = false;
@@ -734,6 +713,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     if (landedOnCorner) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
     SolverStep s = stepTransient(netlist, hTry, t);
     if (landedOnCorner) setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
+    if (!osdiFatal_.empty()) return "OSDI model error at t=" + std::to_string(t) + " s: " + osdiFatal_;
     if (!s.stats.converged || !(s.time > t)) {
       h = hTry * 0.25;
       if (h < dtMin) {
@@ -745,6 +725,15 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
       continue;
     }
     const double taken = s.time - t;
+    // Stalled: a run of accepted steps far below the user step (an ill-posed model
+    // that converges only at femtosecond steps) would take millions of them.
+    // ponytail: 1000 consecutive steps below step*1e-4 is a heuristic bound.
+    tinySteps = taken < step * 1e-4 ? tinySteps + 1 : 0;
+    if (tinySteps > 1000) {
+      std::ostringstream msg;
+      msg << "Transient stalled at t=" << t << " s: 1000 steps below " << step * 1e-4 << " s (timestep too small).";
+      return msg.str();
+    }
     if (taken < dtMin) {  // accepted, but LTE control cut it below dtMin: no progress (ngspice: delmin)
       std::ostringstream msg;
       msg << "Transient timestep too small at t=" << t << " s (" << taken << " s < " << dtMin << " s).";

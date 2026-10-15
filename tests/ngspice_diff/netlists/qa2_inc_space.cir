@@ -1,0 +1,6 @@
+* .include with a quoted path containing a space
+V1 1 0 DC 2
+R1 1 3 1k
+.include "lib/sp ace/qa2_s.inc"
+.op
+.end

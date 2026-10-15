@@ -29,6 +29,7 @@ DIALECT = {
     "PARSER/scalingFactors.cir": "Xyce reads 1X as 1e6",
     "GLOBALNODE/global3.cir": "Xyce reads 1a as 1 (ngspice: atto)",
     "Output/TRAN/tran-prn-timescalefactor.cir": "output time scaling",
+    "PARAM_REFACTOR/paramHomotopy.cir": "LOCA continuation (.options loca) moves the .param to its maximum",
     "MINDUCTORS/mutIndPrint": "V source across an inductor: singular at DC (ngspice .op: check l1#branch)",
     "MINCAPRES/mincr.cir": ".options DEVICE MINRES=1 gives the RS=0 diode 1 ohm (Xyce V(2a) = ngspice v(2b)); ngspice agrees with the engine",
     "LOAD/load.cir": "Xyce gold is 0.5 mV off ngspice near V4 = 54.7 V; the engine matches ngspice to 33 uV",

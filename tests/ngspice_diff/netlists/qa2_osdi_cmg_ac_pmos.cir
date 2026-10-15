@@ -1,0 +1,9 @@
+* bsimcmg PMOS common source ac
+.osdi bsimcmg.osdi
+VDD 1 0 DC 0.8
+VG 2 0 DC 0.3 AC 1
+RD 3 0 5k
+N1 3 2 1 1 pfin
+.model pfin bsimcmg_va type=0
+.ac dec 5 1k 100g
+.end

@@ -1,0 +1,9 @@
+* bsim4 NMOS Id-Vd with sense resistor
+.osdi bsim4.osdi
+VG 2 0 DC 0.8
+VD 4 0 DC 0
+R1 4 3 200
+N1 3 2 0 0 nch
+.model nch bsim4va type=1 w=1u l=100n
+.dc VD 0 1.2 0.05
+.end
