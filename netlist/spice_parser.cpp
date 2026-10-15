@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 
@@ -47,13 +48,26 @@ std::vector<std::string> SPICEParser::tokenize(const std::string& line) {
     return tokens;
 }
 
+// numparam's generated names, NAME|3 (a specialized subcircuit) and SUB|MODEL (a model
+// hoisted out of one), as the user wrote them: NAME and MODEL.
+static std::string userNames(std::string s) {
+    auto inName = [](char c) { return !std::isspace((unsigned char)c) && !std::strchr(":,()='\"#.", c); };
+    for (size_t bar; (bar = s.find('|')) != std::string::npos;) {
+        size_t b = bar, e = bar;
+        while (b > 0 && inName(s[b - 1])) --b;
+        while (e < s.size() && inName(s[e])) ++e;
+        const std::string w = s.substr(b, e - b), last = w.substr(w.rfind('|') + 1);
+        const bool specialized = !last.empty() && std::all_of(last.begin(), last.end(), [](char c) { return std::isdigit((unsigned char)c); });
+        s.replace(b, e - b, specialized ? w.substr(0, w.find('|')) : last);
+    }
+    return s;
+}
+
 double SPICEParser::parseValue(const std::string& raw) const {
-    // .param reference: {NAME} or bare NAME (arithmetic expressions unsupported)
+    // A bare .param name (numparam::expand replaced {expressions} and name=param, and
+    // passes the evaluated global parameters as ".param NAME=value" lines)
     std::string s = raw;
-    if (s.size() >= 2 && s.front() == '{' && s.back() == '}')
-        s = s.substr(1, s.size() - 2);
-    auto p = params_.find(toUpper(s));
-    if (p != params_.end()) return p->second;
+    if (auto p = params_.find(toUpper(s)); p != params_.end()) return p->second;
 
     size_t end = 0;
     double v = 0.0;
@@ -270,9 +284,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     noiseRef_.clear();
     subcktChildren_.clear();
     modelCards_.clear();
-    params_.clear();
     inductorIndex_.clear();
     modelNames_.clear();
+    params_.clear();
     cardLine_.clear();
     scale_ = 1.0;
     osdiModels_.clear();
@@ -286,7 +300,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
 
     auto fail = [&](int lineNum, const std::string& what) {
         result_.success = false;
-        result_.errorMessage = "Parse error at line " + std::to_string(lineNum) + ": " + what;
+        result_.errorMessage = "Parse error at line " + std::to_string(lineNum) + ": " + userNames(what);
         result_.errorLine = lineNum;
         return result_;
     };
@@ -340,9 +354,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             if (keyword[0] == '.') {
                 if (keyword == ".MODEL")  { parseModelCard(tok); cardLine_[".MODEL/" + toUpper(tok.size() > 1 ? tok[1] : "")] = lineNum; }
                 else if (keyword == ".OSDI") {}   // loaded in the first pass
+                else if (keyword == ".PARAM")  {} // handled in the first pass
                 else if (keyword == ".SUBCKT") parseSubcktBegin(tok);
                 else if (keyword == ".ENDS")   parseSubcktEnd();
-                else if (keyword == ".PARAM")  {} // handled in the first pass
                 else if (keyword == ".OP")     result_.hasOP = true;
                 else if (keyword == ".OPTION" || keyword == ".OPTIONS") {
                     // gminsteps changes the DC homotopy; temp/tnom would change every device
@@ -545,16 +559,24 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     };
     auto resolveBlock = [&](TensorBlock& blk) {
         // A MOSFET's card: its own, or the bin of a family NAME.0, NAME.1, ... whose
-        // [LMIN, LMAX) x [WMIN, WMAX) holds the device's L and W (ngspice binning).
+        // [LMIN, LMAX] x [WMIN, WMAX] holds the device's L and W. ngspice's rule (probed
+        // on ngspice 45): edges inclusive within 1e-9 m, total W (not W/NF), and on a
+        // shared edge the card defined last wins (its model list is newest-first).
         auto mosCard = [&](const Mosfet& m) -> const ModelCard* {
             const std::string name = toUpper(m.modelName);
             if (modelCards_.count(name)) return card(m.modelName);
+            constexpr double eps = 1e-9;
+            const ModelCard* best = nullptr;
+            int bestLine = -1;
             for (auto it = modelCards_.lower_bound(name + "."); it != modelCards_.end() &&
                  it->first.compare(0, name.size() + 1, name + ".") == 0; ++it) {
                 const ModelCard& c = it->second;
-                if (c.get("LMIN", 0.0) <= m.l && m.l < c.get("LMAX", INFINITY) &&
-                    c.get("WMIN", 0.0) <= m.w && m.w < c.get("WMAX", INFINITY)) return &c;
+                const int line = cardLine_[".MODEL/" + it->first];
+                if (line >= bestLine &&
+                    c.get("LMIN", 0.0) - eps <= m.l && m.l <= c.get("LMAX", INFINITY) + eps &&
+                    c.get("WMIN", 0.0) - eps <= m.w && m.w <= c.get("WMAX", INFINITY) + eps) { best = &c; bestLine = line; }
             }
+            if (best) return best;
             std::ostringstream why;
             why << m.instanceName << ": no bin of model " << m.modelName << " covers L=" << m.l << " W=" << m.w;
             throw std::runtime_error(why.str());
@@ -589,6 +611,25 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             o.model = model;
             return o;
         };
+        // Capacitors: a model card gives the value (ngspice capsetup/captemp) unless the
+        // instance does; M multiplies. The circuit runs at 27 C, so TC1/TC2 act through TNOM only.
+        for (auto& cap : blk.capacitors) {
+            if (!cap.model_name.empty()) {
+                const ModelCard* c = card(cap.model_name);
+                if (c->type != "C") throw std::runtime_error(cap.name + ": model " + c->name + " is " + c->type + ", not a C model");
+                supported(c, {"CAP", "CJ", "CJSW", "DEFW", "DEFL", "NARROW", "SHORT", "TNOM", "TC1", "TC2"});
+                const double w = (cap.width_m > 0 ? cap.width_m : c->get("DEFW", 1e-6)) - c->get("NARROW", 0.0);
+                const double l = (cap.length_m > 0 ? cap.length_m : c->get("DEFL", 0.0)) - c->get("SHORT", 0.0);
+                if (std::isnan(cap.capacitance_farads))
+                    cap.capacitance_farads = c->params.count("CAP") ? c->get("CAP", 0.0)
+                                                                    : c->get("CJ", 0.0) * w * l + 2.0 * c->get("CJSW", 0.0) * (l + w);
+                const double d = 27.0 - c->get("TNOM", 27.0);
+                cap.capacitance_farads *= 1.0 + c->get("TC1", 0.0) * d + c->get("TC2", 0.0) * d * d;
+                cap.model_name.clear();
+            } else if (std::isnan(cap.capacitance_farads)) throw std::runtime_error(cap.name + ": no value and no model");
+            cap.capacitance_farads *= cap.m;  // was parsed and never applied
+            cap.m = 1.0;
+        }
         std::vector<Mosfet> level1;
         for (auto& m : blk.mosfets) {
             const ModelCard* c = kind(mosCard(m), m.instanceName, {"NMOS", "PMOS"});
@@ -741,8 +782,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             it != result_.netlist.blockDefinitions.end())
             result_.netlist.instanceStates[k].initialize(it->second);
     try {  // OSDI instances: parameters, setup_instance, node collapsing
-        result_.netlist.instantiateOsdi(result_.netlist.environment.ambient_temp_K - 300.15 +
-                                        PhysicsConstants::T_DEVICE_NOMINAL_K);
+        result_.netlist.instantiateOsdi(result_.netlist.environment.ambient_temp_K);
     } catch (const std::exception& e) {  // "<BLOCK>#<k>.<name>: ..." or "<name>: ...": the device's line
         const std::string what = e.what(), who = what.substr(0, what.find(':'));
         const size_t hash = who.find('#'), dot = who.rfind('.');
@@ -764,22 +804,22 @@ void SPICEParser::parseResistor(const std::vector<std::string>& tok, TensorBlock
     r.name = tok[0];
     r.nodeTerminal1 = nodeIndex(tok[1]);
     r.nodeTerminal2 = nodeIndex(tok[2]);
-    r.resistance_ohms = parseValue(tok[3]);
+    size_t first = 4;  // "R1 a b r=1k" (IHP cap_cmim) as well as "R1 a b 1k"
+    if (const std::string k = toUpper(tok[3]); (k == "R" || k == "RESISTANCE") && tok.size() > 4) r.resistance_ohms = parseValue(tok[first++]);
+    else r.resistance_ohms = parseValue(tok[3]);
     if (r.resistance_ohms == 0.0) {  // an exact short: a 0 V branch (negative R is legal SPICE)
         blk.voltageSources.push_back({r.nodeTerminal1, r.nodeTerminal2, 0.0});
         return;
     }
 
     // tokenize() turns "KEY=val" into ["KEY", "val"]
-    for (size_t i = 4; i < tok.size(); ++i) {
+    for (size_t i = first; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")        r.width_m  = parseValue(tok[++i]);
         else if (upper == "L")   r.length_m = parseValue(tok[++i]);
-        else if (upper == "TC1" || upper == "TC2") {
-            if (parseValue(tok[++i]) != 0.0)  // no stamp applies them
-                throw std::runtime_error(tok[0] + ": TC1/TC2 temperature coefficients are not supported yet");
-        }
+        else if (upper == "TC1" || upper == "TC2") parseValue(tok[++i]);  // R(T) = R(1 + tc1 (T-TNOM) + ...):
+        // exact no-ops, as the circuit always runs at TNOM = 27 C (.temp is not supported)
         else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
     blk.resistors.push_back(r);
@@ -791,10 +831,16 @@ void SPICEParser::parseCapacitor(const std::vector<std::string>& tok, TensorBloc
     c.name = tok[0];
     c.nodePlate1 = nodeIndex(tok[1]);
     c.nodePlate2 = nodeIndex(tok[2]);
-    c.capacitance_farads = parseValue(tok[3]);
+    // C a b <value> [model] | C a b <model> (semiconductor capacitor), then KEY val pairs:
+    // an even count of words after the nodes means value + model; odd, value or model
+    size_t i = 3;
+    const char c0 = tok[3][0];
+    const bool valueFirst = (tok.size() - 3) % 2 == 0 || std::isdigit((unsigned char)c0) || c0 == '.' || c0 == '-' || c0 == '+';
+    c.capacitance_farads = valueFirst ? parseValue(tok[i++]) : NAN;  // NAN: from the model (resolveBlock)
+    if ((tok.size() - i) % 2 == 1) c.model_name = tok[i++];
 
     // tokenize() turns "KEY=val" into ["KEY", "val"]. IC= applies with UIC.
-    for (size_t i = 4; i < tok.size(); ++i) {
+    for (; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")      c.width_m  = parseValue(tok[++i]);
@@ -1195,12 +1241,9 @@ void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<in
     }
 }
 
-// .PARAM <name>=<value> [<name>=<value>]...
+// .PARAM <name>=<value> [<name>=<value>]... (numparam::expand's evaluated globals)
 void SPICEParser::parseParam(const std::vector<std::string>& tok) {
-    // After tokenizer: .PARAM key value key value ...
-    for (size_t i = 1; i + 1 < tok.size(); i += 2) {
-        params_[toUpper(tok[i])] = parseValue(tok[i + 1]);
-    }
+    for (size_t i = 1; i + 1 < tok.size(); i += 2) params_[toUpper(tok[i])] = parseValue(tok[i + 1]);
 }
 
 } // namespace acutesim

@@ -1,0 +1,7 @@
+* bare .param names as values (ngspice accepts them)
+.param vdd=1.2 rr=2k
+V1 1 0 vdd
+R1 1 2 rr
+R2 2 0 1k
+.op
+.end

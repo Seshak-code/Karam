@@ -1,0 +1,9 @@
+* qa3: IHP hv pmos dc sweep
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOShv.lib mos_tt
+VDD 1 0 DC 3.3
+VG 2 0 DC 3.3
+RD 3 0 10k
+XP 3 2 1 1 sg13_hv_pmos w=2u l=0.4u ng=2
+.dc VG 3.3 0 -0.15
+.end

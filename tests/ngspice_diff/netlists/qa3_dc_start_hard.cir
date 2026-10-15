@@ -1,0 +1,10 @@
+* qa3: sweep starts deep in a hard region: diode string reverse then forward, with stop in breakdown-ish high forward
+.model dd d (is=1e-14 n=1.05 rs=1)
+V1 1 0 DC -20
+R1 1 2 1
+D1 2 3 dd
+D2 3 4 dd
+D3 4 5 dd
+D4 5 0 dd
+.dc V1 -20 5 0.25
+.end

@@ -1,0 +1,17 @@
+* qa3: two-stage CMOS op-amp (MOS1) in unity-gain feedback, .op
+.model nm nmos (level=1 vto=0.6 kp=100u lambda=0.04 gamma=0.4 phi=0.7)
+.model pm pmos (level=1 vto=-0.6 kp=40u lambda=0.05 gamma=0.5 phi=0.7)
+VDD 1 0 DC 3.3
+VIN 2 0 DC 1.5
+IB 1 8 DC 20u
+MB1 8 8 0 0 nm W=10u L=2u
+MB2 9 8 0 0 nm W=20u L=2u
+M1 5 out 9 0 nm W=20u L=2u
+M2 6 2 9 0 nm W=20u L=2u
+M3 5 5 1 1 pm W=40u L=2u
+M4 6 5 1 1 pm W=40u L=2u
+M6 out 6 1 1 pm W=160u L=1u
+M7 out 8 0 0 nm W=80u L=2u
+CC 6 out 2p
+.op
+.end

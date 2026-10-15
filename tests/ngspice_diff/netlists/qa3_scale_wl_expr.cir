@@ -1,0 +1,15 @@
+* qa3: .options scale with params in W/L and a subckt
+.options scale=1u
+.param wn = 4
+.subckt inv in out vdd params: wr=2
+M1 out in 0 0 nm W={wn} L=1
+M2 out in vdd vdd pm W={wn*wr} L=1
+.ends
+.model nm nmos (level=1 vto=0.5 kp=100u)
+.model pm pmos (level=1 vto=-0.5 kp=40u)
+VDD 1 0 DC 3
+VIN 2 0 DC 1.4
+X1 2 3 1 inv
+X2 2 4 1 inv wr=3
+.op
+.end

@@ -12,6 +12,7 @@
 #include "engine_api/engine_callbacks.h"
 #include "physics/circuitsim.h"
 #include "netlist/spice_parser.h"
+#include "netlist/numparam.h"
 
 #include <array>
 #include <cmath>
@@ -67,17 +68,17 @@ int main() {
         // Fix 3: default diode (IS=1e-14) and trailing .model card (IS=1e-12)
         r = run(mode, "* diode default\nV1 1 0 DC 5\nR1 1 2 1k\nD1 2 0 NOCARD\n.model NOCARD D\n.op\n");
         double vd = V(r, 2), id = (5.0 - vd) / 1e3;
-        check(r.converged && near(vd, 0.02585 * std::log(id / 1e-14 + 1), 1e-4),
+        check(r.converged && near(vd, PhysicsConstants::V_THERMAL_NOM * std::log(id / 1e-14 + 1), 1e-4),
               "diode with SPICE defaults matches Shockley (V=" + std::to_string(vd) + ")");
         r = run(mode, "* diode card after\nV1 1 0 DC 5\nR1 1 2 1k\nD1 2 0 DB\n.model DB D(IS=1e-12)\n.op\n");
         vd = V(r, 2); id = (5.0 - vd) / 1e3;
-        check(r.converged && near(vd, 0.02585 * std::log(id / 1e-12 + 1), 1e-4),
+        check(r.converged && near(vd, PhysicsConstants::V_THERMAL_NOM * std::log(id / 1e-12 + 1), 1e-4),
               "trailing .model IS=1e-12 is applied (V=" + std::to_string(vd) + ")");
 
         // Junction exponent cap: at 1 A (Is=1e-14) the old cap of 30 made the
         // diode linear above 0.107 A and gave 0.9915 V; Shockley gives 0.8335 V.
         r = run(mode, "* 1A diode\nI1 0 1 DC 1\nD1 1 0 DM\n.model DM D(IS=1e-14)\n.op\n");
-        check(r.converged && near(V(r, 1), 0.02585 * std::log(1.0 / 1e-14 + 1), 2e-3),
+        check(r.converged && near(V(r, 1), PhysicsConstants::V_THERMAL_NOM * std::log(1.0 / 1e-14 + 1), 2e-3),
               "1 A diode follows Shockley, not the old linear clamp (V=" + std::to_string(V(r, 1)) + ")");
 
         // Diode breakdown: BV is adjusted (ngspice diotemp) so that exactly IBV
@@ -92,7 +93,7 @@ int main() {
                       ".model QE NPN(IS=1e-15 BF=100 VAF=50)\n.op\n");
         {
             const double ic = 5.0 - V(r, 2), vbc = 0.7 - V(r, 2);  // V(): nodes in order of appearance
-            const double expect = 1e-15 * (std::exp(0.7 / 0.02585) - 1.0) * (1.0 - vbc / 50.0);
+            const double expect = 1e-15 * (std::exp(0.7 / PhysicsConstants::V_THERMAL_NOM) - 1.0) * (1.0 - vbc / 50.0);
             check(r.converged && near(ic, expect, 1e-3 * expect),
                   "BJT Early effect matches q1 = 1/(1 - Vbc/VAF) (Ic=" + std::to_string(ic) + ")");
         }
@@ -220,7 +221,7 @@ int main() {
         check(r.converged && near(V(r, 2), 2.5, 1e-3), ".param {RV} is substituted");
         r = run(mode, "* late pnp model\nVCC 1 0 DC 5\nRE 1 2 1k\nVB 3 0 DC 3\nQ1 4 3 2 QP\n"
                       "RC 4 0 1k\n.model QP PNP(IS=1e-15 BF=100)\n.op\n");
-        // Hand: Ie~(5-Ve)/1k, Ic=Ie*100/101, Vbe=0.02585*ln(Ic/1e-15)=0.7205 -> Ve=3.7205
+        // Hand: Ie~(5-Ve)/1k, Ic=Ie*100/101, Vbe=PhysicsConstants::V_THERMAL_NOM*ln(Ic/1e-15)=0.7205 -> Ve=3.7205
         // (an NPN would not conduct at all; ignoring IS from the card gives 3.662)
         check(r.converged && near(V(r, 2), 3.7205, 2e-3),
               ".model after the device still makes it a PNP (V(e)=" + std::to_string(V(r, 2)) + ")");
@@ -259,6 +260,16 @@ int main() {
                       "R2 3 0 1MEG\n.tran 1e-6 2.5e-4\n", 1e-6, 2.5e-4);
         check(r.converged && std::abs(V(r, 2)) > 0.1 && near(V(r, 3) / V(r, 2), 0.99, 1e-3),
               "K coupling: open-circuit v2/v1 = 0.99 (ratio=" + std::to_string(V(r, 3) / V(r, 2)) + ")");
+
+        // A .tran step 10x the period (QA3 BUG-6): steps started at tstep and stepped a 10 MHz LC
+        // tank a period at a time, collapsing it to 4e-81. Now ngspice's step control: the
+        // envelope over the 20th period stays at the exact exp(-t/2RC) = 0.990 (ngspice 45
+        // itself drifts out of phase here; the envelope is what both should keep)
+        r = run(mode, "* lc\nL1 1 0 253.3n\nC1 1 0 1n IC=1\nR1 1 0 100k\n.tran 1u 2u uic\n", 1e-6, 2e-6);
+        double env = 0.0;
+        for (const auto& p : r.waveformPoints) if (p.timeS > 1.9e-6) env = std::max(env, std::abs(p.nodeVoltages[0]));
+        check(r.converged && near(env, std::exp(-2e-6 / (2 * 100e3 * 1e-9)), 0.03),
+              "LC tank with tstep = 10 periods keeps its envelope (" + std::to_string(env) + ")");
 
         // Fix 2: an invalid timestep is an error, not an infinite loop; 0 means automatic
         r = run(mode, "* rc\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n", -1e-6, 1e-3);
@@ -336,11 +347,12 @@ int main() {
         check(s.stats.converged && !s.stats.gminSteppingUsed, "linear divider: no GMIN stepping reported");
     }
 
-    // Source stepping (ngspice gillespie_src): with gmin stepping off, a 50-stage RTL
-    // chain that plain Newton cannot solve converges by ramping the sources
+    // Source stepping (ngspice gillespie_src): with gmin stepping off, a 100-stage RTL
+    // chain that plain Newton cannot solve (50 stages it can) converges by ramping the
+    // sources; ngspice 45 aborts it with gminsteps=0 and matches with gmin stepping on
     {
         std::string net = "* rtl\n.options gminsteps=0\nVCC 1 0 DC 5\nVIN 2 0 DC 0\n";
-        for (int i = 0; i < 50; ++i)
+        for (int i = 0; i < 100; ++i)
             net += "RB" + std::to_string(i) + " " + std::to_string(2 + i) + " b" + std::to_string(i) + " 10k\nQ" +
                    std::to_string(i) + " " + std::to_string(3 + i) + " b" + std::to_string(i) + " 0 NP\nRC" +
                    std::to_string(i) + " 1 " + std::to_string(3 + i) + " 1k\n";
@@ -349,7 +361,8 @@ int main() {
         CircuitSim sim;
         SolverStep s = sim.solveDC(p.netlist);
         check(p.success && s.stats.converged && s.stats.sourceSteppingUsed,
-              "DC source stepping solves a 50-stage RTL chain with gminsteps=0");
+              "DC source stepping solves a 100-stage RTL chain with gminsteps=0 (converged " +
+                  std::to_string(s.stats.converged) + ", source stepping " + std::to_string(s.stats.sourceSteppingUsed) + ")");
     }
 
     // Phase 3 MOS1: SPICE card defaults (KP 2e-5, VTO 0, W = L = 100u) give
@@ -445,6 +458,22 @@ int main() {
             e.emplace_back(x[0], x[1], x[2]);
         check(GraphCanonical::computeTopologyHash(e, 0) == 3977363823923051078ULL,
               "topology hash unchanged by the linear-time relabel");
+    }
+
+    {   // .param expression semantics as ngspice 47 evaluates them (QA3 BUG-9)
+        auto none = [](const std::string&, double&) { return false; };
+        int bad = 0;
+        for (const auto& [e, want] : std::vector<std::pair<const char*, double>>{
+                 {"2**3**2", 64}, {"2^3^2", 64}, {"-2**2", -4}, {"2**-1", 0.5}, {"nint(2.5)", 2}, {"nint(-2.5)", -2},
+                 {"nint(3.5)", 4}, {"pwr(-2,3)", 8}, {"pow(-2,3)", -8}, {"5mil", 5e-3}, {"sqr(3)", 9}, {"2<>3", 1},
+                 {"-7%3", -1}, {"0?2:0?4:5", 5}, {"log(100)", std::log(100.0)}, {"temper", 27}, {"atanh(0.5)", std::atanh(0.5)}})
+            if (std::abs(numparam::eval(e, none) - want) > 1e-12 * std::abs(want)) { std::printf("    %s\n", e); ++bad; }
+        for (const char* e : {"1/0", "ln(0)", "1e400", "sqrt(-1)", "10%0", "min(3,1,2)"}) {
+            bool threw = false;
+            try { numparam::eval(e, none); } catch (const std::exception&) { threw = true; }
+            if (!threw) { std::printf("    %s accepted\n", e); ++bad; }
+        }
+        check(bad == 0, ".param expressions: ngspice associativity, rounding, pwr, mil, errors for non-finite results");
     }
 
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");

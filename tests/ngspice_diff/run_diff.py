@@ -21,11 +21,13 @@ SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "m": 1e-3, "u": 1e-6, "n": 
 #   ngspice's own RELTOL, i.e. the accuracy either solver actually guarantees for nonlinear devices.
 # Transient: engine steps are <= the .tran step (coarse, LTE-limited); the reference is run with
 #   tmax=tstep/10.  Error is judged against each node's swing (max-min of the reference): 2% of swing,
-#   with a 5 mV floor so near-constant nodes (virtual grounds) are not judged on noise.
-# ngspice temperature: the engine hardcodes Vt = 25.85 mV (kT/q at 299.98 K = 26.83 C); ngspice defaults to
-#   27 C (Vt = 25.865 mV), which alone shifts a 26 mA BJT Vbe by 0.5 mV.  --temp aligns them (set as
-#   .options temp= tnom=), so remaining differences are model differences, not a thermal-voltage constant.
-DEFAULTS = dict(dc_atol=2e-4, dc_rtol=1e-3, tran_rtol=0.02, tran_atol=5e-3, temp=26.83)
+#   with a 5 mV floor so near-constant nodes (virtual grounds) are not judged on noise, and a timing
+#   tolerance of tstep/10: an engine sample may match the reference anywhere within +-tstep/10 of its
+#   time. On a steep edge 2% of swing alone is a sub-ps timing demand (a 100-stage chain accumulated
+#   0.95 ps = 0.1% of its delay against a reference converged to 0.15 ps; ngspice at its own default
+#   step is 3 ps off by stage 10).
+# Both simulators run at ngspice's default 27 C (the engine's Vt is kT/q at 300.15 K since 2026-10-15).
+DEFAULTS = dict(dc_atol=2e-4, dc_rtol=1e-3, tran_rtol=0.02, tran_atol=5e-3)
 
 def num(s):
     m = re.fullmatch(r"([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z]*)", s.lower())
@@ -147,7 +149,6 @@ def run_ngspice(args, text, an, names):
     vecs = " ".join(f"v({n.lower()})" for n in names)
     out = os.path.join(args.tmp, "ng.dat")
     if os.path.exists(out): os.remove(out)
-    kept.append(f".options temp={args.temp} tnom={args.temp}")
     ctl = [".control", cmd, f"wrdata {out} {vecs}", "quit", ".endc", ".end"]
     if an[0] == "noise":  # spectra in plot noise1, integrated totals in noise2
         ctl = [".control", "noise {1} {2} {3} {4} {5!r} {6!r}".format(*an), "setplot noise1",
@@ -248,21 +249,21 @@ def compare(args, text, an, mode, nm, ref):
         ts = col(r, 0)
         if ts[-1] < tstop * 0.999: bad.append(f"engine stopped at t={ts[-1]:g} < tstop={tstop:g} ({r['err']})")
         sel = [i for i, t in enumerate(ts) if xs[0] <= t <= xs[-1]]  # reference may start at TSTART
+        dt = tstep / 10  # timing tolerance (see the policy above)
         for n in names:
             ref_n = vals[n]
             swing = max(ref_n) - min(ref_n)
             tol = max(args.tran_atol, args.tran_rtol * swing)
             eng = col(r, nm[n])
             for i in sel:
+                # The reference's range over [t - dt, t + dt]; plus, where it jumps more than tol inside
+                # one cell (a switching edge), that cell's bracket: interpolation would invent a value.
+                win = [interp(xs, ref_n, ts[i] - dt), interp(xs, ref_n, ts[i] + dt)]
+                win += ref_n[bisect.bisect_left(xs, ts[i] - dt):bisect.bisect_right(xs, ts[i] + dt)]
                 k = bisect.bisect_left(xs, ts[i])
-                if 0 < k < len(xs) and abs(ref_n[k] - ref_n[k - 1]) > tol:
-                    # The reference jumps more than tol inside one cell (a switching edge): interpolation
-                    # would invent a value, so the engine must lie within the cell's bracket +- tol.
-                    lo, hi = sorted((ref_n[k - 1], ref_n[k]))
-                    got = min(max(eng[i], lo), hi)
-                    judge(f"t={ts[i]:g} v({n})", eng[i], got, tol, max(swing, 1e-3))
-                    continue
-                judge(f"t={ts[i]:g} v({n})", eng[i], interp(xs, ref_n, ts[i]), tol, max(swing, 1e-3))
+                if 0 < k < len(xs) and abs(ref_n[k] - ref_n[k - 1]) > tol: win += [ref_n[k - 1], ref_n[k]]
+                got = min(max(eng[i], min(win)), max(win))
+                judge(f"t={ts[i]:g} v({n})", eng[i], got, tol, max(swing, 1e-3))
         if not r["conv"] and not bad: bad.append(f"engine reports not converged: {r['err']}")
     return ("FAIL" if bad else "PASS"), worst_abs, worst_rel, "; ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else "")
 

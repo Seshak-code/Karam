@@ -1,0 +1,22 @@
+* qa3: X override evaluated in caller scope even when it names the callee's own param; defaults referencing earlier header params; body .param shadowing header
+.param w = 10
+.subckt s a b params: w=3 z={w*2} y={z+w}
+.param q = {y*10}
+R1 a b {w}
+R2 b c {z}
+R3 c d {y}
+R4 d 0 {q}
+.ends
+V1 1 0 DC 1
+X1 1 2 s w={w+1}
+X2 1 3 s
+X3 1 4 s z=7
+X4 1 5 s q=50
+X5 1 6 s y=1 w=w*2
+R9 2 0 1meg
+R8 3 0 1meg
+R7 4 0 1meg
+R6 5 0 1meg
+R5 6 0 1meg
+.op
+.end

@@ -1,0 +1,13 @@
+* qa3: .if false with no else, element with same name in both branches, .param inside .if
+.param m = 0
+.if (m)
+.param val = 5
+R1 1 2 1
+.else
+.param val = 7
+R1 1 2 2
+.endif
+V1 1 0 DC 1
+R2 2 0 {val*100}
+.op
+.end

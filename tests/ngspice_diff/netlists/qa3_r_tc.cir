@@ -1,0 +1,6 @@
+* qa3: R tc1/tc2 (IHP rsmain): at the nominal temp the coefficients do nothing
+V1 1 0 DC 1
+R1 1 2 1k tc1=2.975e-3 tc2=4.63e-6
+R2 2 0 1k
+.op
+.end

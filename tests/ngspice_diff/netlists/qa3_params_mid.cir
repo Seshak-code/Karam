@@ -1,0 +1,9 @@
+* qa3 BUG(low): "params:" after name=value defaults: ngspice accepts, engine "unexpected 'PARAMS:'"
+.subckt t a b r=3k PARAMS: q=2
+R1 a b {r*q}
+.ends
+V1 1 0 DC 1
+X1 1 2 t
+R2 2 0 6k
+.op
+.end

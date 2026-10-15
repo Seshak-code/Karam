@@ -1,0 +1,31 @@
+* qa3: 25 diodes in series from 20 V through 1 ohm (huge cold-start error)
+.model dd d (is=1e-14 n=1)
+V1 1 0 DC 20
+R1 1 2 1
+D1 2 3 dd
+D2 3 4 dd
+D3 4 5 dd
+D4 5 6 dd
+D5 6 7 dd
+D6 7 8 dd
+D7 8 9 dd
+D8 9 10 dd
+D9 10 11 dd
+D10 11 12 dd
+D11 12 13 dd
+D12 13 14 dd
+D13 14 15 dd
+D14 15 16 dd
+D15 16 17 dd
+D16 17 18 dd
+D17 18 19 dd
+D18 19 20 dd
+D19 20 21 dd
+D20 21 22 dd
+D21 22 23 dd
+D22 23 24 dd
+D23 24 25 dd
+D24 25 26 dd
+D25 26 0 dd
+.op
+.end

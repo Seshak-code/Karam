@@ -1,0 +1,7 @@
+* qa3: semiconductor capacitor with .model c (IHP cmim_core style): C n1 n2 model l= w=
+.model cm c (cj=1e-3 cjsw=1e-10 tnom=27)
+V1 1 0 PULSE(0 1 0 1n 1n 10n 20n)
+R1 1 2 1k
+C1 2 0 cm l=10u w=10u
+.tran 0.1n 30n
+.end

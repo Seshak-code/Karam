@@ -1,0 +1,10 @@
+* qa3: IHP hv nmos common-source ac
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOShv.lib mos_tt
+VDD 1 0 DC 3.3
+VG 2 0 DC 1.0 AC 1
+RD 1 3 5k
+XN 3 2 0 0 sg13_hv_nmos w=4u l=0.45u ng=2
+CL 3 0 100f
+.ac dec 10 1meg 100g
+.end

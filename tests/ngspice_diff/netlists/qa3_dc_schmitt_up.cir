@@ -1,0 +1,13 @@
+* qa3: BJT emitter-coupled Schmitt trigger, DC sweep up through the upper threshold
+.model npn1 npn (is=1e-15 bf=100 br=1)
+VCC 1 0 DC 12
+RC1 1 2 2k
+RC2 1 3 1k
+R1 2 4 5k
+R2 4 0 5k
+RE 5 0 500
+Q1 2 6 5 npn1
+Q2 3 4 5 npn1
+VIN 6 0 DC 0
+.dc VIN 0 8 0.1
+.end

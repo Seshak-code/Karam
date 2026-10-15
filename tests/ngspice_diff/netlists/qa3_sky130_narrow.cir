@@ -1,0 +1,8 @@
+* qa3 BUG (k2/wk2): sky130 nfet_01v8 l=0.5 w=1 : engine 4.9x ngspice current
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VG 2 0 DC 0.9
+RD 1 3 1k
+XN 3 2 0 0 sky130_fd_pr__nfet_01v8 l=0.5 w=1
+.op
+.end

@@ -1,0 +1,9 @@
+* qa3: IHP lv nmos+pmos inverter dc transfer, corner mos_sf
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOSlv.lib mos_sf
+VDD 1 0 DC 1.2
+VIN 2 0 DC 0
+XP 3 2 1 1 sg13_lv_pmos w=1u l=0.13u
+XN 3 2 0 0 sg13_lv_nmos w=0.5u l=0.13u
+.dc VIN 0 1.2 0.05
+.end

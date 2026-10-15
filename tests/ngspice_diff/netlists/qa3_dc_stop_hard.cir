@@ -1,0 +1,9 @@
+* qa3: sweep ends at hard forward bias of a BJT stack (huge currents) with source stepping
+.model npn1 npn (is=1e-16 bf=200 vaf=80 rb=50 re=1 rc=1)
+V1 1 0 DC 0
+RB 1 2 100
+Q1 3 2 0 npn1
+RC 4 3 10
+VCC 4 0 DC 5
+.dc V1 0 5 0.1
+.end

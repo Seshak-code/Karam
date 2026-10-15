@@ -1,0 +1,6 @@
+* qa3: R card with r= keyword (IHP cap_cmim uses "R1 PLUS 1 r=55m"); ngspice reads it
+V1 1 0 DC 1
+R1 1 2 r=1k
+R2 2 0 r=3k
+.op
+.end

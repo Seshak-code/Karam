@@ -26,91 +26,6 @@
 static constexpr int COLD_START_SUBSTEPS = 100;
 
 // =============================================================================
-// PHASE 1 HARDENING: Helper Method Implementations
-// =============================================================================
-
-void CircuitSim::seedInitialGuess(const TensorNetlist &netlist,
-                                  std::vector<double> &voltageEstimate) {
-  const size_t N = voltageEstimate.size();
-
-  // Temperature-corrected Vbe seed: at cold temps, Vbe increases (~+2mV/K below
-  // nominal)
-  double T = netlist.environment.ambient_temp_K;
-  double vbe_seed = PhysicsConstants::V_BE_SEED - 0.002 * (T - 300.15);
-  // Clamp to reasonable range [0.5V, 1.2V]
-  vbe_seed = std::max(0.5, std::min(1.2, vbe_seed));
-
-  // 1. Seed from Voltage Sources (direct)
-  for (const auto &source : netlist.globalBlock.voltageSources) {
-    int idx = SafeUtils::safe_idx(source.nodePositive, N, "VSource seed");
-    if (idx >= 0) {
-      voltageEstimate[idx] = source.voltage_V;
-    }
-  }
-
-  // 2. Seed Diode anodes (0.6V initial for silicon)
-  for (const auto &diode : netlist.globalBlock.diodes) {
-    int idx = SafeUtils::safe_idx(diode.anode, N, "Diode seed");
-    if (idx >= 0) {
-      voltageEstimate[idx] =
-          std::max(voltageEstimate[idx], PhysicsConstants::V_DIODE_SEED);
-    }
-  }
-
-  // 3. Find supply voltage for mid-rail seeding
-  double vSupply = PhysicsConstants::V_SUPPLY_DEFAULT;
-  for (const auto &vs : netlist.globalBlock.voltageSources) {
-    if (vs.voltage_V > vSupply)
-      vSupply = vs.voltage_V;
-  }
-
-  // 4. Current Source Node Seeding (BJT base detection)
-  for (const auto &cs : netlist.globalBlock.currentSources) {
-    int nPos = SafeUtils::safe_idx(cs.nodePositive, N, "ISource seed");
-    if (nPos < 0)
-      continue;
-
-    // Check if this node is a BJT base
-    bool isBase = false;
-    for (const auto &bjt : netlist.globalBlock.bjts) {
-      if (SafeUtils::safe_idx(bjt.base, N, "BJT base check") == nPos) {
-        int nE = SafeUtils::safe_idx(bjt.emitter, N, "BJT emitter");
-        double v_e = (nE >= 0) ? voltageEstimate[nE] : 0.0;
-        double vbe = bjt.isNPN ? vbe_seed : -vbe_seed;
-        voltageEstimate[nPos] = std::max(voltageEstimate[nPos], v_e + vbe);
-        isBase = true;
-        break;
-      }
-    }
-    // Default: mid-rail for unconnected current source nodes
-    if (!isBase && voltageEstimate[nPos] == 0.0) {
-      voltageEstimate[nPos] = vSupply * 0.5;
-    }
-  }
-
-  // 5. BJT Multi-Pass Seeding (Darlington propagation), every block
-  auto at = [&](int n) -> double * { return n > 0 && n <= (int)N ? &voltageEstimate[n - 1] : nullptr; };
-  for (int pass = 0; pass < 3; ++pass) {
-    forEachJunction(netlist, [&](const Junction &j) {
-      if (!j.q) return;
-      double *c = at(j.n[0]), *b = at(j.n[1]), *e = at(j.n[2]);
-      const double s = j.q->isNPN ? 1.0 : -1.0;  // PNP: mirrored
-      if (e && b) *b = s * std::max(s * *b, s * (*e + s * vbe_seed));
-      if (c && b) *c = s * std::max(s * *c, s * (*b + s * 0.5));
-    });
-  }
-
-  // 6. Internal nodes (series resistances) start at their external terminal
-  forEachJunction(netlist, [&](const Junction &j) {
-    const int ext[7] = {0, 1, 2, 3, 0, 1, 2}, pairs = j.d ? 1 : 3, first = j.d ? 2 : 4;
-    for (int k = first; k < first + pairs; ++k) {
-      const int x = j.d ? 0 : ext[k];
-      if (j.n[k] != j.n[x]) if (double *a = at(j.n[k])) *a = at(j.n[x]) ? *at(j.n[x]) : 0.0;
-    }
-  });
-}
-
-// =============================================================================
 // MAIN SOLVER METHODS
 // =============================================================================
 
@@ -139,12 +54,11 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
   // Start: the last converged operating point when there is one (a .dc sweep's
   // previous point; ngspice continues from it with its junction-limiting state),
-  // else the heuristic seed (supply rails, PN junctions) from a cold start. The
-  // heuristic seed used to be applied on top of the previous point and every
-  // point restarted its junctions at vcrit, so long-chain sweeps lost the
-  // continuation and failed where ngspice sweeps through.
-  std::vector<double> coldSeed(nTot, 0.0);
-  seedInitialGuess(netlist, coldSeed);
+  // else all zeros, as ngspice. A heuristic seed (sources' values on their nodes,
+  // 0.6 V anodes, mid-rail current-source nodes, Vbe ladders) put cross-coupled
+  // latches on their metastable midpoint (QA3 BUG-5; 7 more IHP flip-flops matched
+  // ngspice without it, and nothing needed it).
+  const std::vector<double> coldSeed(nTot, 0.0);
   const bool warm = !prevVoltages_.empty() && prevVoltages_.size() == voltageEstimate.size();
   voltageEstimate = warm ? prevVoltages_ : coldSeed;
   if (warm) syncJunctionLimits(netlist, voltageEstimate);
@@ -475,7 +389,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                    ? "Singular matrix: check node " + std::to_string(singularRow + 1) +
                          " (no DC path to ground?)"
                    : "Singular matrix: check branch " + std::to_string(singularRow - netlist.numGlobalNodes + 1) +
-                         " (a loop of voltage sources or inductors?)") +
+                         " (a loop of voltage sources, inductors or 0-ohm resistors?)") +
               (details.empty() ? "" : "\n" + details);
   if (!converged && !osdiFatal_.empty()) details = "OSDI model error: " + osdiFatal_;
   else if (!converged && !osdiNonFinite_.empty()) details = "OSDI model error: " + osdiNonFinite_ + (details.empty() ? "" : "\n" + details);
@@ -730,7 +644,12 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   // The step after a corner uses backward Euler (SPICE: order 1 after a
   // breakpoint): trapezoidal rings +-dv across a derivative jump (an L driven
   // by a ramp that stops) and LTE rejection then shrinks h until it gives up.
-  double h = step, t = 0.0;
+  // Step size as ngspice dctran: never above min(tstep, tstop/50), first step
+  // min(tstep, tstop/100)/100, then doubling under LTE rejection. Starting at tstep
+  // sampled a 100 MHz sine only at its zeros and stepped an LC tank one period at a
+  // time; LTE has no history to reject the first steps (QA3 BUG-6).
+  const double hMax = std::min(step, stop / 50.0);
+  double h = std::min(step, stop / 100.0) / 100.0, t = 0.0;
   bool landedOnCorner = false;
   int tinySteps = 0;
   while (stop - t > endTol) {
@@ -770,7 +689,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
     if (!onPoint(s)) return "Cancelled.";
-    h = std::min(step, taken * 2.0);
+    h = std::min(hMax, taken * 2.0);
   }
   return "";
 }

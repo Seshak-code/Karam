@@ -1,0 +1,7 @@
+* qa3: .dc of a current source into a diode + zener-ish BV stack (both polarities)
+.model dd d (is=1e-14 bv=6 ibv=1e-3)
+I1 0 1 DC 0
+D1 1 0 dd
+R1 1 0 1meg
+.dc I1 -5m 5m 0.5m
+.end
