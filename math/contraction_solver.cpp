@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -501,8 +502,14 @@ void solveWithFactors(const ContractionPlan& plan, const std::vector<FrontFactor
 
 }  // namespace
 
+struct ContractionCache::Impl {
+    const ContractionPlan* plan = nullptr;
+    std::vector<FrontFactor> F;
+    std::vector<std::vector<double>> in;  // per front: the A values it assembled last time
+};
+
 SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
-                              const ContractionPlan& plan, int refineSteps) {
+                              const ContractionPlan& plan, int refineSteps, ContractionCache* cache) {
     SolverResult res;
     res.iterations = 1;
     const int n = A.rows;
@@ -520,15 +527,37 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
     //  - fronts without a boundary (roots) have only fully-summed rows, so every
     //    column finds a pivot there.
     const int nf = (int)plan.fronts.size();
-    std::vector<FrontFactor> F(nf);
+    std::vector<FrontFactor> local;
+    bool warm = false;  // the cache holds factors of this plan
+    if (cache) {
+        if (!cache->impl) cache->impl = std::make_shared<ContractionCache::Impl>();
+        auto& c = *cache->impl;
+        warm = c.plan == &plan && (int)c.F.size() == nf;
+        if (!warm) { c.plan = &plan; c.F.assign(nf, {}); c.in.assign(nf, {}); }
+    } else local.resize(nf);
+    std::vector<FrontFactor>& F = cache ? cache->impl->F : local;
+    std::vector<char> reused(nf, 0);
     bool singular = false;
     double smallestPivot = std::numeric_limits<double>::infinity();
     for (const auto& level : plan.levels) {
         parallelFor((int)level.size(), levelWork(plan, level, true), [&](int li) {
             const int id = level[li];
             const auto& fr = plan.fronts[id];
+            if (cache) {  // dirty flag: inputs and every child unchanged -> keep the factor
+                auto& in = cache->impl->in[id];
+                bool same = warm && in.size() == fr.assembleK.size();
+                for (int c : fr.children) same = same && reused[c];
+                for (size_t t = 0; same && t < in.size(); ++t)
+                    same = std::memcmp(&in[t], &A.values[fr.assembleK[t]], sizeof(double)) == 0;
+                if (same) { reused[id] = 1; return; }
+                in.resize(fr.assembleK.size());
+                for (size_t t = 0; t < in.size(); ++t) in[t] = A.values[fr.assembleK[t]];
+            }
             layoutFront(plan, id, F);
             auto& ff = F[id];
+            ff.e = 0;  // a cached factor object carries the last solve's state
+            ff.singular = false;
+            ff.minPivot = std::numeric_limits<double>::infinity();
             const int m = ff.m, p = (int)fr.pivots.size(), d = ff.full - p;
             auto& M = ff.M;
             M.assign((size_t)m * m, 0.0);
@@ -601,6 +630,10 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
         if (singular) break;
     }
     res.smallestPivot = smallestPivot;
+    if (cache) {
+        for (char r : reused) (r ? cache->reused : cache->refactored)++;
+        if (singular) cache->impl.reset();  // never reuse a failed factorization
+    }
     if (singular) {
         res.converged = false;
         res.rankDeficient = true;

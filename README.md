@@ -148,7 +148,7 @@ waveform corners, all running through one transient loop shared by the API and t
 | Source stepping | ✅ done |
 | **Solver benchmark against KLU** on the SuiteSparse circuit matrices. KLU's authors found multifrontal methods ineffective on tiny-front transistor netlists, so TreeSPICE must win there too, not only on resistor grids | ✅ measured 2026-10-13 (`bench/results-2026-10-13.md`): 3–1,900× slower than KLU on transistor-level matrices, from ordering fill. Gap accepted on the condition that GPU acceleration (Phase 4) proves to close it |
 | **Condition-number survey** of real MNA matrices, with and without gmin and scaling. This decides whether low-precision factors are viable | ✅ measured 2026-10-15 (`bench/cond-2026-10-15.md`): 9 of 17 SuiteSparse circuit matrices have equilibrated κ ≤ 2.5e6 (FP32 fronts + FP64 refinement viable); 8 reach 7.7e8–1.9e12 (need GMRES-based refinement or FP64 fronts); gmin does not matter |
-| Per-front dirty flags with exact reuse of an unchanged subtree's Schur complement (CPU prototype) | Open integration |
+| Per-front dirty flags with exact reuse of an unchanged subtree's Schur complement (CPU prototype) | ✅ done (`ContractionCache`): bit-identical to refactoring; one changed entry refactors 6 of 177 fronts. A grid + logic transient gains only 13 %: LTE changes h, and h enters every capacitor stamp (Phase 4: per-subtree multirate) |
 
 **Gate:** standard-cell delay and power within 1 % of ngspice on a real PDK. DC converges on
 every case that ngspice converges on. Factorization time within 2× of KLU on the SuiteSparse

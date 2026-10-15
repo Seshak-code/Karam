@@ -423,10 +423,13 @@ public:
   // Default linear solver: tensor-contraction plan, rebuilt only when the
   // Jacobian's sparsity pattern (circuit topology) changes.
   std::unique_ptr<ContractionPlan> contractionPlan_;
+  ContractionCache contractionCache_;  // unchanged subtrees keep their factors between solves
   SolverResult solveLinear(const Csr_matrix& A, const std::vector<double>& b) {
-    if (!contractionPlan_ || !contractionPlan_->matches(A))
+    if (!contractionPlan_ || !contractionPlan_->matches(A)) {
       contractionPlan_ = std::make_unique<ContractionPlan>(planContraction(A));
-    return solveContraction(A, b, *contractionPlan_);
+      contractionCache_ = {};  // factors belong to the old plan
+    }
+    return solveContraction(A, b, *contractionPlan_, 2, &contractionCache_);
   }
 
   // Converged solution of the prior solve (seeder history, dV/dt)

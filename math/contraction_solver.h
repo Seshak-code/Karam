@@ -2,6 +2,7 @@
 
 #include "linalg.h"
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 /**
@@ -56,7 +57,20 @@ struct ContractionPlan {
 /** Build the contraction tree for a CSR sparsity pattern (pattern is symmetrised). */
 ContractionPlan planContraction(const Csr_matrix& A, int leafSize = 64);
 
+/** Factors kept between solves of one plan (per-front dirty flags): a front whose
+ *  assembled entries are bitwise equal to the previous solve's, and whose children
+ *  were all reused, keeps its factor and update tensor. Exact reuse: the same
+ *  inputs through the same arithmetic, so results are bit-identical to refactoring.
+ *  A linear subtree (a power grid, constant-step capacitor companions) factors once. */
+struct ContractionCache {
+    struct Impl;
+    std::shared_ptr<Impl> impl;
+    size_t reused = 0, refactored = 0;  // fronts, cumulative
+};
+
 /** Factor + solve A x = b along `plan` (A must match plan's pattern), with
- *  up to `refineSteps` iterative-refinement passes against A. */
+ *  up to `refineSteps` iterative-refinement passes against A. `cache`: reuse
+ *  unchanged subtrees from the previous solve of the same plan. */
 SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
-                              const ContractionPlan& plan, int refineSteps = 2);
+                              const ContractionPlan& plan, int refineSteps = 2,
+                              ContractionCache* cache = nullptr);

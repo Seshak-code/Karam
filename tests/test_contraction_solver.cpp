@@ -132,6 +132,24 @@ int main() {
                     e[{i + pass * g1.rows, g1.col_indices[k] + pass * g1.rows}] = g1.values[k];
         compareDense("disconnected components", toCsr(2 * g1.rows, e));
     }
+    {   // per-front dirty flags: after one changed entry, the cached solve reuses the
+        // untouched subtrees and is bit-identical to a full refactorization
+        auto A = circuit(1500, 3);
+        auto plan = planContraction(A);
+        ContractionCache cache;
+        auto b = rhsFor(A.rows, 3);
+        solveContraction(A, b, plan, 2, &cache);
+        const size_t first = cache.refactored;
+        A.values[A.row_pointer[7]] *= 1.5;  // one entry changes
+        auto cached = solveContraction(A, b, plan, 2, &cache);
+        auto fresh = solveContraction(A, b, plan, 2);
+        const size_t reused = cache.reused, again = cache.refactored - first;
+        check(cached.converged && cached.solution == fresh.solution && reused > 0 && again < first,
+              "dirty flags: bit-identical to a refactorization; fronts refactored after one change", (double)again);
+        auto same = solveContraction(A, b, plan, 2, &cache);  // nothing changed: every front reused
+        check(same.solution == fresh.solution && cache.refactored == first + again,
+              "dirty flags: an unchanged matrix refactors no front", (double)(cache.refactored - first - again));
+    }
     {
         std::map<std::pair<int, int>, double> e{{{0, 0}, 2.0}};
         auto A = toCsr(1, e); auto plan = planContraction(A);
