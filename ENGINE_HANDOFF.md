@@ -102,6 +102,22 @@ then the two Roadmap sections it points to. Everything below was verified by run
   built with `OPENVAF_DIR=... tests/build_osdi.sh` into git-ignored `datasets/osdi` (the harness SKIPs without
   them). Open: `.param` arithmetic expressions and subckt `params:` (PDK libraries need both); OSDI models
   with state/`$limit`.
+- **Update 2026-10-15 (Claude Code, Phase 3 close-out, branch `phase3/pdk`):** PR #7 merged (owner). This
+  stretch: ngspice parameter front end (`netlist/numparam`: .param expressions, parameterized subcircuits,
+  .if, per-instance local models), real PDKs (IHP SG13G2 through its PSP103 OSDI; sky130 native BSIM4
+  level-54 cards bridged to the OSDI BSIM4 with binning and `.option scale`), the Phase 3 gate
+  (`tests/char_cells.py`: IHP inv/nand2/nor2/xor2/dfrbp and sky130 inv/nand2/nor2 within 0.09 % of
+  ngspice on every delay, slew and supply energy), transient OP when DC is singular (ngspice 47), DC
+  sweep continuation, no residual damping in Newton, the condition-number survey
+  (`bench/cond-2026-10-15.md`) and per-front dirty flags (`ContractionCache`). Bugs found on the way, all
+  pre-existing: VSS/GROUND were ground (every cell with a VSS port was wrong), the scheduler audited
+  same-shaped subcircuits with the first one's values. QA rounds 2 and 3 ran as Sonnet agents in
+  `TreeSPICE-qa` (reports on `qa/phase3-round2` / `qa/phase3-round3`). PDK files are in git-ignored
+  `datasets/pdk/{ihp,sky130}` (owner-approved sparse downloads; sky130 only nfet_01v8, pfet_01v8,
+  pfet_01v8_hvt cells, hence `tests/ngspice_diff/netlists/lib/sky130_tt_min.lib`). Per-folder `flow.md`
+  and the app's `context.md` are deleted: build code context with graphify (`graphify query ...`).
+  **Next:** Phase 4 (GPU). Precision plan from the survey: FP32 fronts + FP64 refinement for about half of
+  real circuit matrices, GMRES-based refinement or FP64 fronts for the rest.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).
