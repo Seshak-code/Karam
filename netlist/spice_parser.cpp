@@ -121,8 +121,11 @@ double SPICEParser::instanceArea(const std::vector<std::string>& tok, size_t fro
 
 int SPICEParser::nodeIndex(const std::string& name) {
     std::string upper = toUpper(name);
-    if (upper == "0" || upper == "GND" || upper == "VSS" || upper == "GROUND")
-        return 0;  // ground is global, also inside subcircuit bodies
+    // Ground is "0" or "GND", as in ngspice, and global (also inside subcircuit
+    // bodies). VSS/GROUND used to be ground too: a cell's VSS port became global
+    // ground instead of a port, which shifted every later local node of the cell.
+    if (upper == "0" || upper == "GND")
+        return 0;
 
     // Inside a .subckt body node names are local to that definition
     auto& map  = inSubckt_ ? subcktNodeMap_ : nodeMap_;
@@ -165,6 +168,8 @@ std::vector<std::pair<int, std::string>> SPICEParser::preprocessLines(
         // Strip trailing whitespace
         while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
             line.pop_back();
+        // and leading whitespace (PDK files indent their "+" continuation lines)
+        line.erase(0, line.find_first_not_of(" \t"));
 
         if (line.empty()) continue;
 

@@ -10,7 +10,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 ENGINE = next((p for p in (os.path.join(ROOT, "build", "acutesim_engine_dump"),
                            os.path.join(ROOT, "..", "build", "acutesim_engine", "acutesim_engine_dump"))
                if os.access(p, os.X_OK)), os.path.join(ROOT, "build", "acutesim_engine_dump"))
-GROUND = {"0", "GND", "VSS", "GROUND"}
+GROUND = {"0", "GND"}  # ngspice: vss / ground are ordinary nodes
 NODE_POS = {**{c: [1, 2] for c in "RCLVIDHF"}, **{c: [1, 2, 3, 4] for c in "MEGT"},
             "Q": [1, 2, 3], "J": [1, 2, 3], "K": []}
 SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12, "f": 1e-15}
@@ -54,7 +54,6 @@ def node_map(text):
     """Engine column order: first appearance in top-level element cards (name -> 1-based column)."""
     m, in_sub = {}, False
     models = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".model")}
-    subckts = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".subckt")}
     for line in cards(text):
         t = toks(line)
         if t[0][0] == ".":
@@ -65,8 +64,10 @@ def node_map(text):
         if in_sub: continue
         c = t[0][0].upper()
         pos = range(1, len(t) - 1) if c == "X" else NODE_POS.get(c, [])
-        if c == "X":  # X<name> <nodes...> <subckt> [params]: nodes precede the subcircuit name
-            pos = range(1, next((k for k in range(len(t) - 1, 0, -1) if t[k].upper() in subckts), len(t) - 1))
+        if c == "X":  # X<name> <nodes...> <subckt> [params:] [k=v ...]: the words before the parameters
+            w = re.sub(r"\s*=\s*", "=", line).split()
+            w = w[:next((k for k, x in enumerate(w) if "=" in x or x.upper() == "PARAMS:"), len(w))]
+            pos = range(1, len(w) - 1)
         if c == "N":  # N<name> <terminals...> <model> [params]: terminals precede the first model name
             pos = range(1, next((k for k in range(1, len(t)) if t[k].upper() in models), 1))
         # Q c b e [s] model ...: the 4th field is a substrate node when the 5th is a name (engine rule)
@@ -281,6 +282,8 @@ def main():
     atexit.register(shutil.rmtree, args.tmp, True)
     if os.path.isdir(os.path.join(HERE, "netlists", "lib")):  # .include/.lib targets, beside the temp netlists
         shutil.copytree(os.path.join(HERE, "netlists", "lib"), os.path.join(args.tmp, "lib"))
+    pdk = os.path.join(ROOT, "datasets", "pdk")  # downloaded PDKs (git-ignored), as pdk/<name>/...
+    if os.path.isdir(pdk): os.symlink(pdk, os.path.join(args.tmp, "pdk"))
     fails = 0
     for path in sorted(glob.glob(os.path.join(HERE, "netlists", "*.cir"))):
         name = os.path.basename(path)
@@ -290,8 +293,9 @@ def main():
         if an[0] == "unsupported":
             print(f"{'SKIPPED':<19} {name} ({an[1]})"); continue
         missing = [l for l in osdi_libs(text) if not os.path.exists(os.path.join(OSDI_DIR, l))]
+        missing += sorted({p for p in re.findall(r"\bpdk/[\w.-]+", text) if not os.path.exists(os.path.join(ROOT, "datasets", p))})
         if missing:
-            print(f"{'SKIPPED':<19} {name} (no {', '.join(missing)} in datasets/osdi: run tests/build_osdi.sh)"); continue
+            print(f"{'SKIPPED':<19} {name} (missing {', '.join(missing)}: datasets/osdi from tests/build_osdi.sh, datasets/pdk see ENGINE_HANDOFF)"); continue
         nm = node_map(text) if an[0] != "noise" else {}
         try: ref = run_ngspice(args, text, an, list(nm))
         except (RuntimeError, subprocess.TimeoutExpired) as e:

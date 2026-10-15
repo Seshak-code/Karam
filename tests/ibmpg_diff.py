@@ -12,7 +12,7 @@ import argparse, bz2, glob, os, re, resource, subprocess, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests", "ngspice_diff"))
 import run_diff as rd  # noqa: E402  (shared engine-path default)
-GROUND = {"0", "GND", "VSS", "GROUND"}
+GROUND = {"0", "GND"}  # ngspice: vss / ground are ordinary nodes
 
 def node_order(netlist):
     """Engine node numbering: first appearance in R/V/I cards (the benchmarks contain only those)."""

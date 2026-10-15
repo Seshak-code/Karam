@@ -1,0 +1,10 @@
+* IHP SG13G2: lv NMOS with its source above the bulk (stacked-device bias), PSP103 via OSDI
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOSlv.lib mos_tt
+VDD 1 0 DC 1.2
+VG 2 0 DC 1.2
+VS 4 0 DC 0
+RD 1 3 10k
+XN 3 2 4 0 sg13_lv_nmos w=1u l=0.13u
+.dc VS 0 0.6 0.05
+.end
