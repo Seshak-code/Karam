@@ -1,0 +1,9 @@
+* qa3: .options scale with MOS1: W L AD AS PD PS scaled; junction caps in tran
+.options scale=1u
+.model nm nmos (level=1 vto=0.5 kp=100u cj=1e-4 cjsw=1e-10 pb=0.8 mj=0.5 mjsw=0.33 cgso=1e-10 cgdo=1e-10 tox=5n)
+VDD 1 0 DC 2
+VIN 2 0 PULSE(0 2 1n 0.5n 0.5n 4n 10n)
+RL 1 3 10k
+M1 3 2 0 0 nm W=10 L=1 AD=30 AS=30 PD=16 PS=16
+.tran 0.05n 15n
+.end

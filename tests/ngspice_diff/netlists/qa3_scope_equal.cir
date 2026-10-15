@@ -1,0 +1,15 @@
+* qa3: equal parameter sets spelled differently + same subckt with different sets, tran (shared specialization)
+.param a = 2
+.subckt rc in out params: r=1k c=1p
+R1 in out {r}
+C1 out 0 {c}
+.ends
+V1 1 0 PULSE(0 1 0 100p 100p 5n 10n)
+X1 1 2 rc
+X2 1 3 rc r=1k c=1p
+X3 1 4 rc r={500*a} c={a/2*1p}
+X4 1 5 rc r=2k
+X5 1 6 rc r={a*1k} c=1p
+X6 1 7 rc c=2p
+.tran 0.1n 20n
+.end

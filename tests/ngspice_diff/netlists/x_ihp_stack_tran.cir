@@ -1,0 +1,11 @@
+* IHP SG13G2: two lv NMOS in series, transient (internal stack node charging)
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOSlv.lib mos_tt
+VDD 1 0 DC 1.2
+VG 2 0 PULSE(0 1.2 100p 40p 40p 400p 1n)
+RD 1 3 10k
+XN0 3 2 4 0 sg13_lv_nmos w=740n l=130n
+XN1 4 2 0 0 sg13_lv_nmos w=740n l=130n
+CL 3 0 5f
+.tran 0.5p 1n
+.end

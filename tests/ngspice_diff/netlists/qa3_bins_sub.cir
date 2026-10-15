@@ -1,0 +1,18 @@
+* qa3: binned BSIM4 family inside a subckt, vth depends on params, param-dependent geometry crossing bins
+.subckt cell d g s params: w=2u l=0.5u vt0=0.1
+.model nb.0 nmos (level=54 version=4.5 tnom=26.83 vth0={0.3+vt0} toxe=4n toxm=4n lmin=0.1u lmax=1u wmin=1u wmax=5u)
+.model nb.1 nmos (level=54 version=4.5 tnom=26.83 vth0={0.35+vt0} toxe=4n toxm=4n lmin=0.1u lmax=1u wmin=5u wmax=20u)
+M1 d g s s nb W={w} L={l}
+.ends
+V1 1 0 DC 2
+VG 2 0 DC 1.2
+X1 1a 2 0 cell
+X2 1b 2 0 cell w=8u
+X3 1c 2 0 cell w=8u vt0=0.3
+X4 1d 2 0 cell w={4u+1u}
+R1 1 1a 2k
+R2 1 1b 2k
+R3 1 1c 2k
+R4 1 1d 2k
+.op
+.end

@@ -1,0 +1,9 @@
+* qa3 BUG: W=4.9999u is within ~1e-3 of WMIN of the next bin: ngspice selects nb.1 (wmin=5u), engine nb.0 (wmax=5u exclusive)
+.model nb.0 nmos (level=54 version=4.5 vth0=0.40 toxe=4n toxm=4n lmin=1u lmax=10u wmin=1u wmax=5u)
+.model nb.1 nmos (level=54 version=4.5 vth0=0.55 toxe=4n toxm=4n lmin=1u lmax=10u wmin=5u wmax=20u)
+V1 1 0 DC 2
+VG 2 0 DC 0.7
+M1 3 2 0 0 nb W=4.9999u L=2u
+R1 1 3 10k
+.op
+.end

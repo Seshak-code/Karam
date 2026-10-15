@@ -1,0 +1,8 @@
+* .end inside an included file must end only that file
+V1 1 0 DC 2
+R1 1 2 1k
+R2 2 0 3k
+.include lib/qa2_end.inc
+R7 1 2 2k
+.op
+.end

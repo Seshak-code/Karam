@@ -1,0 +1,10 @@
+* nand2 cell dc
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOSlv.lib mos_tt
+.include pdk/ihp/ihp-sg13g2/libs.ref/sg13g2_stdcell/spice/sg13g2_stdcell.spice
+VDD vdd 0 DC 1.2
+VA a 0 DC 0
+VB b 0 DC 1.2
+X1 y a b vdd 0 sg13g2_nand2_1
+.dc VA 0 1.2 0.1
+.end

@@ -1,0 +1,38 @@
+* qa3: nested .if/.elseif/.else, at top level and in subckts, with params
+.param mode = 2
+.param flag = 1
+.if (mode == 1)
+R1 1 2 1k
+.elseif (mode == 2)
+ .if (flag)
+R1 1 2 2k
+ .else
+R1 1 2 3k
+ .endif
+.else
+R1 1 2 4k
+.endif
+.subckt blk a b params: sel=0 lev=1
+.if (sel == 0)
+R1 a b 100
+.elseif (sel == 1 && lev > 0)
+ .if (lev > 5)
+R1 a b 200
+ .elseif (lev > 2)
+R1 a b 300
+ .else
+R1 a b 400
+ .endif
+.else
+R1 a b 500
+.endif
+.ends
+V1 1 0 DC 3
+X1 2 3 blk
+X2 3 4 blk sel=1
+X3 4 5 blk sel=1 lev=3
+X4 5 6 blk sel=1 lev=9
+X5 6 7 blk sel=2
+R9 7 0 1k
+.op
+.end

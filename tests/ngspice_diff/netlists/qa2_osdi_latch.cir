@@ -1,0 +1,13 @@
+* bsim4 SRAM-like cross-coupled inverter latch with bitline write
+.osdi bsim4.osdi
+VDD 1 0 DC 1.2
+NP1 a b 1 1 pch
+NN1 a b 0 0 nch
+NP2 b a 1 1 pch
+NN2 b a 0 0 nch
+VW w 0 DC 1.2
+NA a w 0 0 nch
+.model nch bsim4va type=1 w=1u l=100n
+.model pch bsim4va type=-1 w=2u l=100n
+.op
+.end

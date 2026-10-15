@@ -1,0 +1,12 @@
+* bsim4 inverter + cap, uic with .ic
+.osdi bsim4.osdi
+VDD 1 0 DC 1.2
+VIN 2 0 DC 0
+NP 3 2 1 1 pch
+NN 3 2 0 0 nch
+C3 3 0 10f
+.ic v(3)=0.2
+.model nch bsim4va type=1 w=1u l=100n
+.model pch bsim4va type=-1 w=2u l=100n
+.tran 5p 0.5n uic
+.end

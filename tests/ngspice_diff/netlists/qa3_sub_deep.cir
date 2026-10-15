@@ -1,0 +1,26 @@
+* qa3: 4-level nesting, parameters passed down, body .param overridden from X, same subckt different/equal sets
+.param base = 1k
+.subckt L4 a b params: r=1k f=1
+.param extra = 2
+R1 a b {r*f*extra}
+.ends
+.subckt L3 a b params: rr=2k
+X1 a m L4 r={rr} f=1
+X2 m b L4 r={rr/2} f=2 extra=3
+.ends
+.subckt L2 a b params: s=1 rr=3k
+.param loc = {s*2}
+X1 a m L3 rr={rr*loc}
+X2 m b L3
+.ends
+.subckt L1 a b params: s=1
+X1 a m L2 s={s} rr={base}
+X2 m b L2 s={s+1}
+.ends
+V1 1 0 DC 5
+XA 1 2 L1
+XB 2 3 L1 s=3
+XC 3 4 L1
+R9 4 0 1k
+.op
+.end

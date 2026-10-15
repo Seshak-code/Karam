@@ -1,0 +1,17 @@
+* qa3: X param named like a global; callee default refers to caller global; param shadowing
+.param w = 10
+.param k = 4
+.subckt s1 a b params: w=3 z={w*2}
+R1 a b {w*z}
+.ends
+.subckt s2 a b params: p={k}
+X1 a b s1 w=p
+.ends
+V1 1 0 DC 1
+X1 1 2 s1
+X2 2 3 s1 w=1
+X3 3 4 s2
+X4 4 5 s2 p=7
+R5 5 0 1
+.op
+.end

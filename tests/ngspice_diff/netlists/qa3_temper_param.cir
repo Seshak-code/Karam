@@ -1,0 +1,7 @@
+* qa3: ngspice's built-in temper (circuit temperature, C) in .param expressions (IHP HBT/RES models)
+.param tt = {temper*2}
+V1 1 0 DC 1
+R1 1 2 {tt}
+R2 2 0 1k
+.op
+.end

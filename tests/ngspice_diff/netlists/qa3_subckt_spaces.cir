@@ -1,0 +1,22 @@
+* qa3: X and .subckt params with spaces around =, expressions with spaces, params: keyword variants
+.param g = 2
+.subckt s a b params: r = 1k  c = {g * 1p}
+R1 a b { r * g }
+C1 b 0 {c}
+.ends
+.subckt t a b PARAMS: r=3k q = 2
+R1 a b {r*q}
+.ends
+V1 1 0 PULSE(0 1 1n 1n 1n 20n 50n)
+X1 1 2 s
+X2 1 3 s r = 2k c = { 3 * 1p }
+X3 1 4 s r={(g+1)*1k}
+X4 1 5 t
+X5 1 6 t q=1 r=1k
+R5 2 0 10k
+R6 3 0 10k
+R7 4 0 10k
+R8 5 0 10k
+R9 6 0 10k
+.tran 0.5n 40n
+.end

@@ -1,0 +1,8 @@
+* same section names in different files; .endl with and without name; case-insensitive section/file
+V1 1 0 DC 2
+.lib 'lib/qa2_s2.lib' FF
+.lib "lib/qa2_s3.lib" Tt
+R1 1 2 {rv}
+R2 2 0 {rw}
+.op
+.end

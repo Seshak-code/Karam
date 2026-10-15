@@ -1,0 +1,11 @@
+* qa3: 3-stage BJT cascade (Darlington triple) driven hard from 15 V
+.model npn1 npn (is=1e-16 bf=150 br=2 vaf=100 ikf=0.1 rb=100)
+V1 1 0 DC 15
+RB 1 2 10
+Q1 3 2 4 npn1
+Q2 3 4 5 npn1
+Q3 3 5 6 npn1
+RE 6 0 1
+RC 1 3 5
+.op
+.end

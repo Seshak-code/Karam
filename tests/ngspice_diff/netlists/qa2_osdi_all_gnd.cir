@@ -1,0 +1,9 @@
+* bsim4 all-but-drain grounded, gate hi via resistor
+.osdi bsim4.osdi
+VDD 1 0 DC 1.2
+R1 1 3 1k
+R2 1 4 1k
+N1 3 4 0 0 nch
+.model nch bsim4va type=1 w=1u l=100n
+.op
+.end

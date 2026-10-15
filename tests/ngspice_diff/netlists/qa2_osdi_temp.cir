@@ -1,0 +1,10 @@
+* temp option: bsim4 at 100C
+.options temp=100
+.osdi bsim4.osdi
+VDD 1 0 DC 1.2
+VG 2 0 DC 0.6
+R1 1 3 5k
+N1 3 2 0 0 nch
+.model nch bsim4va type=1 w=1u l=100n
+.op
+.end

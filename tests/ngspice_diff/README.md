@@ -10,13 +10,14 @@ Prerequisites: `brew install ngspice`; `cmake --build build --target acutesim_en
 
 The analysis comes from the netlist's own `.op` / `.dc` / `.tran` card. `.dc` (one V/I source) runs natively
 in the engine (one row per sweep point). For ngspice the analysis/print cards are
-dropped and a `.control` block runs the analysis and `wrdata`s the nodes. Options set on the ngspice side:
-`temp=tnom=26.83` (engine hardcodes Vt = 25.85 mV) and, for `.tran`, `tmax = tstep/10` so the reference is
+dropped and a `.control` block runs the analysis and `wrdata`s the nodes. Both run at 27 C; on the ngspice
+side, for `.tran`, `tmax = tstep/10` so the reference is
 dense (engine samples are compared against it by linear interpolation; PULSE edges still follow `tstep`).
 
-Tolerances (see comment in `run_diff.py`; flags `--dc-atol --dc-rtol --tran-atol --tran-rtol --temp`):
+Tolerances (see comment in `run_diff.py`; flags `--dc-atol --dc-rtol --tran-atol --tran-rtol`):
 DC |err| <= 200 uV + 0.1 % of the reference (1 mOhm Norton sources/shorts give ~I*1 mOhm; 0.1 % is ngspice RELTOL).
-Transient |err| <= max(5 mV, 2 % of the node's swing in the reference waveform).
+Transient |err| <= max(5 mV, 2 % of the node's swing in the reference waveform), against the reference anywhere
+within +-tstep/10 of the sample's time (timing tolerance: a steep edge otherwise demands sub-ps agreement).
 
 Adding a circuit: drop a `.cir` with one analysis card in `netlists/`. Hierarchical cases use `.subckt`; only
 top-level nodes are compared. Netlists whose floating nodes are set only by gmin (e.g. `aac_10_bridge`) are

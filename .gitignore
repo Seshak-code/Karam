@@ -1,3 +1,6 @@
 build*/
 datasets/
 __pycache__/
+
+# graphify code graph (rebuild: graphify extract . --code-only; graphify update . after edits)
+graphify-out/

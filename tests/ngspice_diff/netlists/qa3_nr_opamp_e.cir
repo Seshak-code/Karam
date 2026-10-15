@@ -1,0 +1,12 @@
+* qa3: E-source op-amp (gain 1e6) with diode clamps in feedback, inverting amp with large input
+.model dd d (is=1e-14)
+VIN 1 0 DC 3
+R1 1 2 1k
+RF 2 3 10k
+E1 3 0 0 2 1e6
+D1 3 4 dd
+D2 4 3 dd
+R4 4 0 100k
+RL 3 0 1k
+.op
+.end

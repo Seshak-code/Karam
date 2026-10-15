@@ -12,18 +12,15 @@ namespace PhysicsConstants {
 // THERMAL & FUNDAMENTAL
 // =============================================================================
 
-/** Thermal voltage at 300K (room temperature): kT/q */
-constexpr double V_THERMAL_300K = 0.02585; // Volts
 
 /** Boltzmann constant */
 constexpr double K_BOLTZMANN = 1.380649e-23; // J/K
 
 /** Electron charge */
 constexpr double Q_ELECTRON = 1.602176634e-19; // Coulombs
-/** Temperature at which V_THERMAL_300K is kT/q (299.98 K). Built-in devices use that
- *  fixed Vt; OSDI devices get ambient - 300.15 K + this so the two agree.
- *  ponytail: the fixed Vt vs ambient_temp_K mismatch is a known issue (handoff §6). */
-constexpr double T_DEVICE_NOMINAL_K = V_THERMAL_300K * Q_ELECTRON / K_BOLTZMANN;
+/** Thermal voltage kT/q at the nominal 27 C (300.15 K), as ngspice: 25.865 mV.
+ *  Built-in devices scale it by T / 300.15; OSDI devices get the temperature itself. */
+constexpr double V_THERMAL_NOM = K_BOLTZMANN * 300.15 / Q_ELECTRON;
 
 // =============================================================================
 // DEVICE DEFAULTS (Silicon)
@@ -50,15 +47,6 @@ constexpr double IS_DEFAULT_SCHOTTKY = 200e-9; // Amperes
 // =============================================================================
 // SOLVER HEURISTICS
 // =============================================================================
-
-/** Diode forward voltage seed for initial guess */
-constexpr double V_DIODE_SEED = 0.6; // Volts
-
-/** BJT Vbe seed for initial guess */
-constexpr double V_BE_SEED = 0.7; // Volts
-
-/** Default supply voltage assumption (if none found) */
-constexpr double V_SUPPLY_DEFAULT = 5.0; // Volts
 
 /** Voltage source internal resistance (Norton equivalent) */
 constexpr double R_VSOURCE_INTERNAL = 1e-3; // Ohms

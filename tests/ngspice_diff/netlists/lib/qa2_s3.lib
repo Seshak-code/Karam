@@ -1,0 +1,6 @@
+.lib tt
+.param rw=3k
+.endl tt
+.lib ff
+.param rw=4k
+.endl ff

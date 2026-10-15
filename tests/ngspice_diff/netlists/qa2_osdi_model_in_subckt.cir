@@ -1,0 +1,14 @@
+* .model card inside the .subckt for OSDI device
+.osdi bsim4.osdi
+.subckt inv in out vdd
+.model nch2 bsim4va type=1 w=1u l=100n
+.model pch2 bsim4va type=-1 w=2u l=100n
+NP out in vdd vdd pch2
+NN out in 0 0 nch2
+.ends
+VDD 1 0 DC 1.2
+VIN 2 0 DC 0.4
+X1 2 3 1 inv
+X2 3 4 1 inv
+.op
+.end

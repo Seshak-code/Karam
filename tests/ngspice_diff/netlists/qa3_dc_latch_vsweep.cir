@@ -1,0 +1,12 @@
+* qa3: latch with a series-resistor-forced node swept from 0 to VDD and back through the switching point (two sweeps joined)
+.model nm nmos (level=1 vto=0.5 kp=200u lambda=0.02)
+.model pm pmos (level=1 vto=-0.5 kp=100u lambda=0.02)
+VDD 1 0 DC 1.8
+MN1 qb q 0 0 nm W=2u L=1u
+MP1 qb q 1 1 pm W=4u L=1u
+MN2 q qb 0 0 nm W=2u L=1u
+MP2 q qb 1 1 pm W=4u L=1u
+VF 5 0 DC 0
+RF 5 q 20k
+.dc VF 0 1.8 0.05
+.end

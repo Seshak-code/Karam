@@ -49,12 +49,14 @@ public:
     uint32_t terminals() const { return connected_; }
     uint32_t numLocal() const { return numLocal_; }          // terminals + internal nodes
     uint32_t numInternal() const { return numLocal_ - connected_; }
+    bool isFlow(uint32_t k) const { return flow_[k]; }  // local unknown k is a branch current
 
     // Evaluate at local node voltages v[0..numLocal). Afterwards f/q are the
     // resistive/reactive residuals (current / charge out of each local node into
     // the device) and G/C their Jacobians (row-major numLocal x numLocal).
     // Returns false if the model reports a fatal error.
     bool evaluate(const double *v, uint32_t analysisFlags, double abstime);
+    const std::string &error() const { return error_; }  // the model's message after a fatal evaluate()
     const std::vector<double> &f() const { return f_; }
     const std::vector<double> &q() const { return q_; }
     double G(uint32_t r, uint32_t c) const { return G_[(r + 1) * (numLocal_ + 1) + c + 1]; }
@@ -75,7 +77,10 @@ private:
     std::string name_;
     void *data_ = nullptr;
     uint32_t connected_ = 0, numLocal_ = 0;
+    double mult_ = 1.0;  // instance m (simulator multiplier) when the module has no m of its own
+    std::string error_;
     std::vector<int> local_;  // descriptor node -> local index, -1 = ground
+    std::vector<bool> flow_;
     std::vector<double> solve_, f_, q_, fBuf_, qBuf_, G_, C_, noiseBuf_;
 };
 

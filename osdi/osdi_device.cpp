@@ -40,9 +40,13 @@ std::map<std::string, void *> &libraries() {
     return m;
 }
 
+// The last error the models logged (their $error / $fatal text), for Instance::error().
+thread_local std::string lastError;
+
 extern "C" void treespiceOsdiLog(void *handle, char *msg, uint32_t lvl) {
     static const char *names[] = {"debug", "display", "info", "warning", "error", "fatal"};
     const uint32_t l = lvl & LOG_LVL_MASK;
+    if (l >= LOG_LVL_ERR) lastError = msg ? msg : "";
     std::fprintf(stderr, "[OSDI %s] %s: %s\n", handle ? (const char *)handle : "?", l <= 5 ? names[l] : "log",
                  msg ? msg : "");
 }
@@ -140,8 +144,8 @@ Model::Model(const Descriptor *desc, const std::string &cardName, const std::map
     : d(desc), data(std::calloc(1, std::max<uint32_t>(desc->model_size, 1))), name(cardName) {
     for (const auto &[k, v] : params) {
         const std::string key = lower(k);
-        if (key == "level" || key == "version") continue;  // SPICE card bookkeeping, not model parameters
         const uint32_t id = findParam(d, k);
+        if (key == "level" || (key == "version" && id == NONE)) continue;  // SPICE card bookkeeping
         if (id == NONE) throw std::runtime_error("model " + name + ": parameter " + k + " is not a " + d->name + " parameter");
         writeParam(d, nullptr, data, id, v, 0, "model " + name);
     }
@@ -162,6 +166,11 @@ Instance::Instance(std::shared_ptr<Model> model, const std::string &name,
     data_ = std::calloc(1, std::max<uint32_t>(d->instance_size, 1));
     for (const auto &[k, v] : params) {
         const uint32_t id = findParam(d, k);
+        if (id == NONE && lower(k) == "m") {  // the simulator's device multiplier, as in ngspice
+            if (!(v > 0.0)) throw std::runtime_error(name + ": m must be > 0");
+            mult_ = v;
+            continue;
+        }
         if (id == NONE || (d->param_opvar[id].flags & PARA_KIND_MASK) != PARA_KIND_INST)
             throw std::runtime_error(name + ": " + k + " is not an instance parameter of " + d->name);
         writeParam(d, data_, model_->data, id, v, ACCESS_FLAG_INSTANCE, name);
@@ -198,6 +207,9 @@ Instance::Instance(std::shared_ptr<Model> model, const std::string &name,
     local_.assign(N, -1);
     for (uint32_t i = 0; i < N; ++i)
         if (map[i] != NONE) { local_[i] = (int)map[i]; numLocal_ = std::max(numLocal_, map[i] + 1); }
+    flow_.assign(numLocal_, false);  // unknowns that are branch currents (V(a,b) <+ ... branches)
+    for (uint32_t i = 0; i < N; ++i)
+        if (local_[i] >= 0 && d->nodes[i].is_flow) flow_[local_[i]] = true;
 
     // OSDI-facing numbering: slot 0 = ground, local node k = slot k + 1. The
     // Jacobian pointers address dense (numLocal+1)^2 buffers in that numbering.
@@ -242,8 +254,15 @@ bool Instance::evaluate(const double *v, uint32_t analysisFlags, double abstime)
     d->load_residual_react(data_, model_->data, qBuf_.data());
     d->load_jacobian_resist(data_, model_->data);
     d->load_jacobian_react(data_, model_->data, 1.0);
+    if (mult_ != 1.0) {  // m parallel devices: every current, charge and derivative scales
+        for (auto &x : fBuf_) x *= mult_;
+        for (auto &x : qBuf_) x *= mult_;
+        for (auto &x : G_) x *= mult_;
+        for (auto &x : C_) x *= mult_;
+    }
     for (uint32_t k = 0; k < numLocal_; ++k) { f_[k] = fBuf_[k + 1]; q_[k] = qBuf_[k + 1]; }
-    return !(ret & EVAL_RET_FLAG_FATAL);
+    if (ret & EVAL_RET_FLAG_FATAL) { error_ = lastError.empty() ? "fatal model error" : lastError; return false; }
+    return true;
 }
 
 std::vector<Instance::NoiseGen> Instance::noise(double freq) {
@@ -256,7 +275,7 @@ std::vector<Instance::NoiseGen> Instance::noise(double freq) {
         const NodePair &np = d->noise_sources[s].nodes;
         const int a = np.node_1 == NONE ? -1 : local_[np.node_1];
         const int b = np.node_2 == NONE ? -1 : local_[np.node_2];
-        if (a != b) out.push_back({a, b, noiseBuf_[s]});
+        if (a != b) out.push_back({a, b, mult_ * noiseBuf_[s]});
     }
     return out;
 }

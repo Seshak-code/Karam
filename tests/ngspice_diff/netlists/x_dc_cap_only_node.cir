@@ -1,0 +1,8 @@
+* capacitor-only node
+V1 1 0 DC 1
+R1 1 2 1k
+C1 2 3 1p
+C2 3 0 1p
+R2 2 0 1k
+.op
+.end

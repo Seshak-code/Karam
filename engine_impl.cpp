@@ -26,6 +26,7 @@
 #include "engine_api/isimulation_engine.h"
 
 #include <chrono>
+#include <functional>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -162,9 +163,20 @@ static SimulationResponseDTO dcSweep(CircuitSim& sim, TensorNetlist& netlist, co
     }
     const long n = static_cast<long>(std::floor(span + 1e-9));
     r.converged = true;
-    for (long k = 0; k <= n && !cancelled(); ++k) {
-        *value = sw.start + k * sw.step;
+    // A point that does not converge from the previous one is approached in
+    // halves from the last converged value (continuation), down to 1/256 step.
+    std::function<SolverStep(double, double, int)> reach = [&](double from, double to, int depth) {
+        *value = to;
         SolverStep s = sim.solveDC(netlist);
+        if (s.stats.converged || depth == 0) return s;
+        const double mid = 0.5 * (from + to);
+        SolverStep m = reach(from, mid, depth - 1);
+        return m.stats.converged ? reach(mid, to, depth - 1) : m;
+    };
+    for (long k = 0; k <= n && !cancelled(); ++k) {
+        const double target = sw.start + k * sw.step;
+        SolverStep s = reach(target - sw.step, target, k == 0 ? 0 : 8);
+        *value = target;
         if (!s.stats.converged) {
             r.converged   = false;
             r.errorDetail = "DC sweep failed at " + name + "=" + std::to_string(*value) + ": " +

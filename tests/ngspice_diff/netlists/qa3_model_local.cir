@@ -1,0 +1,16 @@
+* qa3: local .model in subckt depending on params; two instances with different params; same model name globally
+.model nloc nmos (vto=0.2 kp=10u)
+.subckt inv in out vcc params: vt=0.5 kpp=100u
+.model nloc nmos (vto={vt} kp={kpp} lambda=0.02)
+RL vcc out 20k
+M1 out in 0 0 nloc W=10u L=1u
+.ends
+V1 1 0 DC 3.3
+VIN 2 0 DC 1.2
+X1 2 3 1 inv
+X2 2 4 1 inv vt=0.9 kpp=50u
+X3 2 5 1 inv vt=0.9 kpp=50u
+M9 6 2 0 0 nloc W=10u L=1u
+R6 1 6 20k
+.op
+.end

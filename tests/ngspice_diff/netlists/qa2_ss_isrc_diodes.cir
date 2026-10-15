@@ -1,0 +1,17 @@
+* source stepping with a current source forcing 20 series diodes (plain newton from 0 struggles)
+.options gminsteps=0
+I1 0 1 DC 10m
+D1 1 2 DM
+D2 2 3 DM
+D3 3 4 DM
+D4 4 5 DM
+D5 5 6 DM
+D6 6 7 DM
+D7 7 8 DM
+D8 8 9 DM
+D9 9 10 DM
+D10 10 0 DM
+R1 1 0 1meg
+.model DM D(IS=1e-16 N=1.0)
+.op
+.end

@@ -9,6 +9,7 @@
 #include <set>
 #include <cassert>
 #include <iostream>
+#include "../physics/physics_constants.h"
 #include "graph_canonical.h"
 
 namespace osdi { class Model; class Instance; }
@@ -451,7 +452,7 @@ struct SimulationEnvironment {
  * Where:
  *   I_S = Saturation current (typ. 1e-14 A)
  *   N   = Emission coefficient (1.0 for ideal, 1.5-2 for real)
- *   V_T = Thermal voltage (kT/q = 25.85 mV @ 300K)
+ *   V_T = Thermal voltage (kT/q = 25.865 mV at 27 C)
  *
  * Newton-Raphson Linearization:
  *   g_eq = dI/dV = (I_S / (N*V_T)) * exp(V_k / (N*V_T))
@@ -465,7 +466,7 @@ struct Diode {
     // these were read as garbage by every parser-created diode (NaN results).
     double saturationCurrent_I_S_A = 1e-14;  // I_S [A]
     double emissionCoefficient_N = 1.0;      // N (dimensionless)
-    double thermalVoltage_V_T_V = 0.02585;   // V_T [V]
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM;   // V_T [V]
 
     // Thermal (Optional, default 300.15K)
     double temperature_K = 300.15;
@@ -506,7 +507,7 @@ struct SchottkyDiode {
     double saturationCurrent_I_S_A = 200e-9;   // Higher than PN (~200nA typ)
     double emissionCoefficient_N = 1.05;       // Closer to ideal
     double seriesResistance_Rs_ohms = 1.0;     // Package/bond wire resistance
-    double thermalVoltage_V_T_V = 0.02585;     // kT/q @ 300K
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM;     // kT/q at 27 C
     
     // Junction Capacitance (AC/Transient)
     double junctionCapacitance_Cj0_F = 2e-12;  // Zero-bias capacitance
@@ -537,7 +538,7 @@ struct ZenerDiode {
     double seriesResistance_Rs_ohms = 7.0; // Rz
     double emissionCoefficient_N = 1.0;
     double saturationCurrent_I_S_A = 1e-14;
-    double thermalVoltage_V_T_V = 0.02585;
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM;
     
     double temperature_K = 300.15;
 };
@@ -566,7 +567,11 @@ struct Mosfet {
         double ps = 0.0; // Perimeter Source
         double nrd = 0.0; // Number of squares Drain
         double nrs = 0.0; // Number of squares Source
+        double sa = 0.0, sb = 0.0, sd = 0.0;  // BSIM4 stress (LOD) distances
     } geo;
+    // The instance parameters exactly as written (scaled, upper-case keys): a BSIM4
+    // device receives only these, so the model's own defaults apply to the rest.
+    std::map<std::string, double> given;
 
     // Advanced Params
     struct Params {
@@ -607,7 +612,7 @@ struct BJT {
     double betaF = 100.0;                         // Forward Beta
     double betaR = 1.0;                         // Reverse Beta
     double saturationCurrent_I_S_A = 1e-14;       // Is [A]
-    double thermalVoltage_V_T_V = 0.02585;          // Vt [V]
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM;          // Vt [V]
 
     // Gummel-Poon .model values beyond IS/BF/BR (ngspice bjt level 1), resolved
     // by the parser with SPICE defaults; area = the instance AREA factor.
@@ -663,7 +668,7 @@ struct JFET {
     double beta = 1e-4;                   // Transconductance parameter [A/V^2]
     double Vto = -2.0;                    // Pinch-off voltage [V] (negative for N-ch)
     double lambda = 0.01;                 // Channel-length modulation [1/V]
-    double thermalVoltage_V_T_V = 0.02585; // For gate-source diode (optional)
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM; // For gate-source diode (optional)
     
     double temperature_K = 300.15;
 };
@@ -920,7 +925,7 @@ struct TensorBlock {
         signalSources.push_back(src);
         updateNodeCount(nPos); updateNodeCount(nNeg);
     }
-    void addDiode(const std::string& name, int anode, int cathode, double Is, double N = 1.0, double Vt = 0.02585) {
+    void addDiode(const std::string& name, int anode, int cathode, double Is, double N = 1.0, double Vt = PhysicsConstants::V_THERMAL_NOM) {
         if (isFrozen) return;
         Diode d;
         d.instanceName = name;
@@ -933,7 +938,7 @@ struct TensorBlock {
         diodes.push_back(d);
         updateNodeCount(anode); updateNodeCount(cathode);
     }
-    void addDiode(int anode, int cathode, double Is, double N = 1.0, double Vt = 0.02585) {
+    void addDiode(int anode, int cathode, double Is, double N = 1.0, double Vt = PhysicsConstants::V_THERMAL_NOM) {
         static int d_count = 0;
         addDiode("D_AUTO_" + std::to_string(++d_count), anode, cathode, Is, N, Vt);
     }
@@ -952,7 +957,7 @@ struct TensorBlock {
     void addBJT(const std::string& name, int C, int B, int E, 
                 const std::string& model, bool isNPN = true,
                 double betaF = 100.0, double betaR = 1.0, 
-                double Is = 1e-14, double Vt = 0.02585) {
+                double Is = 1e-14, double Vt = PhysicsConstants::V_THERMAL_NOM) {
         if (isFrozen) return;
         
         BJT newBjt;
@@ -1356,7 +1361,7 @@ public:
     void addBJT(const std::string& name, int C, int B, int E, 
                 const std::string& model, bool isNPN = true,
                 double betaF = 100.0, double betaR = 1.0, 
-                double Is = 1e-14, double Vt = 0.02585) {
+                double Is = 1e-14, double Vt = PhysicsConstants::V_THERMAL_NOM) {
         globalBlock.addBJT(name, C, B, E, model, isNPN, betaF, betaR, Is, Vt);
         globalState.bjtState.emplace_back();
         numGlobalNodes = std::max({numGlobalNodes, C, B, E});

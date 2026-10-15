@@ -423,10 +423,13 @@ public:
   // Default linear solver: tensor-contraction plan, rebuilt only when the
   // Jacobian's sparsity pattern (circuit topology) changes.
   std::unique_ptr<ContractionPlan> contractionPlan_;
+  ContractionCache contractionCache_;  // unchanged subtrees keep their factors between solves
   SolverResult solveLinear(const Csr_matrix& A, const std::vector<double>& b) {
-    if (!contractionPlan_ || !contractionPlan_->matches(A))
+    if (!contractionPlan_ || !contractionPlan_->matches(A)) {
       contractionPlan_ = std::make_unique<ContractionPlan>(planContraction(A));
-    return solveContraction(A, b, *contractionPlan_);
+      contractionCache_ = {};  // factors belong to the old plan
+    }
+    return solveContraction(A, b, *contractionPlan_, 2, &contractionCache_);
   }
 
   // Converged solution of the prior solve (seeder history, dV/dt)
@@ -670,6 +673,11 @@ public:
   // Independent source value: its waveform in transient, else DC, times the
   // source-stepping factor (1 except while solveDC ramps the sources).
   double srcFact_ = 1.0;
+  // A fatal OSDI model error during the current analysis (the model's own text):
+  // it fails the analysis at once instead of retrying ever smaller steps.
+  mutable std::string osdiFatal_;
+  mutable std::string osdiNonFinite_;
+  double ptranGmin_ = 0.0;  // node-to-ground gmin while solveDC runs its transient OP  // the last non-finite OSDI evaluation: reported if the analysis fails
   template <class S> double sourceValue(const S &s, double dc, double h, double time) const {
     return srcFact_ * (h > 1e-15 ? waveformValue(s, dc, time) : dc);
   }
@@ -718,10 +726,21 @@ public:
     const bool tran = h > 1e-15 && integrator;
     osdi::Instance &in = *r.in;
     if (!in.evaluate(x.data(), tran ? osdi::ANALYSIS_TRAN : osdi::ANALYSIS_DC | osdi::ANALYSIS_STATIC, 0.0)) {
+      osdiFatal_ = r.dev->instanceName + ": " + in.error();  // reported instead of a singular matrix
       std::fill(I.begin(), I.end(), NAN);
       if (J) J->assign(L * L, 0.0);
       return I;
     }
+    for (size_t k = 0; k < L; ++k)
+      if (!std::isfinite(in.f()[k]) || !std::isfinite(in.q()[k])) {
+        // An extreme Newton iterate may do this and the homotopy recovers, so it
+        // only explains a failed analysis (osdiNonFinite_), it does not end one.
+        osdiNonFinite_ = r.dev->instanceName + ": the model returned a non-finite current or charge "
+                                               "(parameters outside its valid range?)";
+        std::fill(I.begin(), I.end(), NAN);
+        if (J) J->assign(L * L, 0.0);
+        return I;
+      }
     const bool trap = tran && integrator->getType() == IntegrationType::TRAPEZOIDAL;
     const double coef = !tran ? 0.0 : trap ? 2.0 / h : 1.0 / h;
     for (size_t k = 0; k < L; ++k) {
@@ -735,6 +754,16 @@ public:
       for (size_t a = 0; a < L; ++a)
         for (size_t b = 0; b < L; ++b) (*J)[a * L + b] = in.G(a, b) + coef * in.C(a, b);
     }
+    // A branch-current unknown (V(a,b) <+ 0 branches, e.g. BSIM4's body network with
+    // rbodymod off, which closes a loop of zero-volt branches) gets 1 uOhm in series,
+    // so roundoff cannot drive a circulating current (1e-12 there gave 1e-4 A).
+    // Internal nodes get nothing, as in ngspice: a floating one (an unconnected bulk)
+    // is set by the model's own junction gmin, which a leak to ground would override.
+    for (size_t k = in.terminals(); k < L; ++k)
+      if (in.isFlow(k)) {
+        I[k] += 1e-6 * x[k];
+        if (J) (*J)[k * L + k] += 1e-6;
+      }
     return I;
   }
 
@@ -1114,11 +1143,6 @@ private:
   // PHASE 1 HARDENING: Helper Methods (Decomposition of solveDC)
   // =========================================================================
 
-  /**
-   * seedInitialGuess - Initialize voltage estimates for Newton-Raphson.
-   * Encapsulates heuristic seeding for Diodes, BJTs, and supply nodes.
-   */
-  void seedInitialGuess(const TensorNetlist& netlist, std::vector<double>& v);
 
 
   /**

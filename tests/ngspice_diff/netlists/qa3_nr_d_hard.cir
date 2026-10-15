@@ -1,0 +1,7 @@
+* qa3: 500 V across a diode + 0.1 ohm
+.model dd d (is=1e-14 n=1 rs=0.05)
+V1 1 0 DC 500
+R1 1 2 0.1
+D1 2 0 dd
+.op
+.end

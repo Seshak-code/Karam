@@ -1,0 +1,15 @@
+* qa3: params in sources, PULSE/SIN args, C IC, spaces in braces and quotes, = with spaces, names clashing with nodes
+.param vhi = 3.3 tr = 1n
+.param tper = {20 * tr}
+.param cval = 1p  rr = 1k
+.param n1 = 5
+VP in 0 PULSE(0 {vhi} {2*tr} {tr} {tr} {5 * tr} 'tper')
+V2 v2 0 SIN({vhi/2} 'vhi/4' 100meg)
+R1 in out { rr * 2 }
+C1 out 0 {cval} IC = { 0.5 }
+R2 out n1 'rr + 100'
+R3 n1 0 n1
+R4 v2 o2 {rr}
+C2 o2 0 {cval/2}
+.tran 0.2n 60n
+.end

@@ -1,0 +1,16 @@
+* qa3: Widlar current source + Brokaw-like core, supply 12 V
+.model npn1 npn (is=1e-16 bf=100 vaf=80)
+.model pnp1 pnp (is=1e-16 bf=50 vaf=50)
+VCC 1 0 DC 12
+R1 1 2 10k
+Q1 2 2 3 npn1
+RE 3 0 5k
+Q2 4 2 5 npn1
+R3 5 0 1k
+Q3 6 6 1 pnp1
+Q4 4 6 1 pnp1
+RL 6 4 1meg
+Q5 7 4 0 npn1
+R7 1 7 20k
+.op
+.end

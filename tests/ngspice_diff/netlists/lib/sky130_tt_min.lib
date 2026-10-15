@@ -1,0 +1,16 @@
+* sky130 tt corner for the devices in datasets/pdk/sky130 (nfet_01v8, pfet_01v8, pfet_01v8_hvt):
+* the same files sky130.lib.spice's tt section includes for them, without the other devices
+.lib tt
+.option scale=1.0u
+.param lv_dlc_rotweak = 0 lvhvt_dlc_rotweak = 0
++ sky130_fd_pr__nfet_01v8__dlc_rotweak = lv_dlc_rotweak
++ sky130_fd_pr__pfet_01v8__dlc_rotweak = lv_dlc_rotweak
++ sky130_fd_pr__pfet_01v8_hvt__dlc_rotweak = lvhvt_dlc_rotweak
+.include "../pdk/sky130/models/parameters/lod.spice"
+.include "../pdk/sky130/cells/nfet_01v8/sky130_fd_pr__nfet_01v8__tt.corner.spice"
+.include "../pdk/sky130/cells/pfet_01v8/sky130_fd_pr__pfet_01v8__tt.corner.spice"
+.include "../pdk/sky130/cells/pfet_01v8_hvt/sky130_fd_pr__pfet_01v8_hvt__tt.corner.spice"
+.include "../pdk/sky130/cells/nfet_01v8/sky130_fd_pr__nfet_01v8__mismatch.corner.spice"
+.include "../pdk/sky130/cells/pfet_01v8/sky130_fd_pr__pfet_01v8__mismatch.corner.spice"
+.include "../pdk/sky130/cells/pfet_01v8_hvt/sky130_fd_pr__pfet_01v8_hvt__mismatch.corner.spice"
+.endl tt

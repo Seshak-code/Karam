@@ -1,0 +1,20 @@
+* bsim4 two-level nested subckt, instance used 2x at different levels
+.osdi bsim4.osdi
+.model nch bsim4va type=1 w=1u l=100n
+.model pch bsim4va type=-1 w=2u l=100n
+.subckt inv in out vdd
+NP out in vdd vdd pch
+NN out in 0 0 nch
+.ends
+.subckt buf in out vdd
+X1 in m vdd inv
+X2 m out vdd inv
+.ends
+VDD 1 0 DC 1.2
+VIN 2 0 PULSE(0 1.2 0.1n 50p 50p 0.6n 1.4n)
+XB1 2 3 1 buf
+XB2 3 4 1 buf
+XI 4 5 1 inv
+CL 5 0 2f
+.tran 5p 1.5n
+.end

@@ -1,0 +1,8 @@
+* qa3: 100 MHz sine into a diode detector, tstep 5n (10/5/2 points per period)
+V1 1 0 SIN(0 2 100meg)
+D1 1 2 dd
+R2 2 0 10k
+C2 2 0 100p
+.model dd d (is=1e-14 cjo=1p)
+.tran 5n 200n
+.end

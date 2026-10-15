@@ -1,0 +1,9 @@
+* qa3: BJT base driven from 100 V via 1 ohm, collector from 50 V via 0.5 ohm, no limits
+.model npn1 npn (is=1e-16 bf=100 vaf=50 rb=1 re=0.1 rc=0.1)
+V1 1 0 DC 100
+R1 1 2 1
+Q1 3 2 0 npn1
+V2 4 0 DC 50
+R2 4 3 0.5
+.op
+.end

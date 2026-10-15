@@ -1,0 +1,8 @@
+* qa3 BUG: 100 MHz sine into a diode detector with .tran step 1u (= 100 periods): engine steps are exactly tstep, every sample is sin(2*pi*k*100)=0, output stays 0 (ngspice: 1.29 V)
+V1 1 0 SIN(0 2 100meg)
+D1 1 2 dd
+R2 2 0 10k
+C2 2 0 100p
+.model dd d (is=1e-14 cjo=1p)
+.tran 1u 20u
+.end

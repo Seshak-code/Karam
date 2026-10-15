@@ -1,0 +1,11 @@
+* bsimcmg inverter tran
+.osdi bsimcmg.osdi
+VDD 1 0 DC 0.8
+VIN 2 0 PULSE(0 0.8 0.1n 20p 20p 0.5n 1n)
+NP 3 2 1 1 pfin
+NN 3 2 0 0 nfin
+C3 3 0 1f
+.model nfin bsimcmg_va type=1
+.model pfin bsimcmg_va type=0
+.tran 5p 2n
+.end

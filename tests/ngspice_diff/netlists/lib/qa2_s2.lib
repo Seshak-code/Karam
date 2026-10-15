@@ -1,0 +1,7 @@
+* two sections; same names exist in qa2_s3.lib
+.lib tt
+.param rv=1k
+.endl
+.lib ff
+.param rv=2k
+.endl

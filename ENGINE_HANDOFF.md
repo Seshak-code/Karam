@@ -102,6 +102,32 @@ then the two Roadmap sections it points to. Everything below was verified by run
   built with `OPENVAF_DIR=... tests/build_osdi.sh` into git-ignored `datasets/osdi` (the harness SKIPs without
   them). Open: `.param` arithmetic expressions and subckt `params:` (PDK libraries need both); OSDI models
   with state/`$limit`.
+- **Update 2026-10-15 (Claude Code, Phase 3 close-out, branch `phase3/pdk`):** PR #7 merged (owner). This
+  stretch: ngspice parameter front end (`netlist/numparam`: .param expressions, parameterized subcircuits,
+  .if, per-instance local models), real PDKs (IHP SG13G2 through its PSP103 OSDI; sky130 native BSIM4
+  level-54 cards bridged to the OSDI BSIM4 with binning and `.option scale`), the Phase 3 gate
+  (`tests/char_cells.py`: IHP inv/nand2/nor2/xor2/dfrbp and sky130 inv/nand2/nor2 within 0.09 % of
+  ngspice on every delay, slew and supply energy), transient OP when DC is singular (ngspice 47), DC
+  sweep continuation, no residual damping in Newton, the condition-number survey
+  (`bench/cond-2026-10-15.md`) and per-front dirty flags (`ContractionCache`). Bugs found on the way, all
+  pre-existing: VSS/GROUND were ground (every cell with a VSS port was wrong), the scheduler audited
+  same-shaped subcircuits with the first one's values. QA rounds 2 and 3 ran as Sonnet agents in
+  `TreeSPICE-qa` (reports on `qa/phase3-round2` / `qa/phase3-round3`). PDK files are in git-ignored
+  `datasets/pdk/{ihp,sky130}` (owner-approved sparse downloads; sky130 only nfet_01v8, pfet_01v8,
+  pfet_01v8_hvt cells, hence `tests/ngspice_diff/netlists/lib/sky130_tt_min.lib`). Per-folder `flow.md`
+  and the app's `context.md` are deleted: build code context with graphify (`graphify query ...`).
+  **Next:** Phase 4 (GPU). Precision plan from the survey: FP32 fronts + FP64 refinement for about half of
+  real circuit matrices, GMRES-based refinement or FP64 fronts for the rest.
+- **Update 2026-10-15 (Claude Code, QA round 3 fixed, branch `phase3/pdk`):** all ten findings of
+  `tests/QA_PHASE3_ROUND3_REPORT.md` are resolved (its "Resolution" section has the detail). The ones that
+  change results everywhere: (1) Vt is kT/q at 300.15 K (was 25.85 mV = 299.98 K) and the ngspice harness
+  runs at 27 C (it ran ngspice at 26.83 C to hide the difference); (2) DC starts from zeros like ngspice (the
+  heuristic seed is deleted: it put latches on their metastable point); (3) transient steps follow ngspice
+  (first step min(tstep, tstop/100)/100, cap min(tstep, tstop/50)); (4) `tests/build_osdi.sh` patches three
+  wrong defaults in Cogenda's `bsim4.va` (wk2, wgamma1, TNOM) — rebuild `datasets/osdi` after pulling;
+  (5) the transient comparison allows a timing tolerance of tstep/10. Binning follows ngspice's probed rule;
+  R `r=`/TC, model capacitors, `temper`, `.params`, `PARAMS:` are supported; `.param` arithmetic matches
+  ngspice; parse errors show the user's names. Verified: see the commit message.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).
@@ -299,16 +325,17 @@ From `Roadmap.md` Phase 2, with pointers:
 - ~~Junction gmin~~ **FIXED 2026-10-12 (Cline):** gmin now sits across each junction
   (device models + SoA kernels, both audits) instead of node-to-ground; the node gmin
   is dropped at convergence. `aac_10_bridge` passes. Details: `ENGINE_HANDOFF.md` §0.
-- Temperature: devices use a fixed Vt = 25.85 mV (≈ 299.98 K) while `ambient_temp_K` defaults to
-  300.15 K (noise uses the latter: 0.03 % vs the harness's 26.83 °C). Derive Vt from the temperature.
+- ~~Temperature~~ **FIXED 2026-10-15:** Vt is kT/q at 300.15 K (`V_THERMAL_NOM`, scaled by T/300.15);
+  OSDI gets the ambient temperature; the harness no longer runs ngspice at 26.83 °C.
 - Session Monte Carlo: `mcSeed` never applied (every run identical) 🚫; the driver path works. `test_headless_orchestrator` has 3
   pre-existing failures (DTO default `success`, two MC result counts) — verified identical at baseline.
 - Hard nonlinear DC: plain-Newton-first costs extra iterations (Darlington 35 → ~115); consider a lower
   iteration cap on the direct attempt.
 - BJT: bias-dependent base resistance (IRB, RBM != RB), excess phase (PTF), flicker noise (KF), temperature
   coefficients away from TNOM: explicit errors or no effect. JFET AREA, EXP/PWL/SFFM/AM, T lines: explicit errors.
-- Subcircuit parameters (`params:`) and `.param` arithmetic expressions unsupported (PDK libraries use
-  both). `.options`: only `gminsteps` is read, the rest ignored; `.print` ignored (output only).
+- `.options`: only `gminsteps` and `scale` are read (`temp`/`tnom` are errors), the rest ignored; `.temp` is an
+  error (the circuit always runs at 27 C); `.print` ignored (output only). `m=` on a subcircuit instance is an
+  error (ngspice scales every device inside). Errors inside `.lib` files carry the `.lib` card's line.
 - Junction-cap shortcut and other simplifications are marked `ponytail:` in code (grep for it).
 - Engine CLI (`acutesim_engine_cli`) parses `.tran 10u` with `istringstream` (no SI suffixes).
 

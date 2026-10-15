@@ -29,27 +29,8 @@ struct DiodeParams
 {
     T Is;  // Saturation Current [A] at Tnom
     T N;   // Emission Coefficient (1.0 for ideal)
-    T Vt;  // Thermal Voltage [V] (kT/q ≈ 25.85mV @ 300K)
+    T Vt;  // Thermal Voltage [V] (kT/q = 25.865 mV at 27 C)
     T Rs;   // Series Parasitic Resistance [Ω]
-    
-    // Thermal Parameters
-    T Tnom; // Nominal Temperature (usually 300.15K)
-    T Temp; // Operating Temperature [K]
-    T Eg;   // Bandgap Energy [eV] (1.11 for Si)
-    T Xti;  // IS temperature exponent (3.0 for pn junction)
-
-    // Calculate Is at operating temperature
-    T Is_effective() const {
-        if (Temp == Tnom) return Is;
-        T ratio = Temp / Tnom;
-        // Eg is in eV, Vt is in V. V = kT/q. Need to be careful with Boltzmann constant units if using raw k.
-        // Simplified relations used in SPICE:
-        // Is(T) = Is * (T/Tnom)^(Xti/N) * exp(...) 
-        // Note: Xti usually 3.0.
-        using std::pow;
-        using std::exp;
-        return Is * pow(ratio, Xti / N) * exp((Eg / (0.02585)) * (1.0 - Tnom/Temp)); // using Vt_nom approx
-    }
 };
 
 /**
@@ -172,7 +153,7 @@ struct Mos1Params {
     P vto = 0.0;        // VTO as on the card (PMOS negative)
     P lambda = 0.0, gamma = 0.0, phi = 0.6;
     P isat = 1e-14;     // bulk junction saturation current, IS * M
-    P vt = PhysicsConstants::V_THERMAL_300K;
+    P vt = PhysicsConstants::V_THERMAL_NOM;
     // Charge storage (mos1_charges), scaled by W, Leff and M like ngspice mos1temp
     bool caps = false;                       // any capacitance below is non-zero
     P cox = 0.0;                             // Meyer: COX * W * Leff * M (0 without TOX)
@@ -316,7 +297,7 @@ inline T spice_junction(T v, P is, P vte)
 // temperature dependence (the engine runs at TNOM).
 template <typename P>
 struct DiodeModel {
-    P is = 1e-14, vte = PhysicsConstants::V_THERMAL_300K;  // IS*AREA, N*Vt
+    P is = 1e-14, vte = PhysicsConstants::V_THERMAL_NOM;  // IS*AREA, N*Vt
     P rs = 0.0;                                            // RS/AREA (series, internal node)
     P cjo = 0.0, vj = 1.0, m = 0.5, fc = 0.5, tt = 0.0;    // CJO*AREA
     bool breakdown = false; P xbv = 0.0;                    // BV adjusted so I(-BV) = IBV (diotemp)
@@ -356,15 +337,15 @@ inline std::pair<T, T> diode_iq(T vd, const DiodeModel<P>& p)
 template <typename P>
 struct BjtModel {
     P type = 1.0;                                  // +1 NPN, -1 PNP
-    P is = 1e-16, bf = 100.0, br = 1.0, vtf = PhysicsConstants::V_THERMAL_300K, vtr = PhysicsConstants::V_THERMAL_300K;  // NF*Vt, NR*Vt
+    P is = 1e-16, bf = 100.0, br = 1.0, vtf = PhysicsConstants::V_THERMAL_NOM, vtr = PhysicsConstants::V_THERMAL_NOM;  // NF*Vt, NR*Vt
     P invVaf = 0.0, invVar = 0.0, oikf = 0.0, oikr = 0.0;     // 1/VAF, 1/VAR, 1/(IKF*AREA), 1/(IKR*AREA)
-    P ise = 0.0, vte = 1.5 * PhysicsConstants::V_THERMAL_300K; // ISE*AREA, NE*Vt
-    P isc = 0.0, vtc = 2.0 * PhysicsConstants::V_THERMAL_300K; // ISC*AREA, NC*Vt
+    P ise = 0.0, vte = 1.5 * PhysicsConstants::V_THERMAL_NOM; // ISE*AREA, NE*Vt
+    P isc = 0.0, vtc = 2.0 * PhysicsConstants::V_THERMAL_NOM; // ISC*AREA, NC*Vt
     P rb = 0.0, rc = 0.0, re = 0.0;                            // per AREA; > 0: internal node
     P cje = 0.0, vje = 0.75, mje = 0.33;                        // *AREA
     P cjcInt = 0.0, cjcExt = 0.0, vjc = 0.75, mjc = 0.33;       // CJC*XCJC*AREA (B'-C'), rest (B-C')
     P cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
-    P iss = 0.0, vts = PhysicsConstants::V_THERMAL_300K;       // substrate junction: ISS*AREA, NS*Vt
+    P iss = 0.0, vts = PhysicsConstants::V_THERMAL_NOM;       // substrate junction: ISS*AREA, NS*Vt
     P tf = 0.0, xtf = 0.0, ovtf = 0.0, xjtf = 0.0, tr = 0.0;   // ovtf = 1/(1.44 VTF), xjtf = ITF*AREA
 };
 

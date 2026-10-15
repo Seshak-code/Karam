@@ -1,0 +1,11 @@
+* .lib call inside a .subckt body, .param declared after use
+.subckt top in out
+.lib 'lib/qa2_sub.lib' cells
+
+.ends
+V1 1 0 DC 3
+X2 1 2 top
+.param ra=2k rb=1k
+R3 2 0 6k
+.op
+.end

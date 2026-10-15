@@ -26,91 +26,6 @@
 static constexpr int COLD_START_SUBSTEPS = 100;
 
 // =============================================================================
-// PHASE 1 HARDENING: Helper Method Implementations
-// =============================================================================
-
-void CircuitSim::seedInitialGuess(const TensorNetlist &netlist,
-                                  std::vector<double> &voltageEstimate) {
-  const size_t N = voltageEstimate.size();
-
-  // Temperature-corrected Vbe seed: at cold temps, Vbe increases (~+2mV/K below
-  // nominal)
-  double T = netlist.environment.ambient_temp_K;
-  double vbe_seed = PhysicsConstants::V_BE_SEED - 0.002 * (T - 300.15);
-  // Clamp to reasonable range [0.5V, 1.2V]
-  vbe_seed = std::max(0.5, std::min(1.2, vbe_seed));
-
-  // 1. Seed from Voltage Sources (direct)
-  for (const auto &source : netlist.globalBlock.voltageSources) {
-    int idx = SafeUtils::safe_idx(source.nodePositive, N, "VSource seed");
-    if (idx >= 0) {
-      voltageEstimate[idx] = source.voltage_V;
-    }
-  }
-
-  // 2. Seed Diode anodes (0.6V initial for silicon)
-  for (const auto &diode : netlist.globalBlock.diodes) {
-    int idx = SafeUtils::safe_idx(diode.anode, N, "Diode seed");
-    if (idx >= 0) {
-      voltageEstimate[idx] =
-          std::max(voltageEstimate[idx], PhysicsConstants::V_DIODE_SEED);
-    }
-  }
-
-  // 3. Find supply voltage for mid-rail seeding
-  double vSupply = PhysicsConstants::V_SUPPLY_DEFAULT;
-  for (const auto &vs : netlist.globalBlock.voltageSources) {
-    if (vs.voltage_V > vSupply)
-      vSupply = vs.voltage_V;
-  }
-
-  // 4. Current Source Node Seeding (BJT base detection)
-  for (const auto &cs : netlist.globalBlock.currentSources) {
-    int nPos = SafeUtils::safe_idx(cs.nodePositive, N, "ISource seed");
-    if (nPos < 0)
-      continue;
-
-    // Check if this node is a BJT base
-    bool isBase = false;
-    for (const auto &bjt : netlist.globalBlock.bjts) {
-      if (SafeUtils::safe_idx(bjt.base, N, "BJT base check") == nPos) {
-        int nE = SafeUtils::safe_idx(bjt.emitter, N, "BJT emitter");
-        double v_e = (nE >= 0) ? voltageEstimate[nE] : 0.0;
-        double vbe = bjt.isNPN ? vbe_seed : -vbe_seed;
-        voltageEstimate[nPos] = std::max(voltageEstimate[nPos], v_e + vbe);
-        isBase = true;
-        break;
-      }
-    }
-    // Default: mid-rail for unconnected current source nodes
-    if (!isBase && voltageEstimate[nPos] == 0.0) {
-      voltageEstimate[nPos] = vSupply * 0.5;
-    }
-  }
-
-  // 5. BJT Multi-Pass Seeding (Darlington propagation), every block
-  auto at = [&](int n) -> double * { return n > 0 && n <= (int)N ? &voltageEstimate[n - 1] : nullptr; };
-  for (int pass = 0; pass < 3; ++pass) {
-    forEachJunction(netlist, [&](const Junction &j) {
-      if (!j.q) return;
-      double *c = at(j.n[0]), *b = at(j.n[1]), *e = at(j.n[2]);
-      const double s = j.q->isNPN ? 1.0 : -1.0;  // PNP: mirrored
-      if (e && b) *b = s * std::max(s * *b, s * (*e + s * vbe_seed));
-      if (c && b) *c = s * std::max(s * *c, s * (*b + s * 0.5));
-    });
-  }
-
-  // 6. Internal nodes (series resistances) start at their external terminal
-  forEachJunction(netlist, [&](const Junction &j) {
-    const int ext[7] = {0, 1, 2, 3, 0, 1, 2}, pairs = j.d ? 1 : 3, first = j.d ? 2 : 4;
-    for (int k = first; k < first + pairs; ++k) {
-      const int x = j.d ? 0 : ext[k];
-      if (j.n[k] != j.n[x]) if (double *a = at(j.n[k])) *a = at(j.n[x]) ? *at(j.n[x]) : 0.0;
-    }
-  });
-}
-
-// =============================================================================
 // MAIN SOLVER METHODS
 // =============================================================================
 
@@ -124,6 +39,8 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // device evaluation + batched front contraction.
 
   struct RestoreSources { double &f; ~RestoreSources() { f = 1.0; } } restoreSources{srcFact_};
+  osdiFatal_.clear();
+  osdiNonFinite_.clear();
 
   // Ensure topology hash is fresh
   netlist.globalBlock.computeTopologyHash();
@@ -135,27 +52,17 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   const int nTot = systemSize(netlist);
   std::vector<double> voltageEstimate(nTot, 0.0);
 
-  // Gap 4: Neural seeder — use dV/dt extrapolation or EMA history if available.
-  // The heuristic seedInitialGuess() always runs on top for supply rails / PN
-  // junctions.
-  if (!prevVoltages_.empty() &&
-      prevVoltages_.size() == voltageEstimate.size()) {
-    // dV/dt extrapolation from last two converged solutions (DC: dt=1.0)
-    auto seed = neuralSeeder_.predict(prevVoltages_, prevVoltages_, 1.0);
-    if (!seed.empty()) {
-      voltageEstimate = std::move(seed);
-    }
-  } else if (neuralSeeder_.hasHistory()) {
-    auto seed = neuralSeeder_.predictSeed(voltageEstimate.size());
-    if (!seed.empty()) {
-      voltageEstimate = std::move(seed);
-    }
-  }
-
-  // Phase 1 Hardening: Use extracted helper for initial guess seeding
-  // Runs on top of neural seed to enforce supply rail / PN junction constraints
-  seedInitialGuess(netlist, voltageEstimate);
-  resetJunctionLimits(netlist);  // first iteration: junctions at vcrit (ngspice MODEINITJCT)
+  // Start: the last converged operating point when there is one (a .dc sweep's
+  // previous point; ngspice continues from it with its junction-limiting state),
+  // else all zeros, as ngspice. A heuristic seed (sources' values on their nodes,
+  // 0.6 V anodes, mid-rail current-source nodes, Vbe ladders) put cross-coupled
+  // latches on their metastable midpoint (QA3 BUG-5; 7 more IHP flip-flops matched
+  // ngspice without it, and nothing needed it).
+  const std::vector<double> coldSeed(nTot, 0.0);
+  const bool warm = !prevVoltages_.empty() && prevVoltages_.size() == voltageEstimate.size();
+  voltageEstimate = warm ? prevVoltages_ : coldSeed;
+  if (warm) syncJunctionLimits(netlist, voltageEstimate);
+  else resetJunctionLimits(netlist);  // first iteration: junctions at vcrit (ngspice MODEINITJCT)
 
   bool converged = false;
   int total_iterations = 0;
@@ -190,8 +97,13 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // independent sources scaled by srcFact_ from 0 up to 1, the increment grown
   // after easy steps, cut tenfold after a failed one (from the last good point).
   bool sourceSteppingUsed = false;
+  // A node with no DC path (a floating gate, a capacitor-only node) leaves the
+  // final gmin = 0 solve singular. ngspice 47 then runs its transient OP: from all
+  // nodes at 0 V and every capacitor uncharged, sources applied, to steady state,
+  // so such a node keeps zero net charge (a capacitive divider decides it).
+  bool finalSingular = false, floatingNodes = false;
   double srcConv = 0.0, srcRaise = 1e-3;
-  const std::vector<double> seededGuess = voltageEstimate;
+  const std::vector<double> &seededGuess = coldSeed;  // gmin stepping restarts cold
   std::vector<double> lastGood;
   for (int si = 0; si < 1000; ++si) {  // ponytail: hard cap; ngspice has none (factor -> 1 ends it)
     bool gmin_converged = false;
@@ -259,6 +171,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         final_kcl_error = 1e9; // Flag as bad residual
         singularMatrixDetected = true;
         singularRow = result.rankDeficientRow;
+        if (finalStep && gminSteppingUsed && !sourceSteppingUsed) finalSingular = true;
         // If singular, retrying with same Jacobian won't help. Abort this GMIN
         // step.
         total_iterations += iteration + 1;
@@ -274,36 +187,16 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       // Check 1 + 2: Voltage Convergence AND Physical KCL Accuracy
       double kcl_error = kclExcess(netlist, v_new, matrix);
 
-      // Limit Cycle Breaker: Damping
-      // If the residual got worse (and is above tolerance), dampen the step to
-      // force a different path. ">=" also fired on 0 >= 0 (both below the
-      // scale-aware floor), halving every step until the update looked
-      // converged: a 555 output node stopped 0.4 V short of its solution.
-      const double dampTol = finalStep ? PhysicsConstants::KCL_TOL : 1.0;
-      if (iteration > 0 && kcl_error > final_kcl_error && kcl_error > dampTol) { // final_kcl_error holds prev_error
-        // Apply damping: v_new = v_old + 0.5 * (v_new - v_old)
-        for (size_t i = 0; i < v_new.size(); ++i) {
-          v_new[i] = voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
-        }
-        // Re-evaluate residual after damping
-        kcl_error = kclExcess(netlist, v_new, matrix);
-
-        // If still bad, dampen again (aggressive backoff)
-        if (kcl_error > final_kcl_error) {
-          for (size_t i = 0; i < v_new.size(); ++i) {
-            v_new[i] =
-                voltageEstimate[i] + 0.5 * (v_new[i] - voltageEstimate[i]);
-          }
-          kcl_error = kclExcess(netlist, v_new, matrix);
-        }
-      }
+      // No residual-based damping (ngspice has none): the residual is measured at
+      // the raw node voltages, where junction exponentials are not limited, so
+      // damping on it fought the device-local junction limiting. Without it a cold
+      // 60-stage RTL chain converges in 37 iterations instead of 131.
       // Record convergence step for diagnostics
       {
         ConvergenceStep cs;
         cs.iteration = iteration;
         cs.residualNorm = kcl_error;
-        cs.dampingFactor =
-            (iteration > 0 && kcl_error >= final_kcl_error) ? 0.5 : 1.0;
+        cs.dampingFactor = 1.0;  // full Newton steps
         cs.linearSolverResidual = result.finalResidual; // Phase 2.9
 
         // Compute max voltage delta
@@ -355,6 +248,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       voltageEstimate = v_new;
     }
 
+    if (!osdiFatal_.empty()) break;  // a fatal model error does not go away with homotopy
     // If we finished the loop without converging, accumulate iterations
     if (!gmin_converged) {
       total_iterations += iteration + 1;
@@ -424,6 +318,21 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     finalStep = gmin_factor == 0.0;
   } // End GMIN stepping loop
 
+  if (!converged && finalSingular) {
+    // ngspice's defaults: 100 ns steps to 10 us (optran ... 100n 10u)
+    srcFact_ = 1.0;  // source stepping may have left the sources scaled down
+    TensorNetlist pseudo = netlist;
+    // ngspice keeps a node gmin during its transient OP: a node with no capacitance
+    // either (an isolated MOS1 gate) would leave even the transient singular.
+    struct GminOn { double &g; ~GminOn() { g = 0.0; } } gminOn{ptranGmin_};
+    ptranGmin_ = PhysicsConstants::JUNCTION_GMIN;
+    if (runTransient(pseudo, 100e-9, 10e-6, /*uic=*/true, [](const SolverStep &) { return true; }).empty()) {
+      voltageEstimate = lastSolution_;
+      voltageEstimate.resize(nTot, 0.0);
+      converged = floatingNodes = true;
+    }
+  }
+
   // Phase 2.9: Final per-node residual for RMS + worst-node tracking
   std::vector<double> perNodeResiduals;
   final_kcl_error =
@@ -480,8 +389,13 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                    ? "Singular matrix: check node " + std::to_string(singularRow + 1) +
                          " (no DC path to ground?)"
                    : "Singular matrix: check branch " + std::to_string(singularRow - netlist.numGlobalNodes + 1) +
-                         " (a loop of voltage sources or inductors?)") +
+                         " (a loop of voltage sources, inductors or 0-ohm resistors?)") +
               (details.empty() ? "" : "\n" + details);
+  if (!converged && !osdiFatal_.empty()) details = "OSDI model error: " + osdiFatal_;
+  else if (!converged && !osdiNonFinite_.empty()) details = "OSDI model error: " + osdiNonFinite_ + (details.empty() ? "" : "\n" + details);
+  if (!converged && details.empty())
+    details = std::string("DC operating point did not converge (Newton") +
+              (gminSteppingUsed ? ", gmin stepping" : "") + (sourceSteppingUsed ? ", source stepping" : "") + " failed)";
   stats.error_detail = details;
   stats.method = "Newton-Raphson";
   stats.integrationMethod = ""; // DC has no integration
@@ -490,7 +404,10 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   stats.failureType = failureType;
   stats.convergenceHistory = std::move(convergenceHistory);
   stats.worstDevices = std::move(worstDevices);
-  stats.convergenceJustification = justification;
+  stats.convergenceJustification = floatingNodes
+      ? std::string("Operating point has nodes without a DC path (singular matrix): taken from a transient "
+                    "from zero to 10 us, as ngspice's transient OP")
+      : justification;
   stats.convergenceTolerance = 1e-6;
   // Phase 2.9: Numerical Intelligence fields
   stats.rmsResidual = rmsResidual;
@@ -677,6 +594,8 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
                                      const std::function<bool(const SolverStep &)> &onPoint) {
   if (step == 0.0) step = stop / 50.0;  // .tran 0 tstop: ngspice's default TMAX
   if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step >= 0 and stop time > 0.";
+  osdiFatal_.clear();
+  osdiNonFinite_.clear();
 
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
@@ -701,6 +620,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     x0 = lastSolution_;
     x0.resize(nTot, 0.0);
   }
+  arbiterInitialized = false;  // this run's cold start (the DC bias may itself have run a transient OP)
   seedReactiveHistory(netlist, x0, uic);
   lastSolution_ = x0;  // seeds the first Newton iteration
 
@@ -724,8 +644,14 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   // The step after a corner uses backward Euler (SPICE: order 1 after a
   // breakpoint): trapezoidal rings +-dv across a derivative jump (an L driven
   // by a ramp that stops) and LTE rejection then shrinks h until it gives up.
-  double h = step, t = 0.0;
+  // Step size as ngspice dctran: never above min(tstep, tstop/50), first step
+  // min(tstep, tstop/100)/100, then doubling under LTE rejection. Starting at tstep
+  // sampled a 100 MHz sine only at its zeros and stepped an LC tank one period at a
+  // time; LTE has no history to reject the first steps (QA3 BUG-6).
+  const double hMax = std::min(step, stop / 50.0);
+  double h = std::min(step, stop / 100.0) / 100.0, t = 0.0;
   bool landedOnCorner = false;
+  int tinySteps = 0;
   while (stop - t > endTol) {
     double hTry = std::min(h, stop - t);
     bool toCorner = false;
@@ -734,6 +660,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     if (landedOnCorner) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
     SolverStep s = stepTransient(netlist, hTry, t);
     if (landedOnCorner) setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
+    if (!osdiFatal_.empty()) return "OSDI model error at t=" + std::to_string(t) + " s: " + osdiFatal_;
     if (!s.stats.converged || !(s.time > t)) {
       h = hTry * 0.25;
       if (h < dtMin) {
@@ -745,6 +672,15 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
       continue;
     }
     const double taken = s.time - t;
+    // Stalled: a run of accepted steps far below the user step (an ill-posed model
+    // that converges only at femtosecond steps) would take millions of them.
+    // ponytail: 1000 consecutive steps below step*1e-4 is a heuristic bound.
+    tinySteps = taken < step * 1e-4 ? tinySteps + 1 : 0;
+    if (tinySteps > 1000) {
+      std::ostringstream msg;
+      msg << "Transient stalled at t=" << t << " s: 1000 steps below " << step * 1e-4 << " s (timestep too small).";
+      return msg.str();
+    }
     if (taken < dtMin) {  // accepted, but LTE control cut it below dtMin: no progress (ngspice: delmin)
       std::ostringstream msg;
       msg << "Transient timestep too small at t=" << t << " s (" << taken << " s < " << dtMin << " s).";
@@ -753,7 +689,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
     if (!onPoint(s)) return "Cancelled.";
-    h = std::min(step, taken * 2.0);
+    h = std::min(hMax, taken * 2.0);
   }
   return "";
 }
@@ -1065,6 +1001,7 @@ bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
       rhsVector.assign(nTot, 0.0);
 
       stampAllElements(netlist, dt_sub, nrEstimate, dt_sub * (k + 1));
+      addDiagonalConditioning(netlist.numGlobalNodes, ptranGmin_);  // 0 except in a transient OP
       // (no node-to-ground gmin in transient: junction GMIN in the device
       // models keeps floating junction nodes referenced, like ngspice)
 
@@ -1206,6 +1143,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
 
         stampAllElements(netlist, actualTimeStep, nrEstimate,
                          currentTime + actualTimeStep);
+        addDiagonalConditioning(netlist.numGlobalNodes, ptranGmin_);  // 0 except in a transient OP
         // (no node-to-ground gmin in transient: junction GMIN in the device
         // models keeps floating junction nodes referenced, like ngspice)
 

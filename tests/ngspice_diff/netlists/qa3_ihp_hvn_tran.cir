@@ -1,0 +1,10 @@
+* qa3: IHP hv inverter tran
+.osdi psp103.osdi
+.lib pdk/ihp/ihp-sg13g2/libs.tech/ngspice/models/cornerMOShv.lib mos_tt
+VDD 1 0 DC 3.3
+VIN 2 0 PULSE(0 3.3 0.1n 0.1n 0.1n 1n 2.5n)
+XP 3 2 1 1 sg13_hv_pmos w=2u l=0.4u
+XN 3 2 0 0 sg13_hv_nmos w=1u l=0.45u
+CL 3 0 20f
+.tran 10p 5n
+.end

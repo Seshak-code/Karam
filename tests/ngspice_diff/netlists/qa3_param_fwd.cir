@@ -1,0 +1,11 @@
+* qa3: forward ref, redefinition (ngspice: last? first?), quote styles, bare name
+.param x = 3
+.param y = {x*2}
+.param x = 5
+.param z = 'y+1'
+V1 1 0 DC 1
+R1 1 2 y
+R2 2 3 {z}
+R3 3 0 'x*1k'
+.op
+.end
