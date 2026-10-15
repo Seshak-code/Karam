@@ -1,12 +1,16 @@
 // klu_bench — one solver on one Matrix Market matrix, as one "key=value ..." line.
 //
-//   klu_bench <matrix.mtx> <tree|klu> [reps]
+//   klu_bench <matrix.mtx> <tree|klu|cond> [reps]
 //
 // tree: TreeSPICE's contraction solver. plan = planContraction (ordering + tree,
 //       once per pattern); fs = factor + solve without refinement (what every
 //       Newton iteration pays); omega after the engine's default 2 refinement steps.
 // klu:  SuiteSparse KLU (BTF + AMD, the circuit-simulation baseline). analyze +
 //       factor once; fs = klu_refactor + klu_solve (KLU's per-iteration cost).
+// cond: KLU's 1-norm condition estimate (klu_condest) of A as given, after two-sided
+//       max-norm equilibration (rows, then columns), and of A + 1e-12 I (gmin): the
+//       Phase 3 survey deciding whether FP32 fronts with FP64 refinement are viable
+//       (classic refinement converges while kappa * 2^-24 stays well below 1).
 // b = A*1. omega = componentwise backward error max_i |b-Ax|_i / (|A||x|+|b|)_i.
 // Timings are the minimum over `reps` repetitions. Run each solver in its own
 // process (bench/klu_bench.py does) so peak RSS is per solver.
@@ -146,6 +150,29 @@ int main(int argc, char** argv) {
         std::printf(" ok=%d analyze=%.6g factor=%.6g fs=%.6g flops=%.6g lu_nnz=%d omega=%.3g",
                     c.status == KLU_OK ? 1 : 0, tAn, tF, tFs, c.flops, N->lnz + N->unz, omega(A, x, b));
         klu_free_numeric(&N, &c); klu_free_symbolic(&S, &c);
+    } else if (solver == "cond") {
+        auto condest = [&](const Triplets& m) {
+            std::vector<int> Ap, Ai; std::vector<double> Ax;
+            compress(m, true, Ap, Ai, Ax);
+            klu_common c; klu_defaults(&c);
+            c.scale = 0;  // the matrix as given: KLU's own row scaling would hide what we measure
+            klu_symbolic* S = klu_analyze(m.n, Ap.data(), Ai.data(), &c);
+            klu_numeric* N = S ? klu_factor(Ap.data(), Ai.data(), Ax.data(), S, &c) : nullptr;
+            double k = INFINITY;
+            if (N && klu_condest(Ap.data(), Ax.data(), S, N, &c)) k = c.condest;
+            if (N) klu_free_numeric(&N, &c);
+            if (S) klu_free_symbolic(&S, &c);
+            return k;
+        };
+        Triplets e = t;  // rows, then columns, scaled to unit max magnitude
+        std::vector<double> r(t.n, 0.0), cs(t.n, 0.0);
+        for (size_t k = 0; k < e.v.size(); ++k) r[e.r[k]] = std::max(r[e.r[k]], std::abs(e.v[k]));
+        for (size_t k = 0; k < e.v.size(); ++k) if (r[e.r[k]] > 0) e.v[k] /= r[e.r[k]];
+        for (size_t k = 0; k < e.v.size(); ++k) cs[e.c[k]] = std::max(cs[e.c[k]], std::abs(e.v[k]));
+        for (size_t k = 0; k < e.v.size(); ++k) if (cs[e.c[k]] > 0) e.v[k] /= cs[e.c[k]];
+        Triplets g = t;
+        for (int i = 0; i < t.n; ++i) { g.r.push_back(i); g.c.push_back(i); g.v.push_back(1e-12); }
+        std::printf(" kappa=%.3g kappa_eq=%.3g kappa_gmin=%.3g", condest(t), condest(e), condest(g));
     } else { std::printf(" error=\"unknown solver\"\n"); return 2; }
     std::printf(" rss_mb=%.0f\n", peakRssMB());
     return 0;
