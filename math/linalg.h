@@ -606,6 +606,8 @@ struct SolverResult {
   bool rankDeficient = false;
   int rankDeficientRow = -1;    // 0-based row of smallest pivot found
   double smallestPivot = 1e300; // Min |pivot| across LU factorization
+  int gpuFronts = 0;            // contraction solver: fronts factored in FP32 on the GPU
+  bool fp64Refactor = false;    // ... whose refinement failed, so the solve was redone in FP64
 };
 
 /*

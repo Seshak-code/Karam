@@ -1,4 +1,5 @@
 #include "contraction_solver.h"
+#include "gpu_front_lu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -508,8 +509,10 @@ struct ContractionCache::Impl {
     std::vector<std::vector<double>> in;  // per front: the A values it assembled last time
 };
 
-SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
-                              const ContractionPlan& plan, int refineSteps, ContractionCache* cache) {
+namespace {
+SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const ContractionPlan& plan,
+                   int refineSteps, ContractionCache* cache, bool gpu) {
+    static const int gpuMin = [] { const char* s = std::getenv("TREESPICE_GPU_FRONT"); return s ? std::atoi(s) : 256; }();
     SolverResult res;
     res.iterations = 1;
     const int n = A.rows;
@@ -536,7 +539,7 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
         if (!warm) { c.plan = &plan; c.F.assign(nf, {}); c.in.assign(nf, {}); }
     } else local.resize(nf);
     std::vector<FrontFactor>& F = cache ? cache->impl->F : local;
-    std::vector<char> reused(nf, 0);
+    std::vector<char> reused(nf, 0), onGpu(nf, 0);
     bool singular = false;
     double smallestPivot = std::numeric_limits<double>::infinity();
     for (const auto& level : plan.levels) {
@@ -575,6 +578,16 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
                         M[(size_t)cp[a] * m + cp[bb]] += cf.M[(size_t)(cf.e + a) * cf.m + (cf.e + bb)];
             }
 
+            ff.sw.resize(ff.full);
+            if (gpu && gpuMin > 0 && m >= gpuMin && gpuFrontLu(M.data(), m, ff.full, kPivotThreshold, ff.sw.data())) {
+                for (int k = 0; k < ff.full; ++k) {
+                    std::swap(ff.rowLab[k], ff.rowLab[ff.sw[k]]);
+                    ff.minPivot = std::min(ff.minPivot, std::abs(M[(size_t)k * m + k]));
+                }
+                ff.e = ff.full;
+                onGpu[id] = 1;
+                return;
+            }
             ff.sw.clear();
             for (int k = 0; k < ff.full; ++k) {
                 // Column search: first column j (from k) whose best fully-summed
@@ -657,12 +670,25 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
         }
         return omega;
     };
+    // FP32 fronts need refinement whatever the caller asked; it converges linearly
+    // (rate ~ kappa * 2^-24), so stop once a step no longer halves the error.
+    constexpr double eps = std::numeric_limits<double>::epsilon();
+    res.gpuFronts = (int)std::count(onGpu.begin(), onGpu.end(), 1);
+    const int steps = res.gpuFronts ? std::max(refineSteps, 10) : refineSteps;
     double omega = residual();
-    for (int s = 0; s < refineSteps && omega > 4.0 * std::numeric_limits<double>::epsilon(); ++s) {
+    for (int s = 0; s < steps && omega > 4.0 * eps; ++s) {
         solveWithFactors(plan, F, r, dx);
         for (int i = 0; i < n; ++i) x[i] += dx[i];
+        const double prev = omega;
         omega = residual();
         res.iterations++;
+        if (res.gpuFronts && !(omega < 0.5 * prev)) break;
+    }
+    if (res.gpuFronts && !(omega <= 64.0 * eps)) {  // FP32 factors too weak here: redo in FP64
+        if (cache) cache->impl.reset();
+        res = solve(A, b, plan, refineSteps, cache, false);
+        res.fp64Refactor = true;
+        return res;
     }
 
     double r2 = 0.0;
@@ -671,4 +697,10 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
     res.finalResidual = std::sqrt(r2);
     res.converged = std::isfinite(res.finalResidual);
     return res;
+}
+}  // namespace
+
+SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
+                              const ContractionPlan& plan, int refineSteps, ContractionCache* cache) {
+    return solve(A, b, plan, refineSteps, cache, true);
 }

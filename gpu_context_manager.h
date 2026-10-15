@@ -61,10 +61,8 @@ public:
     GPUQueue        sharedQueue() const;
 
 #ifdef ACUTESIM_GPU_ENABLED
-    // Raw handle accessors for C-API consumers (e.g. WebGPUSolver).
-    // Caller must NOT release these handles — the Manager owns them.
-    WGPUDevice  rawDevice() const;
-    WGPUQueue   rawQueue()  const;
+    // Runs ready callbacks (CallbackMode::AllowProcessEvents), e.g. buffer maps.
+    void        processEvents();
 #endif
 
     // Called during engine shutdown — release all Dawn resources.
