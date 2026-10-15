@@ -1,7 +1,7 @@
 # TreeSPICE (Tensor Recursive Elimination Engine)
 
 **TREE — Tensor Recursive Elimination Engine.** A SPICE-equivalent circuit simulation engine built
-on a contraction-tree direct solver. (Formerly *Karam*.)
+on a contraction-tree direct solver.
 
 > **Status: in development.** TreeSPICE solves standard SPICE netlists (DC, sweeps, transient,
 > AC, noise) and is checked against ngspice and Xyce on every change. It is not yet a
