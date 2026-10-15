@@ -470,19 +470,31 @@ private:
         Scope sc;
         sc.parent = &global_;
         for (const auto &[k, v] : s.defaults) sc.raw[k] = v;
+        // The body's own .param values are defaults too: an X card overrides them
+        // (ngspice; sky130 declares l, w, ... that way). Overridden values win
+        // because a scope reads val before raw.
+        Scope body;
+        for (const auto &[bn, bl] : s.body) collectParams(bl, body);
+        std::string given;
         for (const auto &[k, v] : pairs(line)) {
-            if (!sc.raw.count(k)) throw std::runtime_error(hw[0] + ": " + s.name + " has no parameter " + k);
+            if (!sc.raw.count(k) && !body.raw.count(k)) throw std::runtime_error(hw[0] + ": " + s.name + " has no parameter " + k);
             sc.raw.erase(k);
             sc.val[k] = caller.evaluate(v);
+            if (body.raw.count(k)) given += " " + k + "=" + num(sc.val[k]);
         }
-        std::string key = s.name;
+        std::string key = s.name + given;
         for (const auto &[k, v] : s.defaults) { double x; sc.lookup(k, x); key += " " + k + "=" + num(x); }
         auto [spec, isNew] = specialized_.emplace(key, s.defaults.empty() ? s.name : s.name + "__" + std::to_string(specialized_.size() + 1));
         if (isNew) {
             for (const auto &[bn, bl] : s.body) collectParams(bl, sc);  // body .params (any order)
             std::map<std::string, std::string> models;
             for (const auto &[bn, bl] : s.body)
-                if (const auto w = words(bl); w.size() > 1 && upper(w[0]) == ".MODEL") models[upper(w[1])] = spec->second + "__" + upper(w[1]);
+                if (const auto w = words(bl); w.size() > 1 && upper(w[0]) == ".MODEL") {
+                    const std::string m = upper(w[1]);
+                    models[m] = spec->second + "__" + m;
+                    if (const size_t dot = m.rfind('.'); dot != std::string::npos)  // binned family NAME.N:
+                        models[m.substr(0, dot)] = spec->second + "__" + m.substr(0, dot);  // devices name NAME
+                }
             std::string hdr = ".subckt " + spec->second;
             for (const auto &p : s.ports) hdr += " " + p;
             Lines body = walk(s.body, sc, spec->second, &models);

@@ -673,6 +673,7 @@ public:
   // A fatal OSDI model error during the current analysis (the model's own text):
   // it fails the analysis at once instead of retrying ever smaller steps.
   mutable std::string osdiFatal_;
+  mutable std::string osdiNonFinite_;  // the last non-finite OSDI evaluation: reported if the analysis fails
   template <class S> double sourceValue(const S &s, double dc, double h, double time) const {
     return srcFact_ * (h > 1e-15 ? waveformValue(s, dc, time) : dc);
   }
@@ -727,9 +728,11 @@ public:
       return I;
     }
     for (size_t k = 0; k < L; ++k)
-      if (!std::isfinite(in.f()[k]) || !std::isfinite(in.q()[k])) {  // parameters outside the model's range
-        osdiFatal_ = r.dev->instanceName + ": the model returned a non-finite current or charge "
-                                           "(parameters outside its valid range?)";
+      if (!std::isfinite(in.f()[k]) || !std::isfinite(in.q()[k])) {
+        // An extreme Newton iterate may do this and the homotopy recovers, so it
+        // only explains a failed analysis (osdiNonFinite_), it does not end one.
+        osdiNonFinite_ = r.dev->instanceName + ": the model returned a non-finite current or charge "
+                                               "(parameters outside its valid range?)";
         std::fill(I.begin(), I.end(), NAN);
         if (J) J->assign(L * L, 0.0);
         return I;
@@ -746,6 +749,16 @@ public:
       J->assign(L * L, 0.0);
       for (size_t a = 0; a < L; ++a)
         for (size_t b = 0; b < L; ++b) (*J)[a * L + b] = in.G(a, b) + coef * in.C(a, b);
+    }
+    // Internal unknowns the model leaves without a DC reference (ngspice's OSDI run
+    // warns "singular matrix" there): an internal node gets JUNCTION_GMIN to ground;
+    // a branch-current unknown (V(a,b) <+ 0 branches, e.g. BSIM4's body network with
+    // rbodymod off, which closes a loop of zero-volt branches) gets 1 uOhm in series,
+    // so roundoff cannot drive a circulating current (1e-12 there gave 1e-4 A).
+    for (size_t k = in.terminals(); k < L; ++k) {
+      const double reg = in.isFlow(k) ? 1e-6 : PhysicsConstants::JUNCTION_GMIN;
+      I[k] += reg * x[k];
+      if (J) (*J)[k * L + k] += reg;
     }
     return I;
   }

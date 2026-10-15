@@ -566,7 +566,11 @@ struct Mosfet {
         double ps = 0.0; // Perimeter Source
         double nrd = 0.0; // Number of squares Drain
         double nrs = 0.0; // Number of squares Source
+        double sa = 0.0, sb = 0.0, sd = 0.0;  // BSIM4 stress (LOD) distances
     } geo;
+    // The instance parameters exactly as written (scaled, upper-case keys): a BSIM4
+    // device receives only these, so the model's own defaults apply to the rest.
+    std::map<std::string, double> given;
 
     // Advanced Params
     struct Params {

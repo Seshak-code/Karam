@@ -10,6 +10,7 @@
 #include "../osdi/osdi_device.h"
 #include "../physics/physics_constants.h"
 #include <sstream>
+#include <iomanip>
 #include <fstream>
 #include <filesystem>
 #include <cctype>
@@ -273,6 +274,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     inductorIndex_.clear();
     modelNames_.clear();
     cardLine_.clear();
+    scale_ = 1.0;
     osdiModels_.clear();
 
     auto lines = preprocessLines(netlistText);
@@ -303,6 +305,12 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             for (size_t i = 1; i < tok.size(); ++i) globals_.insert(toUpper(tok[i]));
         if (!tok.empty() && toUpper(tok[0]) == ".MODEL" && tok.size() > 1)  // N lines need every model name
             modelNames_.insert(toUpper(tok[1]));
+        if (!tok.empty() && (toUpper(tok[0]) == ".OPTION" || toUpper(tok[0]) == ".OPTIONS"))  // before any M card
+            for (size_t i = 1; i + 1 < tok.size(); ++i)
+                if (toUpper(tok[i]) == "SCALE") {
+                    try { scale_ = parseValue(tok[i + 1]); } catch (const std::exception& e) { return fail(lineNum, e.what()); }
+                    if (!(scale_ > 0.0)) return fail(lineNum, ".option scale must be > 0");
+                }
         if (!tok.empty() && toUpper(tok[0]) == ".OSDI") {  // load compiled Verilog-A modules up front
             try {
                 std::string path = line.substr(line.find_first_of(" \t") == std::string::npos ? line.size() : line.find_first_of(" \t"));
@@ -536,31 +544,84 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                                  std::string(*types.begin()) + "/" + *(types.begin() + 1) + " model");
     };
     auto resolveBlock = [&](TensorBlock& blk) {
-        for (auto& m : blk.mosfets)
-            if (const ModelCard* c = kind(card(m.modelName), m.instanceName, {"NMOS", "PMOS"})) {
-                supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
-                              "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC"});
-                bounded(c, {"KP", "LAMBDA", "GAMMA", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO", "CGBO",
-                            "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW"},
-                        {"PHI"});
-                auto& k = m.card;
-                k.resolved = true;
-                k.pmos = c->type == "PMOS";
-                k.tox = c->get("TOX", 0.0);
-                // No KP with TOX: KP = UO[cm^2/Vs] * COX (ngspice mos1temp)
-                k.kp = c->get("KP", k.tox > 0.0 ? c->get("UO", c->get("U0", 600.0)) * 1e-4 * 3.9 * 8.854214871e-12 / k.tox
-                                                : 2e-5);
-                k.vto = c->get("VTO", 0.0); k.lambda = c->get("LAMBDA", 0.0); k.gamma = c->get("GAMMA", 0.0);
-                k.phi = c->get("PHI", 0.6); k.is = c->get("IS", 1e-14); k.ld = c->get("LD", 0.0);
-                k.cgso = c->get("CGSO", 0.0); k.cgdo = c->get("CGDO", 0.0); k.cgbo = c->get("CGBO", 0.0);
-                k.cbd = c->get("CBD", 0.0); k.cbs = c->get("CBS", 0.0); k.cj = c->get("CJ", 0.0);
-                k.cjsw = c->get("CJSW", 0.0); k.mj = c->get("MJ", 0.5); k.mjsw = c->get("MJSW", 0.5);
-                k.pb = c->get("PB", 0.8); k.fc = c->get("FC", 0.5);
-                if (!(m.l - 2.0 * k.ld > 0.0))
-                    throw std::runtime_error(m.instanceName + ": L - 2*LD must be > 0");
-                if (!(k.mj < 1.0 && k.mjsw < 1.0 && k.pb > 0.0 && k.fc < 1.0))
-                    throw std::runtime_error("model " + c->name + ": needs MJ, MJSW < 1, PB > 0, FC < 1");
+        // A MOSFET's card: its own, or the bin of a family NAME.0, NAME.1, ... whose
+        // [LMIN, LMAX) x [WMIN, WMAX) holds the device's L and W (ngspice binning).
+        auto mosCard = [&](const Mosfet& m) -> const ModelCard* {
+            const std::string name = toUpper(m.modelName);
+            if (modelCards_.count(name)) return card(m.modelName);
+            for (auto it = modelCards_.lower_bound(name + "."); it != modelCards_.end() &&
+                 it->first.compare(0, name.size() + 1, name + ".") == 0; ++it) {
+                const ModelCard& c = it->second;
+                if (c.get("LMIN", 0.0) <= m.l && m.l < c.get("LMAX", INFINITY) &&
+                    c.get("WMIN", 0.0) <= m.w && m.w < c.get("WMAX", INFINITY)) return &c;
             }
+            std::ostringstream why;
+            why << m.instanceName << ": no bin of model " << m.modelName << " covers L=" << m.l << " W=" << m.w;
+            throw std::runtime_error(why.str());
+        };
+        // BSIM4 cards (LEVEL=54 or 14, ngspice's native BSIM4) run on the OSDI BSIM4
+        // (bsim4va from OpenVAF, loaded from TREESPICE_OSDI_PATH as bsim4.osdi when
+        // needed). Its geometry parameters are model parameters there, so each card
+        // plus instance geometry is one OSDI model (shared by equal devices).
+        auto bsim4 = [&](const Mosfet& m, const ModelCard& c) {
+            if (!osdi::findModule("bsim4va")) osdi::loadLibrary("bsim4.osdi");
+            std::map<std::string, double> p;
+            for (const auto& [k, v] : c.params)  // binning bounds select the card; LEVEL names it
+                if (k != "LEVEL" && k != "LMIN" && k != "LMAX" && k != "WMIN" && k != "WMAX" && k != "LINTNOI") p[k] = v;
+            // ponytail: LINTNOI (a BSIM4.8 flicker-noise length offset) is unknown to
+            // bsim4va and dropped; only flicker noise is affected.
+            p["TYPE"] = c.type == "PMOS" ? -1.0 : 1.0;
+            std::string key = toUpper(c.name);
+            for (const auto& [k, v] : m.given) {
+                if (k == "NF" && v == 1.0) continue;
+                p[k] = v;
+                std::ostringstream kv;
+                kv << " " << k << "=" << std::setprecision(17) << v;
+                key += kv.str();
+            }
+            auto& model = osdiModels_[key];
+            if (!model) model = std::make_shared<osdi::Model>(osdi::findModule("bsim4va"), c.name, p);
+            OsdiDevice o;
+            o.instanceName = m.instanceName;
+            o.modelName = c.name;
+            o.nodes = {m.drain, m.gate, m.source, m.body};
+            if (m.extra.mult != 1.0) o.params.push_back({"m", m.extra.mult});
+            o.model = model;
+            return o;
+        };
+        std::vector<Mosfet> level1;
+        for (auto& m : blk.mosfets) {
+            const ModelCard* c = kind(mosCard(m), m.instanceName, {"NMOS", "PMOS"});
+            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0) {
+                blk.osdiDevices.push_back(bsim4(m, *c));
+                continue;
+            }
+            if (m.extra.nf != 1) throw std::runtime_error(m.instanceName + ": NF is not supported yet (level 1)");
+            supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
+                          "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC"});
+            bounded(c, {"KP", "LAMBDA", "GAMMA", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO", "CGBO",
+                        "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW"},
+                    {"PHI"});
+            auto& k = m.card;
+            k.resolved = true;
+            k.pmos = c->type == "PMOS";
+            k.tox = c->get("TOX", 0.0);
+            // No KP with TOX: KP = UO[cm^2/Vs] * COX (ngspice mos1temp)
+            k.kp = c->get("KP", k.tox > 0.0 ? c->get("UO", c->get("U0", 600.0)) * 1e-4 * 3.9 * 8.854214871e-12 / k.tox
+                                            : 2e-5);
+            k.vto = c->get("VTO", 0.0); k.lambda = c->get("LAMBDA", 0.0); k.gamma = c->get("GAMMA", 0.0);
+            k.phi = c->get("PHI", 0.6); k.is = c->get("IS", 1e-14); k.ld = c->get("LD", 0.0);
+            k.cgso = c->get("CGSO", 0.0); k.cgdo = c->get("CGDO", 0.0); k.cgbo = c->get("CGBO", 0.0);
+            k.cbd = c->get("CBD", 0.0); k.cbs = c->get("CBS", 0.0); k.cj = c->get("CJ", 0.0);
+            k.cjsw = c->get("CJSW", 0.0); k.mj = c->get("MJ", 0.5); k.mjsw = c->get("MJSW", 0.5);
+            k.pb = c->get("PB", 0.8); k.fc = c->get("FC", 0.5);
+            if (!(m.l - 2.0 * k.ld > 0.0))
+                throw std::runtime_error(m.instanceName + ": L - 2*LD must be > 0");
+            if (!(k.mj < 1.0 && k.mjsw < 1.0 && k.pb > 0.0 && k.fc < 1.0))
+                throw std::runtime_error("model " + c->name + ": needs MJ, MJSW < 1, PB > 0, FC < 1");
+            level1.push_back(m);
+        }
+        blk.mosfets = std::move(level1);
         // first(c, {"A", "B"}, def): the first alias the card gives (SPICE spellings vary)
         auto first = [](const ModelCard* c, std::initializer_list<const char*> keys, double def) {
             for (const char* k : keys) if (c->params.count(k)) return c->params.at(k);
@@ -623,6 +684,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                                          "0 <= XCJC <= 1, NF/NR/BF/BR > 0, RB/RC/RE >= 0");
         }
         for (auto& o : blk.osdiDevices) {
+            if (o.model) continue;  // a BSIM4 card, bridged above
             const ModelCard* c = card(o.modelName);
             const osdi::Descriptor* d = osdi::findModule(c->type);
             if (!d) throw std::runtime_error("model " + c->name + ": type " + c->type +
@@ -671,8 +733,13 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         result_.modelsCreated++;
     }
 
-    // Initialize global state
+    // Initialize global state; instance states again (resolving moved BSIM4 cards
+    // from the MOSFET list to the OSDI list after the instances were placed)
     result_.netlist.globalState.initialize(result_.netlist.globalBlock);
+    for (size_t k = 0; k < result_.netlist.instances.size() && k < result_.netlist.instanceStates.size(); ++k)
+        if (auto it = result_.netlist.blockDefinitions.find(result_.netlist.instances[k].blockName);
+            it != result_.netlist.blockDefinitions.end())
+            result_.netlist.instanceStates[k].initialize(it->second);
     try {  // OSDI instances: parameters, setup_instance, node collapsing
         result_.netlist.instantiateOsdi(result_.netlist.environment.ambient_temp_K - 300.15 +
                                         PhysicsConstants::T_DEVICE_NOMINAL_K);
@@ -873,29 +940,41 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.source = nodeIndex(tok[3]);
     m.body   = nodeIndex(tok[4]);
     m.modelName = tok[5];
-    if (!modelNames_.count(toUpper(tok[5])))
+    const std::string mu = toUpper(tok[5]);  // a .model card, or a binned family NAME.0, NAME.1, ...
+    const auto bin = modelNames_.lower_bound(mu + ".");
+    if (!modelNames_.count(mu) && (bin == modelNames_.end() || bin->compare(0, mu.size() + 1, mu + ".") != 0))
         throw std::runtime_error(tok[0] + ": expected 4 nodes (d g s b), then a model name; '" + tok[5] +
                                  "' is not a .model card");
-    m.w = m.l = 100e-6;  // SPICE DEFW / DEFL
+    m.w = m.l = 100e-6;  // SPICE DEFW / DEFL (not scaled)
 
     // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS act through CJ/CJSW;
-    // NRD/NRS only through RSH, which the model check rejects.
+    // NRD/NRS only through RSH, which the model check rejects. SA/SB/SD and NF
+    // reach BSIM4 (level 54); level 1 rejects NF != 1 when its card is resolved.
+    // .option scale multiplies the lengths (areas by scale^2), as in ngspice.
     for (size_t i = 6; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (upper == "OFF") throw std::runtime_error(tok[0] + ": OFF is not supported yet");
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
-        if (upper == "W")        m.w = parseValue(tok[++i]);
-        else if (upper == "L")   m.l = parseValue(tok[++i]);
-        else if (upper == "AD")  m.geo.ad = parseValue(tok[++i]);
-        else if (upper == "AS")  m.geo.as = parseValue(tok[++i]);
-        else if (upper == "PD")  m.geo.pd = parseValue(tok[++i]);
-        else if (upper == "PS")  m.geo.ps = parseValue(tok[++i]);
+        const double s = scale_;
+        if (upper == "W")        m.w = parseValue(tok[++i]) * s;
+        else if (upper == "L")   m.l = parseValue(tok[++i]) * s;
+        else if (upper == "AD")  m.geo.ad = parseValue(tok[++i]) * s * s;
+        else if (upper == "AS")  m.geo.as = parseValue(tok[++i]) * s * s;
+        else if (upper == "PD")  m.geo.pd = parseValue(tok[++i]) * s;
+        else if (upper == "PS")  m.geo.ps = parseValue(tok[++i]) * s;
         else if (upper == "NRD") m.geo.nrd = parseValue(tok[++i]);
         else if (upper == "NRS") m.geo.nrs = parseValue(tok[++i]);
-        else if (upper == "NF") {
-            if (parseValue(tok[++i]) != 1.0) throw std::runtime_error(tok[0] + ": NF is not supported yet");
+        else if (upper == "SA")  m.geo.sa = parseValue(tok[++i]) * s;
+        else if (upper == "SB")  m.geo.sb = parseValue(tok[++i]) * s;
+        else if (upper == "SD")  m.geo.sd = parseValue(tok[++i]) * s;
+        else if (upper == "NF")  m.extra.nf = (int)std::lround(parseValue(tok[++i]));
+        else if (upper == "M" || upper == "MULT") m.extra.mult = parseValue(tok[++i]);
+        if (i < tok.size() && upper != "M" && upper != "MULT") {  // the value just read, as stored
+            const std::map<std::string, double> v = {{"W", m.w}, {"L", m.l}, {"AD", m.geo.ad}, {"AS", m.geo.as},
+                {"PD", m.geo.pd}, {"PS", m.geo.ps}, {"NRD", m.geo.nrd}, {"NRS", m.geo.nrs}, {"SA", m.geo.sa},
+                {"SB", m.geo.sb}, {"SD", m.geo.sd}, {"NF", (double)m.extra.nf}};
+            if (v.count(upper)) m.given[upper] = v.at(upper);
         }
-        else if (upper == "M")   m.extra.mult = parseValue(tok[++i]);
         else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
     if (!(m.l > 0.0) || !(m.w > 0.0)) throw std::runtime_error(tok[0] + ": W and L must be > 0");

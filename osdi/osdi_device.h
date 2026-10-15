@@ -49,6 +49,7 @@ public:
     uint32_t terminals() const { return connected_; }
     uint32_t numLocal() const { return numLocal_; }          // terminals + internal nodes
     uint32_t numInternal() const { return numLocal_ - connected_; }
+    bool isFlow(uint32_t k) const { return flow_[k]; }  // local unknown k is a branch current
 
     // Evaluate at local node voltages v[0..numLocal). Afterwards f/q are the
     // resistive/reactive residuals (current / charge out of each local node into
@@ -79,6 +80,7 @@ private:
     double mult_ = 1.0;  // instance m (simulator multiplier) when the module has no m of its own
     std::string error_;
     std::vector<int> local_;  // descriptor node -> local index, -1 = ground
+    std::vector<bool> flow_;
     std::vector<double> solve_, f_, q_, fBuf_, qBuf_, G_, C_, noiseBuf_;
 };
 

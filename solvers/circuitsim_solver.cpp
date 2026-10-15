@@ -125,6 +125,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
 
   struct RestoreSources { double &f; ~RestoreSources() { f = 1.0; } } restoreSources{srcFact_};
   osdiFatal_.clear();
+  osdiNonFinite_.clear();
 
   // Ensure topology hash is fresh
   netlist.globalBlock.computeTopologyHash();
@@ -456,6 +457,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
                          " (a loop of voltage sources or inductors?)") +
               (details.empty() ? "" : "\n" + details);
   if (!converged && !osdiFatal_.empty()) details = "OSDI model error: " + osdiFatal_;
+  else if (!converged && !osdiNonFinite_.empty()) details = "OSDI model error: " + osdiNonFinite_ + (details.empty() ? "" : "\n" + details);
   if (!converged && details.empty())
     details = std::string("DC operating point did not converge (Newton") +
               (gminSteppingUsed ? ", gmin stepping" : "") + (sourceSteppingUsed ? ", source stepping" : "") + " failed)";
@@ -655,6 +657,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   if (step == 0.0) step = stop / 50.0;  // .tran 0 tstop: ngspice's default TMAX
   if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step >= 0 and stop time > 0.";
   osdiFatal_.clear();
+  osdiNonFinite_.clear();
 
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);

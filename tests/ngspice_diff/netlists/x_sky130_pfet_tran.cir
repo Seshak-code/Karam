@@ -1,0 +1,10 @@
+* sky130 (real PDK): pfet_01v8_hvt pull-up and nfet_01v8 pull-down (an inverter) driving 10 fF,
+* native BSIM4 cards (binned) on the OSDI BSIM4, transient
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VA 2 0 PULSE(0 1.8 100p 50p 50p 500p 1.2n)
+XP 3 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=1.0
+XN 3 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=0.65
+CL 3 0 10f
+.tran 1p 1.5n
+.end

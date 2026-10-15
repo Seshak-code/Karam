@@ -144,8 +144,8 @@ Model::Model(const Descriptor *desc, const std::string &cardName, const std::map
     : d(desc), data(std::calloc(1, std::max<uint32_t>(desc->model_size, 1))), name(cardName) {
     for (const auto &[k, v] : params) {
         const std::string key = lower(k);
-        if (key == "level" || key == "version") continue;  // SPICE card bookkeeping, not model parameters
         const uint32_t id = findParam(d, k);
+        if (key == "level" || (key == "version" && id == NONE)) continue;  // SPICE card bookkeeping
         if (id == NONE) throw std::runtime_error("model " + name + ": parameter " + k + " is not a " + d->name + " parameter");
         writeParam(d, nullptr, data, id, v, 0, "model " + name);
     }
@@ -207,6 +207,9 @@ Instance::Instance(std::shared_ptr<Model> model, const std::string &name,
     local_.assign(N, -1);
     for (uint32_t i = 0; i < N; ++i)
         if (map[i] != NONE) { local_[i] = (int)map[i]; numLocal_ = std::max(numLocal_, map[i] + 1); }
+    flow_.assign(numLocal_, false);  // unknowns that are branch currents (V(a,b) <+ ... branches)
+    for (uint32_t i = 0; i < N; ++i)
+        if (local_[i] >= 0 && d->nodes[i].is_flow) flow_[local_[i]] = true;
 
     // OSDI-facing numbering: slot 0 = ground, local node k = slot k + 1. The
     // Jacobian pointers address dense (numLocal+1)^2 buffers in that numbering.
