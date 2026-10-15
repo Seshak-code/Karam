@@ -128,6 +128,15 @@ then the two Roadmap sections it points to. Everything below was verified by run
   (5) the transient comparison allows a timing tolerance of tstep/10. Binning follows ngspice's probed rule;
   R `r=`/TC, model capacitors, `temper`, `.params`, `PARAMS:` are supported; `.param` arithmetic matches
   ngspice; parse errors show the user's names. Verified: see the commit message.
+- **Update 2026-10-15 (Claude Code, Phase 4 started, branch `phase4/gpu`):** the old WGSL physics compiler was
+  deleted (invalid shaders). New `math/gpu_front_lu.{h,cpp}`: dense FP32 LU of one contraction front in WGSL on
+  Dawn (pivot / swap / rank-1 update / scale per step, one command buffer per front); fronts of dimension >=
+  `TREESPICE_GPU_FRONT` (env, default 256, 0 = off) go to the GPU until a pivot fails the threshold, the CPU
+  continues from there; FP64 refinement, and an FP64 redo if it stalls (`SolverResult::gpuFronts`,
+  `fp64Refactor`). Standalone: `cmake -DTREESPICE_GPU=ON` fetches Dawn. Result (`bench/gpu-2026-10-15.md`):
+  2-7x on matrices with large fronts, 1e6 grid 3.9 s -> 1.4 s, no FP64 redo on any matrix; but still 48-2150x
+  behind KLU on transistor-level matrices, because the tree does up to 20 000x KLU's flops (ordering).
+  **Owner decision pending:** an AMD-style ordering for non-grid graphs closes the gap; the GPU does not.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).

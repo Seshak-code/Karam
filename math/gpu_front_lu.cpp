@@ -16,7 +16,7 @@ namespace {
 // One elimination step k = four dispatches; P.k arrives through a dynamic
 // uniform offset, so a whole front is one command buffer with no CPU sync.
 // piv[0..m): pivot row of each step; piv[m]: 0, or failing step + 1 (later
-// steps then do nothing and the host falls back to the CPU).
+// steps then do nothing: M is the state after the steps before it).
 const char *kWgsl = R"(
 struct Params { m: u32, k: u32, full: u32, pad: u32, thr: f32, p0: f32, p1: f32, p2: f32 };
 @group(0) @binding(0) var<storage, read_write> M: array<f32>;
@@ -140,16 +140,16 @@ bool readBack(const wgpu::Buffer &b, size_t bytes, void *dst) {
 
 bool gpuFrontLuAvailable() { return GPUContextManager::instance().isAvailable(); }
 
-bool gpuFrontLu(double *M, int m, int full, double threshold, int *sw) {
+int gpuFrontLu(double *M, int m, int full, double threshold, int *sw) {
     auto &gpu = GPUContextManager::instance();
-    if (!gpu.isAvailable() || m <= 0 || full <= 0) return false;
+    if (!gpu.isAvailable() || m <= 0 || full <= 0) return 0;
     const uint64_t bytesM = (uint64_t)m * m * sizeof(float);
-    if (bytesM > (128ull << 20)) return false;  // WebGPU's default storage-binding limit
+    if (bytesM > (128ull << 20)) return 0;  // WebGPU's default storage-binding limit
     static std::mutex serial;  // fronts of one level arrive from several threads
-    std::lock_guard<std::mutex> lock(serial);
+    std::lock_guard<std::mutex> lock(serial);  // (try_lock, CPU meanwhile: meg4 2x better, bcircuit 3x worse)
     wgpu::Device dev = gpu.acquire();
     Kernels &K = kernels(dev);
-    if (!K.ok) return false;
+    if (!K.ok) return 0;
     wgpu::Queue q = dev.GetQueue();
 
     auto buffer = [&](uint64_t size, wgpu::BufferUsage usage) {
@@ -206,17 +206,18 @@ bool gpuFrontLu(double *M, int m, int full, double threshold, int *sw) {
     wgpu::CommandBuffer cmd = enc.Finish();
     q.Submit(1, &cmd);
 
-    if (!readBack(rp, bytesP, piv.data()) || piv[m] != 0) return false;  // a pivot failed: CPU
-    if (!readBack(rm, bytesM, mf.data())) return false;
-    for (float v : mf) if (!std::isfinite(v)) return false;  // FP32 overflow: CPU in FP64
+    if (!readBack(rp, bytesP, piv.data())) return 0;
+    const int done = piv[m] ? piv[m] - 1 : full;  // a pivot failed: the CPU continues from it
+    if (done == 0 || !readBack(rm, bytesM, mf.data())) return 0;
+    for (float v : mf) if (!std::isfinite(v)) return 0;  // FP32 overflow: CPU in FP64
     for (size_t i = 0; i < mf.size(); ++i) M[i] = mf[i];
-    for (int k = 0; k < full; ++k) sw[k] = piv[k];
-    return true;
+    for (int k = 0; k < done; ++k) sw[k] = piv[k];
+    return done;
 }
 
 #else  // no GPU in this build
 
 bool gpuFrontLuAvailable() { return false; }
-bool gpuFrontLu(double *, int, int, double, int *) { return false; }
+int gpuFrontLu(double *, int, int, double, int *) { return 0; }
 
 #endif

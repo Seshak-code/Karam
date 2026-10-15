@@ -578,18 +578,18 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
                         M[(size_t)cp[a] * m + cp[bb]] += cf.M[(size_t)(cf.e + a) * cf.m + (cf.e + bb)];
             }
 
+            // Large fronts: the GPU eliminates in FP32 until a pivot fails the threshold;
+            // the CPU continues from there (column search, delayed pivots) in FP64.
             ff.sw.resize(ff.full);
-            if (gpu && gpuMin > 0 && m >= gpuMin && gpuFrontLu(M.data(), m, ff.full, kPivotThreshold, ff.sw.data())) {
-                for (int k = 0; k < ff.full; ++k) {
-                    std::swap(ff.rowLab[k], ff.rowLab[ff.sw[k]]);
-                    ff.minPivot = std::min(ff.minPivot, std::abs(M[(size_t)k * m + k]));
-                }
-                ff.e = ff.full;
-                onGpu[id] = 1;
-                return;
+            const int k0 = gpu && gpuMin > 0 && m >= gpuMin ? gpuFrontLu(M.data(), m, ff.full, kPivotThreshold, ff.sw.data()) : 0;
+            for (int k = 0; k < k0; ++k) {
+                std::swap(ff.rowLab[k], ff.rowLab[ff.sw[k]]);
+                ff.minPivot = std::min(ff.minPivot, std::abs(M[(size_t)k * m + k]));
             }
-            ff.sw.clear();
-            for (int k = 0; k < ff.full; ++k) {
+            ff.sw.resize(k0);
+            ff.e = k0;
+            onGpu[id] = k0 > 0;
+            for (int k = k0; k < ff.full; ++k) {
                 // Column search: first column j (from k) whose best fully-summed
                 // row passes the threshold against the whole column.
                 int pr = -1, pc = -1;
