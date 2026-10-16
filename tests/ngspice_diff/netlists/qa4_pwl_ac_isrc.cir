@@ -1,0 +1,6 @@
+* qa4: AC analysis with current source PWL
+I1 0 in AC 1m PWL(0 100u 1n 500u 2n 10u)
+R1 in 0 1k
+C1 in 0 100p
+.ac dec 10 1k 100Meg
+.end

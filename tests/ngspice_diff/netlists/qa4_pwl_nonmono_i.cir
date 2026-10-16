@@ -1,0 +1,5 @@
+* qa4: PWL current source with non-monotonic decreasing time points
+I1 0 1 PWL(0 0 2n 1m 1n 0 3n 0)
+R1 1 0 1k
+.tran 0.1n 3n
+.end

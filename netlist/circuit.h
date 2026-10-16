@@ -250,7 +250,9 @@ inline double waveformValue(const Src& s, double dcValue, double t) {
         const auto& T = s.pwl_t;
         if (tt <= T.front()) return s.pwl_v.front();
         if (tt >= T.back()) return s.pwl_v.back();
-        const size_t k = std::upper_bound(T.begin(), T.end(), tt) - T.begin();  // T[k-1] <= tt < T[k]
+        // T[k-1] < tt <= T[k]: at a step (equal times) the instant holds the earlier value, as
+        // ngspice; the later one would put the jump inside the step that lands on the corner
+        const size_t k = std::lower_bound(T.begin(), T.end(), tt) - T.begin();
         return s.pwl_v[k - 1] + (s.pwl_v[k] - s.pwl_v[k - 1]) * (tt - T[k - 1]) / (T[k] - T[k - 1]);
     }
     if (s.type == "PULSE") {
