@@ -73,6 +73,8 @@ constexpr double KCL_TOL = 1e-12; // Amperes
  *  floating-point residuals far above KCL_TOL that no iteration can remove.
  *  At ordinary nodes the allowance is ~1e-13 A, so nothing loosens there. */
 constexpr double KCL_RELTOL = 1e-10;
+// ngspice PIVTOL: a DC solution factored through a pivot at or below it is singular
+constexpr double PIVTOL = 1e-13;
 
 /** Conductance used to short an inductor at DC. Same 1 mOhm as the Norton
  *  voltage-source stamp, so stamps and KCL audits stay consistent.

@@ -551,6 +551,7 @@ struct FrontFactor {
     int m = 0, e = 0, full = 0;  // dim, eliminated count, fully-summed count (p + d)
     bool singular = false;
     double minPivot = std::numeric_limits<double>::infinity();
+    int minPivotRow = -1;  // equation (row of A) of the smallest pivot
 };
 
 // Work estimate for one level: factorization ~ sum dim^2 * pivots, solve ~ sum dim^2
@@ -696,20 +697,9 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
     } else local.resize(nf);
     std::vector<FrontFactor>& F = cache ? cache->impl->F : local;
     std::vector<char> reused(nf, 0), onGpu(nf, 0);
-    // A pivot below kSingularRel x its own entry in A was cancelled down to rounding residue,
-    // not to a value: a floating subnetwork with a current forced into it left ~1e-19 of a
-    // 2e-3 diagonal once the plan split it over fronts, and was solved at 1e15 V (BUG-6).
-    // (A row's largest entry is no scale: a BJT iterate's gm made normal pivots look small.)
-    // ponytail: fixed relative bound; gmin under a 1 S node still passes (1e-12), a gmin node
-    // behind < 0.1 ohm and chains of >~1e4 floating nodes do not.
-    constexpr double kSingularRel = 1e-13;
-    auto entry = [&](int r, int c) {
-        for (int q = A.row_pointer[r]; q < A.row_pointer[r + 1]; ++q)
-            if (A.col_indices[q] == c) return std::abs(A.values[q]);
-        return 0.0;
-    };
     bool singular = false;
     double smallestPivot = std::numeric_limits<double>::infinity();
+    int smallestPivotRow = -1;
     for (const auto& level : plan.levels) {
         parallelFor((int)level.size(), levelWork(plan, level, true), [&](int li) {
             const int id = level[li];
@@ -729,8 +719,15 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
             ff.e = 0;  // a cached factor object carries the last solve's state
             ff.singular = false;
             ff.minPivot = std::numeric_limits<double>::infinity();
+            ff.minPivotRow = -1;
             const int m = ff.m, p = (int)fr.pivots.size(), d = ff.full - p;
             auto& M = ff.M;
+            auto notePivot = [&](int k) {
+                if (const double a = std::abs(M[(size_t)k * m + k]); a < ff.minPivot) {
+                    ff.minPivot = a;
+                    ff.minPivotRow = plan.rowOfVar[ff.rowLab[k]];
+                }
+            };
             // A cached front keeps its buffer between solves; one that grew in an earlier,
             // near-singular iterate (delayed rows) gives the excess back, or every front keeps
             // its worst size for good (14 GB at 4e5 fronts of a 1e5-stage chain)
@@ -756,7 +753,7 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
             const int k0 = gpu && gpuMin > 0 && m >= gpuMin ? gpuFrontLu(M.data(), m, ff.full, kPivotThreshold, ff.sw.data()) : 0;
             for (int k = 0; k < k0; ++k) {
                 std::swap(ff.rowLab[k], ff.rowLab[ff.sw[k]]);
-                ff.minPivot = std::min(ff.minPivot, std::abs(M[(size_t)k * m + k]));
+                notePivot(k);
             }
             ff.sw.resize(k0);
             ff.e = k0;
@@ -802,11 +799,8 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
                 }
                 ff.sw.push_back(pr);
                 const double piv = M[(size_t)k * m + k];
-                ff.minPivot = std::min(ff.minPivot, std::abs(piv));
-                if (!(std::abs(piv) > kSingularRel * entry(plan.rowOfVar[ff.rowLab[k]], ff.colLab[k])) || !std::isfinite(piv)) {
-                    ff.singular = true;
-                    break;
-                }
+                notePivot(k);
+                if (!(std::abs(piv) > 0.0) || !std::isfinite(piv)) { ff.singular = true; break; }
                 const double inv = 1.0 / piv;
                 for (int r = k + 1; r < m; ++r) {
                     double& l = M[(size_t)r * m + k];
@@ -824,11 +818,15 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
             if (plan.fronts[id].parent < 0 && F[id].e < F[id].full) F[id].singular = true;
             if (F[id].singular && res.rankDeficientRow < 0) res.rankDeficientRow = plan.rowOfVar[F[id].rowLab[F[id].e]];
             singular = singular || F[id].singular;
-            smallestPivot = std::min(smallestPivot, F[id].minPivot);
+            if (F[id].minPivot < smallestPivot) {
+                smallestPivot = F[id].minPivot;
+                smallestPivotRow = F[id].minPivotRow;
+            }
         }
         if (singular) break;
     }
     res.smallestPivot = smallestPivot;
+    if (res.rankDeficientRow < 0) res.rankDeficientRow = smallestPivotRow;  // linalg.h: row of the smallest pivot
     if (cache) {
         for (char r : reused) (r ? cache->reused : cache->refactored)++;
         if (singular) cache->impl.reset();  // never reuse a failed factorization

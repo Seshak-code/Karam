@@ -164,11 +164,17 @@ then the two Roadmap sections it points to. Everything below was verified by run
     `netlist/numparam.cpp` (only a parameterless key keeps the plain name).
     Round 2 (`qa/phase4-r2`) found BUG-5: equal PWL times, ngspice's step, were rejected. They are
     now accepted, and the step instant holds the earlier value, as in ngspice. Sonnet's solver QA
-    found two silent wrong answers on singular DC systems:
-    - BUG-6: a pivot cancelled to rounding residue (a current forced into a floating chain split over
-      fronts gave 1e15 V). Pivots below 1e-13 x their own entry in A are now singular.
-    - BUG-7: the transient-OP fallback accepted a capacitor-only node that was still charging. Its
-      result must now satisfy DC KCL to ngspice's reltol/abstol.
+    found two silent wrong answers on singular DC systems; round 3 (Gemini, `qa/phase4-r3`)
+    reopened both, and they ended as:
+    - BUG-6: a DC solution factored through a pivot at or below ngspice's PIVTOL (1e-13) is
+      singular (a current forced into a floating chain, star or grid "converged" at 1e15 V). The
+      check is on the final factorization only: Newton may cross near-singular iterates (a
+      100-stage RTL chain's source-stepping start has 1e-92 pivots). Bounds relative to a
+      pivot's own A entry or row broke gmin stepping (3e10 S diagonal) and BJT iterates.
+    - BUG-7: not a bug. ngspice 47's transient OP also takes the 10 us value as the operating
+      point (1 mA into 1 uF is 0.01 V there too). The real defect was that the KCL audit missed
+      the transient OP's node gmin, so a floating node behind a slow RC (a node at volts) never
+      converged at t = 0.
     Not fixed:
     - "check node N" uses the internal node number, not the netlist name.
     - A 1 pF capacitor-only node still takes 6.5 s (the 10 us transient) before it reports singular.
