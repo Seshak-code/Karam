@@ -71,6 +71,9 @@ public:
     // local node voltages of the last three accepted steps (LTE).
     std::vector<double> qPrev, iPrev;
     std::vector<double> vHist[3];
+    // Where and how the last successful evaluate() ran (device bypass).
+    std::vector<double> evalAt;
+    uint32_t evalFlags = 0;
 
 private:
     std::shared_ptr<Model> model_;

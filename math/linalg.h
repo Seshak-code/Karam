@@ -1,17 +1,14 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
 #include <vector>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 #include <numeric> // For std::iota
 
 /*
@@ -121,293 +118,97 @@ struct CachedCsrPattern {
  * compression.
  */
 
-#include <mutex>
 
 class MatrixConstructor {
-private:
-  // LOCK-FREE ASSEMBLY (Phase 2 Tensor Backend)
-  // SoA Buffers per thread
-  // std::vector<std::vector<int>> thread_rows;
-  // std::vector<std::vector<int>> thread_cols;
-  // std::vector<std::vector<double>> thread_vals;
-  // Actually, keeping it simple with a struct of vectors logic inside specialized per-thread objects might be cleaner,
-  // but for raw speed and minimal allocation, vector<vector<T>> is fine.
-  
-  std::vector<std::vector<int>> thread_rows;
-  std::vector<std::vector<int>> thread_cols;
-  std::vector<std::vector<double>> thread_vals;
-
+  std::vector<int> rows_, cols_;
+  std::vector<double> vals_;
   int numRows = 0;
   int numCols = 0;
-  
-  // Running Checksum for Stamping Verification
-  // Combined using XOR and shifts to be order-independent IF we process in determinstic order?
-  // No, stamping order is non-deterministic in parallel. 
-  // However, simple addition of values is order independent.
-  // But we want to catch "wrong value at wrong place".
-  // Let's implement an atomic checksum accumulator.
-  // For parallel determinism, we can't rely on order. 
-  // We can sum (hash(row, col, value)).
-  // Hash needs to be commutative (Addition).
-  std::atomic<uint64_t> global_checksum{0};
+  uint64_t checksum_ = 0;
+  // createCsr's pattern cache: the (row, col) sequence it last sorted, each triplet's
+  // CSR value slot (-1: outside the matrix, dropped) and that CSR pattern
+  std::vector<int> lastRows_, lastCols_, slot_;
+  Csr_matrix pattern_{{}, {}, {}, -1, -1, 0};
 
 public:
-  MatrixConstructor() {
-      // Pre-allocate buffers for maximum potential threads
-      int max_threads = 1;
-      #ifdef _OPENMP
-      max_threads = omp_get_max_threads();
-      #endif
-      thread_rows.resize(max_threads);
-      thread_cols.resize(max_threads);
-      thread_vals.resize(max_threads);
-  }
-
   // Resets the constructor for a new matrix assembly
   void clear() {
-    // No locks needed if clear() is called sequentially between solves
-    for(size_t i=0; i<thread_rows.size(); ++i) {
-        thread_rows[i].clear();
-        thread_cols[i].clear();
-        thread_vals[i].clear();
-    }
+    rows_.clear();
+    cols_.clear();
+    vals_.clear();
     numRows = 0;
     numCols = 0;
-    global_checksum = 0;
+    checksum_ = 0;
   }
-  
+
   // Explicitly set matrix dimensions
   void setDimensions(int rows, int cols) {
     numRows = rows;
     numCols = cols;
   }
 
-  // Real-time Checksum (Atomic Read)
-  uint64_t getChecksum() const {
-      return global_checksum.load();
-  }
+  // XOR of hash(row, col, value) over the triplets of the last createCsr()
+  uint64_t getChecksum() const { return checksum_; }
 
-  /*
-   * Stamps a numerical value at the specified (row, col) coordinate.
-   * Lock-Free Implementation: Uses thread-local SoA buffers.
-   */
+  // Stamps a numerical value at the specified (row, col) coordinate.
   void add(int row, int col, double value) {
     assert(row >= 0 && "Row index can't be negative");
     assert(col >= 0 && "Column index can't be negative");
-
-    int tid = 0;
-    #ifdef _OPENMP
-    tid = omp_get_thread_num();
-    #endif
-    
-    // Safety check for dynamic thread counts
-    if (tid >= (int)thread_rows.size()) {
-        assert(false && "Thread ID exceeds pre-allocated buffer size");
-        tid = 0; 
-    }
-
-    thread_rows[tid].push_back(row);
-    thread_cols[tid].push_back(col);
-    thread_vals[tid].push_back(value);
-    
-    // Checksum update (Commutative Hash: FNV1a-like mix but additive)
-    // H = Sum( Hash(r,c, v) )
-    // Not perfect collision resistance but good enough for concurrency bugs
-    // Hash(r,c,v) = (r * P1 ^ c * P2) ^ bit_cast<u64>(v)
-    // Using simple FNV primes
-    uint64_t v_bits;
-    // std::bit_cast is C++20, let's use memcpy for safety
-    std::memcpy(&v_bits, &value, sizeof(double));
-    
-    uint64_t h = (static_cast<uint64_t>(row) * 104729) ^ (static_cast<uint64_t>(col) * 700067);
-    h ^= v_bits;
-    
-    // Atomic fetch_add is safe for concurrent updates (Commutative)
-    // However, frequent atomic writes kill perf.
-    // Better: Accumulate locally and sum at end? 
-    // Implementation Plan asked for "Real-time" checksum.
-    // Let's optimize: Store local checksum in thread, verify in createCsr/getChecksum.
-    // Actually, getChecksum() is const. If we want real-time read, we need atomics or iteration.
-    // Given the requirement "Real-time hash verification... to detect CONCURRENT WRITES",
-    // wait, concurrent writes to the *same buffer* are controlled by TID.
-    // Concurrent writes to *same matrix location* are handled by reduction.
-    // The checksum validates that the *Total Stamped Content* is invariant.
-    // Let's relax "Real-time" to "Atomic Accumulation" or just verify at end. 
-    // For now, let's assume we want to query it cheaply.
-    // We can add a "local_checksums" vector?
-    // Let's stick to simple atomic for correctness first, optimize later if bottleneck.
-    // Actually, perf hit on every stamp is bad.
-    // We will accumulate in a local var if we changed the signature, but we can't easily.
-    // Let's SKIP atomic update here and compute it during createCsr?
-    // Requirement: "Real-time... to detect illegal concurrent writes".
-    // If we use thread-local buffers, there ARE no illegal concurrent writes relative to memory safety.
-    // The issue is race conditions on shared logic.
-    // Let's implement it as a post-facto verify in createCsr or explicit compute step.
-    // Or, add to a per-thread checksum vector. Not cleaner without changing struct.
-    // Let's just do it in createCsr for now as MNA assembly is usually fast.
-    // *Wait*, implementing per-thread checksums in the struct is easy.
-    // Let's do that for O(1) retrieval. No, we need to sum them. 
-    // I'll add `std::vector<uint64_t> thread_checksums;` 
-    // But I can't resize it dynamically without safety issues if other threads are running.
-    // It's sized in constructor.
+    rows_.push_back(row);
+    cols_.push_back(col);
+    vals_.push_back(value);
   }
-  
-  // Helper for batch add (Phase 2 optimization)
+
   void addBatch(const std::vector<int>& rows, const std::vector<int>& cols, const std::vector<double>& values) {
-      size_t n = rows.size();
-      int tid = 0;
-      #ifdef _OPENMP
-      tid = omp_get_thread_num();
-      #endif
-      
-      auto& r_buf = thread_rows[tid];
-      auto& c_buf = thread_cols[tid];
-      auto& v_buf = thread_vals[tid];
-      
-      r_buf.reserve(r_buf.size() + n);
-      c_buf.reserve(c_buf.size() + n);
-      v_buf.reserve(v_buf.size() + n);
-      
-      for(size_t i=0; i<n; ++i) {
-          r_buf.push_back(rows[i]);
-          c_buf.push_back(cols[i]);
-          v_buf.push_back(values[i]);
-      }
+    rows_.insert(rows_.end(), rows.begin(), rows.end());
+    cols_.insert(cols_.end(), cols.begin(), cols.end());
+    vals_.insert(vals_.end(), values.begin(), values.end());
   }
 
   /*
-   * Converts uncompressed Triplets into the finalized CSR format.
-   * Merges all thread buffers first.
+   * Converts the triplets into CSR: columns sorted within a row, duplicates summed
+   * (in stamping order), entries outside the matrix dropped. Devices stamp in the
+   * same order every Newton iteration, so the sort runs only when the (row, col)
+   * sequence differs from the last call's; otherwise values are scattered through
+   * the cached slots (the sort was ~11 % of a BSIM4 inverter-chain transient).
    */
   Csr_matrix createCsr() {
-    // 1. Merge Thread Buffers (Parallelized)
-    size_t num_threads = thread_rows.size();
-    std::vector<size_t> sizes(num_threads);
-    std::vector<size_t> offsets(num_threads + 1, 0);
-    
-    // Serial scan for offsets
-    for (size_t i = 0; i < num_threads; ++i) {
-        sizes[i] = thread_rows[i].size();
-        offsets[i + 1] = offsets[i] + sizes[i];
+    const size_t T = rows_.size();
+    checksum_ = 0;
+    for (size_t k = 0; k < T; ++k) {
+      uint64_t v_bits;
+      std::memcpy(&v_bits, &vals_[k], sizeof(double));
+      checksum_ ^= ((static_cast<uint64_t>(rows_[k]) * 104729) ^ (static_cast<uint64_t>(cols_[k]) * 700067)) ^ v_bits;
     }
-    
-    size_t total_triplets = offsets[num_threads];
-    
-    // Allocate Flat SoA for sorting
-    std::vector<int> merged_rows(total_triplets);
-    std::vector<int> merged_cols(total_triplets);
-    std::vector<double> merged_vals(total_triplets);
-    
-    // Recalculate Global Checksum from scratch to ensure consistency
-    uint64_t accum_checksum = 0;
-    
-    // Parallel Copy & Checksum
-    #pragma omp parallel reduction(^:accum_checksum)
-    {
-        int tid = 0;
-        #ifdef _OPENMP
-        tid = omp_get_thread_num();
-        #endif
-        
-        if (tid < (int)num_threads) { // Safety check
-             size_t count = sizes[tid];
-             size_t off = offsets[tid];
-             // Copy
-             if (count > 0) {
-                 std::copy(thread_rows[tid].begin(), thread_rows[tid].end(), merged_rows.begin() + off);
-                 std::copy(thread_cols[tid].begin(), thread_cols[tid].end(), merged_cols.begin() + off);
-                 std::copy(thread_vals[tid].begin(), thread_vals[tid].end(), merged_vals.begin() + off);
-                 
-                 // Compute Checksum Chunk
-                 for(size_t k=0; k<count; ++k) {
-                     uint64_t v_bits;
-                     double val = thread_vals[tid][k];
-                     std::memcpy(&v_bits, &val, sizeof(double));
-                     uint64_t h = (static_cast<uint64_t>(thread_rows[tid][k]) * 104729) ^ 
-                                  (static_cast<uint64_t>(thread_cols[tid][k]) * 700067);
-                     h ^= v_bits;
-                     accum_checksum ^= h;
-                 }
-             }
-        }
-    }
-    
-    global_checksum.store(accum_checksum);
-
-    // matrix object
-    Csr_matrix matrix;
-    matrix.rows = numRows;
-    matrix.cols = numCols;
-
-    if (total_triplets == 0) {
-      matrix.row_pointer.assign(numRows + 1, 0);
-      return matrix;
-    }
-
-    // Sort: We need to sort (row, col) tuples.
-    // Zip indices to sort
-    std::vector<int> p(total_triplets);
-    std::iota(p.begin(), p.end(), 0);
-    
-    // Parallel Sort ? std::sort is usually serial. 
-    // __gnu_parallel::sort exists but non-standard.
-    // For now, serial sort of indices.
-    std::sort(p.begin(), p.end(), [&](int a, int b) {
-        return (merged_rows[a] < merged_rows[b] || 
-               (merged_rows[a] == merged_rows[b] && merged_cols[a] < merged_cols[b]));
-    });
-
-    // Initialize Row Pointer array
-    matrix.row_pointer.assign(numRows + 1, 0);
-
-    // Initial CSR population (Deduplication)
-    matrix.values.reserve(total_triplets);
-    matrix.col_indices.reserve(total_triplets);
-
-    int last_r = -1;
-    int last_c = -1;
-
-    for (int i = 0; i < (int)total_triplets; i++) {
-      int idx = p[i];
-      int r = merged_rows[idx];
-      int c = merged_cols[idx];
-      double v = merged_vals[idx];
-
-      if (r >= numRows || c >= numCols) continue; 
-
-      // Check for duplicate coordinates
-      if (r == last_r && c == last_c) {
-          // Merge with previous
-          if (!matrix.values.empty()) {
-              matrix.values.back() += v;
-          }
-      } else {
-          matrix.values.push_back(v);
-          matrix.col_indices.push_back(c);
-          matrix.row_pointer[r + 1]++;
-          
+    if (pattern_.rows != numRows || pattern_.cols != numCols || rows_ != lastRows_ || cols_ != lastCols_) {
+      std::vector<int> p(T);
+      std::iota(p.begin(), p.end(), 0);
+      std::stable_sort(p.begin(), p.end(), [&](int a, int b) {
+        return rows_[a] < rows_[b] || (rows_[a] == rows_[b] && cols_[a] < cols_[b]);
+      });
+      pattern_ = Csr_matrix{{}, {}, std::vector<int>(numRows + 1, 0), numRows, numCols, 0};
+      slot_.assign(T, -1);
+      int last_r = -1, last_c = -1;
+      for (int idx : p) {
+        const int r = rows_[idx], c = cols_[idx];
+        if (r >= numRows || c >= numCols) continue;
+        if (r != last_r || c != last_c) {
+          pattern_.col_indices.push_back(c);
+          pattern_.row_pointer[r + 1]++;
           last_r = r;
           last_c = c;
+        }
+        slot_[idx] = (int)pattern_.col_indices.size() - 1;
       }
+      for (int i = 0; i < numRows; ++i) pattern_.row_pointer[i + 1] += pattern_.row_pointer[i];
+      pattern_.nnz = (int)pattern_.col_indices.size();
+      lastRows_ = rows_;
+      lastCols_ = cols_;
     }
-    
-    // Fill gaps in row_pointer and Prefix Sum
-    // The loop above only incremented `row_pointer[r+1]` for NEW entries.
-    // Careful: The loop logic `matrix.row_pointer[r+1]++` assumes we visit rows in order.
-    // Yes, p is sorted. 
-    // But if we skip a row (empty row), we verify strict prefix sum.
-    // Correct Prefix Sum:
-    int cumsum = 0;
-    for (int i = 0; i < numRows; ++i) {
-        int count = matrix.row_pointer[i+1];
-        matrix.row_pointer[i+1] = cumsum + count;
-        cumsum += count;
-    }
-
-    matrix.nnz = (int)matrix.values.size();
-
-    assert(matrix.row_pointer[numRows] == matrix.nnz &&
-           "Row pointer mismatch with NNZ");
+    Csr_matrix matrix = pattern_;
+    matrix.values.assign(pattern_.nnz, 0.0);
+    for (size_t k = 0; k < T; ++k)
+      if (slot_[k] >= 0) matrix.values[slot_[k]] += vals_[k];
     return matrix;
   }
 
@@ -437,12 +238,10 @@ public:
    * O(stamps) scatter into a pre-allocated values array using a frozen pattern.
    * Avoids sort+dedup; produces a CSR matrix with the same sparsity as 'pattern'
    * but with freshly accumulated values from the current stamp buffers.
-   * Result is bit-identical to createCsr() for the same stamp sequence.
    * A stamp outside the pattern is dropped; `complete` (if given) reports it.
    */
   Csr_matrix assembleFast(const CachedCsrPattern& pattern, bool* complete = nullptr) {
       if (complete) *complete = true;
-      // Zero-init values
       Csr_matrix matrix;
       matrix.rows        = pattern.rows;
       matrix.cols        = pattern.cols;
@@ -450,20 +249,12 @@ public:
       matrix.row_pointer = pattern.row_pointer;
       matrix.col_indices = pattern.col_indices;
       matrix.values.assign(static_cast<size_t>(pattern.nnz), 0.0);
-
-      // Scatter all thread-buffer triplets into values[]
-      for (size_t tid = 0; tid < thread_rows.size(); ++tid) {
-          const auto& rows = thread_rows[tid];
-          const auto& cols = thread_cols[tid];
-          const auto& vals = thread_vals[tid];
-          const size_t n   = rows.size();
-          for (size_t k = 0; k < n; ++k) {
-              int idx = pattern.indexOf(rows[k], cols[k]);
-              if (idx >= 0) {
-                  matrix.values[static_cast<size_t>(idx)] += vals[k];
-              } else if (complete) {
-                  *complete = false;
-              }
+      for (size_t k = 0; k < rows_.size(); ++k) {
+          int idx = pattern.indexOf(rows_[k], cols_[k]);
+          if (idx >= 0) {
+              matrix.values[static_cast<size_t>(idx)] += vals_[k];
+          } else if (complete) {
+              *complete = false;
           }
       }
       return matrix;

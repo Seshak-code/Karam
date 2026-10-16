@@ -261,7 +261,9 @@ bool Instance::evaluate(const double *v, uint32_t analysisFlags, double abstime)
         for (auto &x : C_) x *= mult_;
     }
     for (uint32_t k = 0; k < numLocal_; ++k) { f_[k] = fBuf_[k + 1]; q_[k] = qBuf_[k + 1]; }
-    if (ret & EVAL_RET_FLAG_FATAL) { error_ = lastError.empty() ? "fatal model error" : lastError; return false; }
+    if (ret & EVAL_RET_FLAG_FATAL) { error_ = lastError.empty() ? "fatal model error" : lastError; evalFlags = 0; return false; }
+    evalAt.assign(v, v + numLocal_);
+    evalFlags = analysisFlags;
     return true;
 }
 

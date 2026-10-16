@@ -513,7 +513,7 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     junctionCurrents(j, x, netlist.environment.ambient_temp_K, h, j.st);
   });
   // OSDI charges, likewise (osdiCurrents with accept)
-  forEachOsdi(netlist, [&](const OsdiRef &r) { osdiCurrents(r, v, h, nullptr, true); });
+  osdiAll(netlist, v, h, false, true);
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);
@@ -580,6 +580,7 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     osdiCurrents(r, x, 0.0, nullptr, true);
     r.in->vHist[1] = r.in->vHist[2] = r.in->vHist[0];
   });
+  osdiAtValid_ = false;  // the charge history moved
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);

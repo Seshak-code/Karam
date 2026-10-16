@@ -3,6 +3,8 @@
 #include "../netlist/circuit.h"
 #include "../math/linalg.h"
 #include "../math/contraction_solver.h"
+#include "../math/worker_pool.h"
+#include <mutex>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -698,6 +700,51 @@ public:
     osdi::Instance *in;
     std::vector<int> n;  // 1-based unknown of each local node (0 = ground)
   };
+  // osdiCurrents() of every OSDI device at v, evaluated in parallel (an instance
+  // writes only its own data; model evaluation was ~half of a BSIM4 transient), in
+  // forEachOsdi order: osdiRefs_[i], osdiI_[i] and, with jac, osdiJ_[i]. Callers
+  // accumulate serially, so stamps and residuals keep their order.
+  // The KCL audit at a Newton iterate and the next iteration's stamp evaluate at the
+  // same point (OSDI devices have no voltage limiting), so the last evaluation is
+  // reused when v (bitwise), h, the method and the devices match; an accepted step
+  // moves the charge history and clears it. Jacobians are always kept for that.
+  mutable std::vector<OsdiRef> osdiRefs_;
+  mutable std::vector<std::vector<double>> osdiI_, osdiJ_;
+  mutable std::vector<double> osdiAtV_;
+  mutable double osdiAtH_ = -1.0;
+  mutable int osdiAtMethod_ = -1;
+  mutable bool osdiAtValid_ = false;
+  void osdiAll(const TensorNetlist &nl, const std::vector<double> &v, double h, bool /*jac*/, bool accept) const {
+    // The device list (with its node vectors) is rebuilt only when the devices change:
+    // walking the instances and comparing pointers allocates nothing (the rebuild did,
+    // per device per call: ~25 % of a BSIM4 chain transient).
+    size_t k = 0;
+    bool listed = true;
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total))
+      for (size_t i = 0; i < sl.blk->osdiDevices.size() && i < sl.st->osdiState.size(); ++i) {
+        const osdi::Instance *in = sl.st->osdiState[i].get();
+        if (!in) continue;
+        listed = listed && k < osdiRefs_.size() && osdiRefs_[k].dev == &sl.blk->osdiDevices[i] && osdiRefs_[k].in == in;
+        ++k;
+      }
+    if (!listed || k != osdiRefs_.size()) {
+      osdiRefs_.clear();
+      forEachOsdi(nl, [&](const OsdiRef &r) { osdiRefs_.push_back(r); });
+      osdiAtValid_ = false;
+    }
+    const int method = integrator ? (int)integrator->getType() : -1;
+    if (osdiAtValid_ && !accept && h == osdiAtH_ && method == osdiAtMethod_ && v == osdiAtV_) return;
+    const int n = (int)osdiRefs_.size();
+    osdiI_.resize(n);
+    osdiJ_.resize(n);
+    parallelFor(n, 2e4 * n,  // ~5 us an evaluation: a few devices are worth the pool
+                [&](int i) { osdiI_[i] = osdiCurrents(osdiRefs_[i], v, h, &osdiJ_[i], accept); });
+    osdiAtValid_ = !accept;
+    osdiAtV_ = v;
+    osdiAtH_ = h;
+    osdiAtMethod_ = method;
+  }
   template <class F> void forEachOsdi(const TensorNetlist &nl, F &&f) const {
     int total = 0;
     for (const auto &sl : branchSlots(nl, total)) {
@@ -718,6 +765,7 @@ public:
   // accepted step (TRAP, else BE, as mosCurrents). One definition for the stamp,
   // the KCL audit and the history update. J: dI/dx = G + coef*C (row-major).
   // accept: store this point as the accepted step. A fatal model error gives NaN.
+  static std::mutex &osdiErrorMutex() { static std::mutex m; return m; }
   std::vector<double> osdiCurrents(const OsdiRef &r, const std::vector<double> &v, double h,
                                    std::vector<double> *J = nullptr, bool accept = false) const {
     const size_t L = r.n.size();
@@ -725,16 +773,37 @@ public:
     for (size_t k = 0; k < L; ++k) x[k] = r.n[k] > 0 && r.n[k] <= (int)v.size() ? v[r.n[k] - 1] : 0.0;
     const bool tran = h > 1e-15 && integrator;
     osdi::Instance &in = *r.in;
-    if (!in.evaluate(x.data(), tran ? osdi::ANALYSIS_TRAN : osdi::ANALYSIS_DC | osdi::ANALYSIS_STATIC, 0.0)) {
+    const uint32_t flags = tran ? osdi::ANALYSIS_TRAN : osdi::ANALYSIS_DC | osdi::ANALYSIS_STATIC;
+    // Device bypass (ngspice's, voltage criterion): a device whose local voltages moved
+    // less than RELTOL*|v| + VNTOL (1e-3, 1 uV) since its last evaluation, of the same
+    // analysis, is not evaluated; its stored f, q extrapolate linearly with G, C
+    // (error O(dv^2)). 98 % of the evaluations of a 1000-stage BSIM4 chain transient
+    // were such. Never for the Jacobian at an operating point itself (AC, noise,
+    // sensitivity run with limitJunctions_ off). TREESPICE_BYPASS=0 evaluates always.
+    static const bool bypassOn = [] { const char *s = std::getenv("TREESPICE_BYPASS"); return !s || std::atoi(s) != 0; }();
+    bool bypass = bypassOn && limitJunctions_ && in.evalFlags == flags && in.evalAt.size() == L;
+    for (size_t k = 0; bypass && k < L; ++k)
+      bypass = std::abs(x[k] - in.evalAt[k]) <= 1e-3 * std::max(std::abs(x[k]), std::abs(in.evalAt[k])) + 1e-6;
+    if (!bypass && !in.evaluate(x.data(), flags, 0.0)) {
+      std::lock_guard<std::mutex> lock(osdiErrorMutex());  // devices evaluate in parallel
       osdiFatal_ = r.dev->instanceName + ": " + in.error();  // reported instead of a singular matrix
       std::fill(I.begin(), I.end(), NAN);
       if (J) J->assign(L * L, 0.0);
       return I;
     }
+    std::vector<double> f(in.f()), q(in.q());  // at x: as evaluated, or extrapolated when bypassed
+    if (bypass)
+      for (size_t a = 0; a < L; ++a)
+        for (size_t b = 0; b < L; ++b) {
+          const double d = x[b] - in.evalAt[b];
+          f[a] += in.G(a, b) * d;
+          q[a] += in.C(a, b) * d;
+        }
     for (size_t k = 0; k < L; ++k)
-      if (!std::isfinite(in.f()[k]) || !std::isfinite(in.q()[k])) {
+      if (!std::isfinite(f[k]) || !std::isfinite(q[k])) {
         // An extreme Newton iterate may do this and the homotopy recovers, so it
         // only explains a failed analysis (osdiNonFinite_), it does not end one.
+        std::lock_guard<std::mutex> lock(osdiErrorMutex());
         osdiNonFinite_ = r.dev->instanceName + ": the model returned a non-finite current or charge "
                                                "(parameters outside its valid range?)";
         std::fill(I.begin(), I.end(), NAN);
@@ -744,9 +813,9 @@ public:
     const bool trap = tran && integrator->getType() == IntegrationType::TRAPEZOIDAL;
     const double coef = !tran ? 0.0 : trap ? 2.0 / h : 1.0 / h;
     for (size_t k = 0; k < L; ++k) {
-      const double iq = tran ? coef * (in.q()[k] - in.qPrev[k]) - (trap ? in.iPrev[k] : 0.0) : 0.0;
-      I[k] = in.f()[k] + iq;
-      if (accept) { in.qPrev[k] = in.q()[k]; in.iPrev[k] = iq; }
+      const double iq = tran ? coef * (q[k] - in.qPrev[k]) - (trap ? in.iPrev[k] : 0.0) : 0.0;
+      I[k] = f[k] + iq;
+      if (accept) { in.qPrev[k] = q[k]; in.iPrev[k] = iq; }
     }
     if (accept) { in.vHist[2] = in.vHist[1]; in.vHist[1] = in.vHist[0]; in.vHist[0] = x; }
     if (J) {
@@ -767,10 +836,10 @@ public:
     return I;
   }
 
-  // Newton stamp of osdiCurrents() at v (a node shared by two terminals sums).
-  void stampOsdi(const OsdiRef &r, const std::vector<double> &v, double h) {
-    std::vector<double> J;
-    const auto I = osdiCurrents(r, v, h, &J);
+  // Newton stamp of the currents I and Jacobian J of osdiCurrents() at v (a node
+  // shared by two terminals sums).
+  void stampOsdi(const OsdiRef &r, const std::vector<double> &I, const std::vector<double> &J,
+                 const std::vector<double> &v) {
     const size_t L = r.n.size();
     auto V = [&](int g) { return g > 0 && g <= (int)v.size() ? v[g - 1] : 0.0; };
     for (size_t t = 0; t < L; ++t) {
@@ -1488,11 +1557,12 @@ public:
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
     });
     // 3.65 OSDI devices: the stamped osdiCurrents(), internal-node rows included
-    forEachOsdi(netlist, [&](const OsdiRef &r) {
-        const auto I = osdiCurrents(r, v_candidate, h);
+    osdiAll(netlist, v_candidate, h, false, false);
+    for (size_t i = 0; i < osdiRefs_.size(); ++i) {
+        const auto &r = osdiRefs_[i];
         for (size_t k = 0; k < r.n.size(); ++k)
-          if (r.n[k] > 0 && r.n[k] <= (int)node_residuals.size()) node_residuals[r.n[k] - 1] -= I[k];
-    });
+          if (r.n[k] > 0 && r.n[k] <= (int)node_residuals.size()) node_residuals[r.n[k] - 1] -= osdiI_[i][k];
+    }
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
     
@@ -1792,15 +1862,17 @@ public:
       attributions.push_back(std::move(a));
     });
     // OSDI devices, likewise (DC, external nodes)
-    forEachOsdi(netlist, [&](const OsdiRef &r) {
-      const auto I = osdiCurrents(r, v_candidate, 0.0);
+    osdiAll(netlist, v_candidate, 0.0, false, false);
+    for (size_t i = 0; i < osdiRefs_.size(); ++i) {
+      const auto &r = osdiRefs_[i];
+      const auto &I = osdiI_[i];
       DeviceAttribution a{r.dev->instanceName, "OSDI", {}};
       for (size_t k = 0; k < r.dev->nodes.size(); ++k) {
         addRes(r.n[k], -I[k]);
         if (r.n[k] > 0 && r.n[k] <= n) a.nodeCurrents.push_back({r.n[k], -I[k]});
       }
       attributions.push_back(std::move(a));
-    });
+    }
 
     // Schottky Diodes
     for (const auto &sd : netlist.globalBlock.schottkyDiodes) {
@@ -2312,7 +2384,8 @@ public:
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     const double tempK = netlist.environment.ambient_temp_K;
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
-    forEachOsdi(netlist, [&](const OsdiRef &r) { stampOsdi(r, v_guess, h); });
+    osdiAll(netlist, v_guess, h, true, false);  // stamped in device order: the same sequence every iteration
+    for (size_t i = 0; i < osdiRefs_.size(); ++i) stampOsdi(osdiRefs_[i], osdiI_[i], osdiJ_[i], v_guess);
 
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it
