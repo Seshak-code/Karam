@@ -622,6 +622,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     x0.resize(nTot, 0.0);
   }
   arbiterInitialized = false;  // this run's cold start (the DC bias may itself have run a transient OP)
+  lteHold_ = 0;
   seedReactiveHistory(netlist, x0, uic);
   lastSolution_ = x0;  // seeds the first Newton iteration
 
@@ -631,9 +632,9 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   std::vector<std::function<double(double)>> corners;
   auto addCorners = [&](const TensorBlock &b) {
     for (const auto &v : b.voltageSources)
-      if (v.type == "PULSE" || v.type == "SINE") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
+      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
     for (const auto &i : b.currentSources)
-      if (i.type == "PULSE" || i.type == "SINE") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
+      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
   };
   addCorners(netlist.globalBlock);
   for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);
@@ -655,6 +656,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   int tinySteps = 0;
   while (stop - t > endTol) {
     double hTry = std::min(h, stop - t);
+    const double intended = hTry;  // before clipping to a corner (ngspice's CKTsaveDelta)
     bool toCorner = false;
     for (const auto &next : corners)
       if (next(t + endTol) - t <= hTry) { hTry = next(t + endTol) - t; toCorner = true; }
@@ -691,6 +693,18 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     t = s.time;
     if (!onPoint(s)) return "Cancelled.";
     h = std::min(hMax, taken * 2.0);
+    // After a corner, as ngspice dctran: at most 0.1 * min(the step that was intended
+    // before it was clipped to the corner, the gap to the next corner). A source jump (a
+    // PWL repeat) taken with one 4.5 ns backward-Euler step left an RC 13 mV low against
+    // the exact response. The clipped step itself can be femtoseconds, and 0.1 of it made
+    // Newton fail on roundoff (an inverter's PWL input, Xyce tranInverterBinning).
+    if (lteHold_ > 0) --lteHold_;
+    if (landedOnCorner) {
+      lteHold_ = 3;
+      double gap = std::numeric_limits<double>::infinity();
+      for (const auto &next : corners) gap = std::min(gap, next(t + endTol) - t);
+      h = std::min(h, 0.1 * std::min(intended, gap));
+    }
   }
   return "";
 }
@@ -1197,7 +1211,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
             });
           });
 
-      if (lteResult.requiresRejection) {
+      if (lteResult.requiresRejection && lteHold_ == 0) {
         // LTE too large — timestep was too aggressive
         actualTimeStep = lteResult.suggestedDt;
         attempt++;

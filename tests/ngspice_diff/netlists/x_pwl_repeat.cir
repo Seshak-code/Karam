@@ -1,0 +1,6 @@
+* PWL with TD and R (ngspice repeat): a 3-corner pattern repeated from t=0.2u, delayed 0.1u, into an RC
+V1 1 0 PWL(0 0 0.2u 1 0.5u 0.3 0.8u 0) TD=0.1u R=0.2u
+R1 1 2 1k
+C1 2 0 100p
+.tran 10n 3u
+.end

@@ -534,6 +534,7 @@ namespace {
 // Threshold for accepting a diagonal pivot inside a front: |a_kk| >= u * max
 // |a_rk| over ALL rows of the front (MUMPS uses the same default, 0.01).
 constexpr double kPivotThreshold = 0.01;
+constexpr int kMaxDelayed = 8;  // rows a front may delay to its parent (see the factor loop)
 
 // Per-front numeric data. Local layout: [own pivots p][delayed-in d][boundary b].
 // After factorization the first `e` columns hold L (unit diagonal implied), the
@@ -718,6 +719,10 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
             ff.minPivot = std::numeric_limits<double>::infinity();
             const int m = ff.m, p = (int)fr.pivots.size(), d = ff.full - p;
             auto& M = ff.M;
+            // A cached front keeps its buffer between solves; one that grew in an earlier,
+            // near-singular iterate (delayed rows) gives the excess back, or every front keeps
+            // its worst size for good (14 GB at 4e5 fronts of a 1e5-stage chain)
+            if (M.capacity() > 4 * (size_t)m * m + 64) std::vector<double>().swap(M);
             M.assign((size_t)m * m, 0.0);
             for (size_t t = 0; t < fr.assembleK.size(); ++t) {
                 int r = fr.assembleRow[t], c = fr.assembleCol[t];
@@ -760,6 +765,19 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
                     double ratio = colmax > 0.0 ? rowBest / colmax : 0.0;
                     if (ri >= 0 && ratio >= kPivotThreshold) { pr = ri; pc = j; }
                     bestRatio = std::max(bestRatio, ratio);
+                }
+                // Delayed rows must not snowball up the tree: a near-singular Newton
+                // iterate of a 30k-stage BSIM4 chain delayed 2e5 pivots into fronts 673
+                // wide (near O(n^2) memory, 131 GB at 1e5 stages). Past kMaxDelayed rows,
+                // the largest fully-summed entry pivots without the boundary rows' veto;
+                // if they are all zero the matrix is singular here: say so now instead of
+                // carrying the zero rows up the tree (they reached fronts ~100 wide).
+                if (pc < 0 && ff.full - k > kMaxDelayed) {
+                    double best = 0.0;
+                    for (int j = k; j < ff.full; ++j)
+                        for (int r = k; r < ff.full; ++r)
+                            if (const double a = std::abs(M[(size_t)r * m + j]); a > best) { best = a; pr = r; pc = j; }
+                    if (pc < 0) { ff.singular = true; break; }
                 }
                 if (pc < 0) break;  // delay the remaining rows/columns to the parent
                 if (pc != k) {

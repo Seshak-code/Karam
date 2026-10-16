@@ -443,6 +443,10 @@ public:
 
   // Gap 5: LTE-based adaptive timestep controller (truncation error, step size).
   LTEController lteController_;
+  // Accepted steps after a waveform corner whose LTE is not checked: divided differences across
+  // the kink measure the kink (an inductor's voltage jumps with dI/dt), not truncation error, and
+  // rejected step after step down to femtoseconds. Three refill a trapezoidal history past it.
+  int lteHold_ = 0;
   double lteTolerance_ = 1e-4;  // absolute LTE tolerance
 
   // Gap 2: Mixed-signal digital event engine.

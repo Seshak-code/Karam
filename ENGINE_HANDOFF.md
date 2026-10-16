@@ -140,6 +140,28 @@ then the two Roadmap sections it points to. Everything below was verified by run
   superposition as a gather) was correct but 1.5-10x slower than the CPU on every matrix (per-pivot barrier
   latency on small fronts) and was deleted; the results file has the numbers. Verified: ctest, ngspice
   544/0, Xyce 109/0, ibmpg 6/6, char_cells 0.087 %, IHP cells 74/77 (unchanged).
+- **Update 2026-10-16 (Claude Code, Phase 4 continued, branch `phase4/gpu`):** device evaluation and scale.
+  - **OSDI evaluation:** parallel on the worker pool (`math/worker_pool.h`). The KCL audit's evaluation is
+    reused by the next stamp. The device list is cached. Device bypass uses ngspice's voltage criterion
+    (`TREESPICE_BYPASS=0` turns it off). CSR assembly sorts only when the stamp pattern changes. A
+    1000-stage BSIM4 chain transient goes from 18.7 s to 4.9 s.
+  - **Scale:** delayed pivots no longer snowball. At most 8 rows per front are delayed (`kMaxDelayed`);
+    past that the largest fully-summed entry pivots, and a zero there is reported singular. Front buffers
+    that grew in a near-singular iterate give the excess back. A 1e5-stage chain (2e5 BSIM4 devices, 5e5
+    unknowns) used to die at a 133 GB peak footprint; it now runs a transient in 318 s at 2.65 GB.
+  - **New parser and solver features:**
+    - PWL sources, with TD= and R= as in ngspice (at a repeat boundary the waveform holds the last value).
+    - ngspice's step rule after a corner: at most 0.1 × min(the intended step, the gap to the next
+      corner).
+    - `.osdi` paths resolve against the netlist directory.
+  - **Scale-ladder gate** (`tests/scale_ladder.py`, BSIM4 chains against ngspice on the same OSDI):
+    - 1e3 stages: 2.0x ngspice, 50 % crossing 1.1 ps from ngspice's.
+    - 1e4 stages: 25 s; ngspice fails ("Timestep too small; initial timepoint").
+    - 1e5 stages: runs (ngspice out of reach).
+  - **Phase 4 Roadmap items not done:**
+    - Device evaluation on the GPU: OSDI models are host machine code, so evaluation stays on CPU threads.
+    - Isomorphism reuse beyond what bypass gives.
+    - Multirate integration.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).

@@ -67,15 +67,20 @@ def main():
             open(ng, "w").write(body + ".control\npre_osdi bsim4.osdi\n"
                                 f"tran {tstep!r} {a.tstop!r} 0 {tstep / 10!r}\nwrdata {dat} " +
                                 " ".join(f"v({p})" for p in probe) + "\nquit\n.endc\n.end\n")
+            ng_note = ""
             try:
                 t0 = time.time()
-                subprocess.run(["ngspice", "-b", ng], capture_output=True, text=True, cwd=tmp, timeout=a.ng_timeout)
+                log = subprocess.run(["ngspice", "-b", ng], capture_output=True, text=True, cwd=tmp, timeout=a.ng_timeout)
                 ng_time = time.time() - t0
                 rows = [list(map(float, x.split())) for x in open(dat)]
+                if len(rows) < 2:  # ngspice aborted (e.g. "Timestep too small" at 1e4 stages)
+                    why = [x.strip() for x in (log.stdout + log.stderr).splitlines() if "too small" in x or "aborted" in x]
+                    ng_note = "  ngspice failed: " + (why[0] if why else "no data")
+                    raise ValueError(ng_note)
                 xs = [r[0] for r in rows]
                 ref = {p: [r[2 * k + 1] for r in rows] for k, p in enumerate(probe)}
                 if last: t50n = crossing(xs, ref[last])
-                worst = 0.0
+                worst = 0.0 if not ng_note else None
                 for p in probe:
                     for row in pts:
                         t = row[0]
@@ -84,11 +89,11 @@ def main():
                         w = (t - xs[j - 1]) / (xs[j] - xs[j - 1])
                         worst = max(worst, abs(row[col[p]] - (ref[p][j - 1] + w * (ref[p][j] - ref[p][j - 1]))))
             except (subprocess.TimeoutExpired, OSError, ValueError):
-                ng_time = None
+                ng_time = None if not ng_note else ng_time
             fmt = lambda x: "-" if x is None else f"{x * 1e12:.2f}"
             print(f"{n:>8} {2 * n:>9} {te:>9.2f} {('>%g' % a.ng_timeout) if ng_time is None else '%.2f' % ng_time:>10} "
                   f"{'-' if ng_time is None else '%.1fx' % (ng_time / te):>8} {fmt(t50e) + ' / ' + fmt(t50n):>22} "
-                  f"{'-' if worst is None else '%.2g' % worst:>9}", flush=True)
+                  f"{'-' if worst is None else '%.2g' % worst:>9}{ng_note[:110]}", flush=True)
     finally:
         shutil.rmtree(tmp, True)
 

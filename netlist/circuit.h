@@ -177,6 +177,10 @@ struct VoltageSource {
     double sine_theta = 0.0; // Damping factor
     double sine_phase = 0.0; // Phase [deg] (Extension)
 
+    // PWL(t1 v1 t2 v2 ...) [TD=delay] [R=repeat-from]: corner times and values
+    std::vector<double> pwl_t, pwl_v;
+    double pwl_td = 0.0, pwl_r = -1.0;  // r < 0: no repeat
+
     std::string expression;  // Symbolic override for DC/main value
     std::string name;        // instance name (F/H cards reference it)
 };
@@ -212,6 +216,9 @@ struct CurrentSource {
     double sine_theta = 0.0;
     double sine_phase = 0.0;
 
+    std::vector<double> pwl_t, pwl_v;
+    double pwl_td = 0.0, pwl_r = -1.0;
+
     std::string expression;  // Symbolic override for DC/main value
 };
 
@@ -221,8 +228,31 @@ struct CurrentSource {
  * paths and the KCL audit, so they can never disagree on a source's value.
  * The transient lands on its corners via nextBreakpoint() below.
  */
+// PWL time in the waveform's own frame: delay removed and, with R, folded back into
+// (r, t_last] after the first pass (ngspice's repeat). A repeat boundary is a jump
+// (v(t_last) -> v(r)); exactly on it ngspice holds v(t_last), so the fold maps there,
+// within 1e-9 of the period (the breakpoint times carry rounding).
+template <class Src>
+inline double pwlLocalTime(const Src& s, double t) {
+    double tt = t - s.pwl_td;
+    const double last = s.pwl_t.back(), per = last - s.pwl_r;
+    if (s.pwl_r >= 0.0 && tt > last && per > 0.0) {
+        const double m = std::fmod(tt - s.pwl_r, per);
+        tt = (m <= 1e-9 * per || m >= (1.0 - 1e-9) * per) ? last : s.pwl_r + m;
+    }
+    return tt;
+}
+
 template <class Src>
 inline double waveformValue(const Src& s, double dcValue, double t) {
+    if (s.type == "PWL") {
+        const double tt = pwlLocalTime(s, t);
+        const auto& T = s.pwl_t;
+        if (tt <= T.front()) return s.pwl_v.front();
+        if (tt >= T.back()) return s.pwl_v.back();
+        const size_t k = std::upper_bound(T.begin(), T.end(), tt) - T.begin();  // T[k-1] <= tt < T[k]
+        return s.pwl_v[k - 1] + (s.pwl_v[k] - s.pwl_v[k - 1]) * (tt - T[k - 1]) / (T[k] - T[k - 1]);
+    }
     if (s.type == "PULSE") {
         double tt = t - s.pulse_td;
         if (tt <= 0.0) return s.pulse_v1;
@@ -254,6 +284,14 @@ template <class Src>
 inline double nextBreakpoint(const Src& s, double t) {
     const double inf = std::numeric_limits<double>::infinity();
     if (s.type == "SINE") return t < s.sine_td ? s.sine_td : inf;
+    if (s.type == "PWL") {  // the next corner, in absolute time
+        const double tt = pwlLocalTime(s, t), shift = t - tt;
+        const auto it = std::upper_bound(s.pwl_t.begin(), s.pwl_t.end(), tt);
+        if (it != s.pwl_t.end()) return *it + shift;
+        if (s.pwl_r < 0.0) return inf;
+        const auto r = std::upper_bound(s.pwl_t.begin(), s.pwl_t.end(), s.pwl_r);  // the repeat's first corner
+        return r == s.pwl_t.end() ? inf : *r + shift + (s.pwl_t.back() - s.pwl_r);
+    }
     if (s.type != "PULSE") return inf;
     const double c[4] = {0.0, s.pulse_tr, s.pulse_tr + s.pulse_pw, s.pulse_tr + s.pulse_pw + s.pulse_tf};
     const double per = s.pulse_per > 0.0 ? s.pulse_per : inf;

@@ -119,6 +119,8 @@ private:
     void parsePulse(const std::vector<std::string>& tok, size_t startIdx, Src& s) const;
     template <class Src>
     void parseSine (const std::vector<std::string>& tok, size_t startIdx, Src& s) const;
+    template <class Src>
+    void parsePwl  (const std::vector<std::string>& tok, size_t startIdx, Src& s) const;
 
     // ── State ─────────────────────────────────────────────────────────
     std::map<std::string, int> nodeMap_;
