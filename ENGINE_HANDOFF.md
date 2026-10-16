@@ -162,6 +162,16 @@ then the two Roadmap sections it points to. Everything below was verified by run
     `phase4/gpu` by Claude Code) found BUG-4: a subcircuit whose parameters are body `.param`s (sky130
     devices) kept its plain name for every instance size, so two sizes emitted its models twice. Fixed in
     `netlist/numparam.cpp` (only a parameterless key keeps the plain name).
+    Round 2 (`qa/phase4-r2`) found BUG-5: equal PWL times, ngspice's step, were rejected. They are
+    now accepted, and the step instant holds the earlier value, as in ngspice. Sonnet's solver QA
+    found two silent wrong answers on singular DC systems:
+    - BUG-6: a pivot cancelled to rounding residue (a current forced into a floating chain split over
+      fronts gave 1e15 V). Pivots below 1e-13 x their own entry in A are now singular.
+    - BUG-7: the transient-OP fallback accepted a capacitor-only node that was still charging. Its
+      result must now satisfy DC KCL to ngspice's reltol/abstol.
+    Not fixed:
+    - "check node N" uses the internal node number, not the netlist name.
+    - A 1 pF capacitor-only node still takes 6.5 s (the 10 us transient) before it reports singular.
   - **Phase 4 Roadmap items not done:**
     - Device evaluation on the GPU: OSDI models are host machine code, so evaluation stays on CPU threads.
     - Isomorphism reuse beyond what bypass gives.

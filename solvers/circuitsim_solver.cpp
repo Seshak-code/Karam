@@ -102,6 +102,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // nodes at 0 V and every capacitor uncharged, sources applied, to steady state,
   // so such a node keeps zero net charge (a capacitive divider decides it).
   bool finalSingular = false, floatingNodes = false;
+  Csr_matrix singularJacobian{};
   double srcConv = 0.0, srcRaise = 1e-3;
   const std::vector<double> &seededGuess = coldSeed;  // gmin stepping restarts cold
   std::vector<double> lastGood;
@@ -172,6 +173,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         singularMatrixDetected = true;
         singularRow = result.rankDeficientRow;
         if (finalStep && gminSteppingUsed && !sourceSteppingUsed) finalSingular = true;
+        singularJacobian = std::move(matrix);  // scales the transient OP's KCL check
         // If singular, retrying with same Jacobian won't help. Abort this GMIN
         // step.
         total_iterations += iteration + 1;
@@ -329,7 +331,21 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     if (runTransient(pseudo, 100e-9, 10e-6, /*uic=*/true, [](const SolverStep &) { return true; }).empty()) {
       voltageEstimate = lastSolution_;
       voltageEstimate.resize(nTot, 0.0);
-      converged = floatingNodes = true;
+      // Only a settled transient is an operating point: a current forced into a node that has
+      // only capacitors charges it for good, and its 10 us value is not one (1 mA into 1 uF
+      // "converged" at 0.01 V, BUG-7). DC KCL (caps open, no gmin) must hold at every node to
+      // ngspice's reltol/abstol, scaled by the node's currents in the last DC Jacobian.
+      std::vector<double> r;
+      calculatePhysicalResiduals(netlist, voltageEstimate, r);
+      const Csr_matrix &J = singularJacobian;
+      bool settled = true;
+      for (int i = 0; i < netlist.numGlobalNodes && i < (int)r.size() && i < J.rows; ++i) {
+        double scale = 0.0;
+        for (int k = J.row_pointer[i]; k < J.row_pointer[i + 1]; ++k)
+          scale += std::abs(J.values[k]) * std::abs(voltageEstimate[J.col_indices[k]]);
+        settled = settled && std::abs(r[i]) <= 1e-3 * scale + 1e-12;
+      }
+      converged = floatingNodes = settled;
     }
   }
 

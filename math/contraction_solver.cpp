@@ -696,6 +696,18 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
     } else local.resize(nf);
     std::vector<FrontFactor>& F = cache ? cache->impl->F : local;
     std::vector<char> reused(nf, 0), onGpu(nf, 0);
+    // A pivot below kSingularRel x its own entry in A was cancelled down to rounding residue,
+    // not to a value: a floating subnetwork with a current forced into it left ~1e-19 of a
+    // 2e-3 diagonal once the plan split it over fronts, and was solved at 1e15 V (BUG-6).
+    // (A row's largest entry is no scale: a BJT iterate's gm made normal pivots look small.)
+    // ponytail: fixed relative bound; gmin under a 1 S node still passes (1e-12), a gmin node
+    // behind < 0.1 ohm and chains of >~1e4 floating nodes do not.
+    constexpr double kSingularRel = 1e-13;
+    auto entry = [&](int r, int c) {
+        for (int q = A.row_pointer[r]; q < A.row_pointer[r + 1]; ++q)
+            if (A.col_indices[q] == c) return std::abs(A.values[q]);
+        return 0.0;
+    };
     bool singular = false;
     double smallestPivot = std::numeric_limits<double>::infinity();
     for (const auto& level : plan.levels) {
@@ -791,7 +803,10 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
                 ff.sw.push_back(pr);
                 const double piv = M[(size_t)k * m + k];
                 ff.minPivot = std::min(ff.minPivot, std::abs(piv));
-                if (!(std::abs(piv) > 0.0) || !std::isfinite(piv)) { ff.singular = true; break; }
+                if (!(std::abs(piv) > kSingularRel * entry(plan.rowOfVar[ff.rowLab[k]], ff.colLab[k])) || !std::isfinite(piv)) {
+                    ff.singular = true;
+                    break;
+                }
                 const double inv = 1.0 / piv;
                 for (int r = k + 1; r < m; ++r) {
                     double& l = M[(size_t)r * m + k];
@@ -806,10 +821,8 @@ SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const Cont
             // A root front has no parent to delay to: un-eliminated fully-summed rows
             // mean no pivot exists (e.g. a node with no DC path). They used to be left
             // silently at x = 0 and the solve reported success.
-            if (plan.fronts[id].parent < 0 && F[id].e < F[id].full && !F[id].singular) {
-                F[id].singular = true;
-                res.rankDeficientRow = plan.rowOfVar[F[id].rowLab[F[id].e]];
-            }
+            if (plan.fronts[id].parent < 0 && F[id].e < F[id].full) F[id].singular = true;
+            if (F[id].singular && res.rankDeficientRow < 0) res.rankDeficientRow = plan.rowOfVar[F[id].rowLab[F[id].e]];
             singular = singular || F[id].singular;
             smallestPivot = std::min(smallestPivot, F[id].minPivot);
         }
