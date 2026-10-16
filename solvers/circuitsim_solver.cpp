@@ -625,9 +625,9 @@ void CircuitSim::tranCorners(const TensorNetlist &netlist) {
   corners.clear();
   auto addCorners = [&](const TensorBlock &b) {
     for (const auto &v : b.voltageSources)
-      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
+      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL" || v.type == "EXP" || v.type == "AM") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
     for (const auto &i : b.currentSources)
-      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
+      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL" || i.type == "EXP" || i.type == "AM") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
   };
   addCorners(netlist.globalBlock);
   for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);

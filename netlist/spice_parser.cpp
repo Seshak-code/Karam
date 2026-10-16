@@ -746,11 +746,17 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             j.Vto    = c->get("VTO", -2.0);
             j.lambda = c->get("LAMBDA", 0.0);
         }
-        if (result_.tranStep > 0.0) {
+        {
+            const double ts = result_.tranStep;
             auto edges = [&](auto& s) {
-                if (s.type != "PULSE") return;
-                if (s.pulse_tr <= 0.0) s.pulse_tr = result_.tranStep;
-                if (s.pulse_tf <= 0.0) s.pulse_tf = result_.tranStep;
+                if (s.type == "EXP") {
+                    auto& w = s.wf;
+                    auto dflt = [](double& x, double v) { if (std::isnan(x)) x = v; };
+                    if (s.type == "EXP") { dflt(w[2], ts); dflt(w[3], ts); dflt(w[4], w[2] + ts); dflt(w[5], ts); }
+                }
+                if (s.type != "PULSE" || !(ts > 0.0)) return;
+                if (s.pulse_tr <= 0.0) s.pulse_tr = ts;
+                if (s.pulse_tf <= 0.0) s.pulse_tf = ts;
             };
             for (auto& v : blk.voltageSources) edges(v);
             for (auto& i : blk.currentSources) edges(i);
@@ -933,7 +939,29 @@ void SPICEParser::parseSourceSpec(const std::vector<std::string>& tok, Src& s, d
             parsePwl(tok, i + 1, s);
             break;
         } else if (kw == "EXP" || kw == "SFFM" || kw == "AM") {
-            throw std::runtime_error(kw + " sources are not supported yet");
+            s.type = kw;
+            // ngspice order. EXP's missing values are NaN until .tran is known (resolveBlock): TD1,
+            // TAU1, TAU2 take TSTEP and TD2 TD1+TSTEP.
+            // ponytail: with no .tran card (a transient requested through the API) they stay NaN.
+            const size_t lo = kw == "AM" ? 5 : kw == "SFFM" ? 5 : 2, hi = kw == "EXP" || kw == "AM" ? 6 : 5;
+            const double nan = std::nan("");
+            s.wf = kw == "EXP" ? std::vector<double>{0, 0, nan, nan, nan, nan}
+                 : std::vector<double>(kw == "SFFM" ? 5 : 6, 0.0);
+            size_t n = 0;
+            for (++i; i < tok.size() && n < hi && isValue(tok[i]); ++i, ++n) s.wf[n] = parseValue(tok[i]);
+            if (n < lo) throw std::runtime_error(tok[0] + ": " + kw + " needs at least " + std::to_string(lo) + " values");
+            if (i < tok.size()) throw std::runtime_error(tok[0] + ": " + kw + " takes at most " + std::to_string(hi) + " values");
+            if (kw == "EXP")  // ngspice: a 0 TD1, TAU1, TD2 or TAU2 is "not given"
+                for (size_t k = 2; k < 6; ++k) if (s.wf[k] == 0.0) s.wf[k] = nan;
+            // ngspice limits the deviation to FC: the index is min(MDI, FC/FS). Its FC / FS defaults
+            // (1/TSTOP) did not match the documented sine, so they are not offered.
+            if (kw == "SFFM") {
+                if (!(s.wf[2] > 0.0 && s.wf[4] > 0.0 && s.wf[3] >= 0.0))
+                    throw std::runtime_error(tok[0] + ": SFFM needs FC > 0, MDI >= 0 and FS > 0 (defaults are not supported yet)");
+                s.wf[3] = std::min(s.wf[3], s.wf[2] / s.wf[4]);
+            }
+            if (!hasDC) { dc = kw == "EXP" ? s.wf[0] : 0.0; return; }  // ngspice's DC value of SFFM and AM is 0, not their t = 0 value
+            break;
         } else {
             dc = parseValue(tok[i++]);  // bare value, e.g. "V1 1 0 5"
             hasDC = true;

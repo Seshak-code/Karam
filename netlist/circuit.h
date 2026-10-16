@@ -181,6 +181,9 @@ struct VoltageSource {
     std::vector<double> pwl_t, pwl_v;
     double pwl_td = 0.0, pwl_r = -1.0;  // r < 0: no repeat
 
+    // EXP v1 v2 td1 tau1 td2 tau2 | SFFM vo va fc mdi fs | AM vo vmo vma fm fc td (ngspice order)
+    std::vector<double> wf;
+
     std::string expression;  // Symbolic override for DC/main value
     std::string name;        // instance name (F/H cards reference it)
 };
@@ -218,6 +221,7 @@ struct CurrentSource {
 
     std::vector<double> pwl_t, pwl_v;
     double pwl_td = 0.0, pwl_r = -1.0;
+    std::vector<double> wf;  // EXP / SFFM / AM arguments, as VoltageSource::wf
 
     std::string expression;  // Symbolic override for DC/main value
 };
@@ -266,6 +270,22 @@ inline double waveformValue(const Src& s, double dcValue, double t) {
         if (tt < s.pulse_tf) return s.pulse_v2 + (s.pulse_v1 - s.pulse_v2) * (tt / s.pulse_tf);
         return s.pulse_v1;
     }
+    if (s.type == "EXP") {  // ngspice: the second rise starts at TD2, on top of the first
+        const auto& w = s.wf;
+        if (t <= w[2]) return w[0];
+        const double a = w[0] + (w[1] - w[0]) * (1.0 - std::exp(-(t - w[2]) / w[3]));
+        return t <= w[4] ? a : a + (w[0] - w[1]) * (1.0 - std::exp(-(t - w[4]) / w[5]));
+    }
+    if (s.type == "SFFM") {
+        const auto& w = s.wf;
+        const double kTwoPi = 6.283185307179586;
+        return w[0] + w[1] * std::sin(kTwoPi * w[2] * t + w[3] * std::sin(kTwoPi * w[4] * t));
+    }
+    if (s.type == "AM") {
+        const auto& w = s.wf;
+        const double kTwoPi = 6.283185307179586, tt = t - w[5];  // 0 (not VO) until TD, as ngspice
+        return tt <= 0.0 ? 0.0 : w[0] + std::sin(kTwoPi * w[4] * tt) * (w[1] + w[2] * std::sin(kTwoPi * w[3] * tt));
+    }
     if (s.type == "SINE") {
         const double kPi = 3.141592653589793;
         double phase = s.sine_phase * (kPi / 180.0);
@@ -286,6 +306,12 @@ template <class Src>
 inline double nextBreakpoint(const Src& s, double t) {
     const double inf = std::numeric_limits<double>::infinity();
     if (s.type == "SINE") return t < s.sine_td ? s.sine_td : inf;
+    if (s.type == "EXP") {  // the two rise starts
+        double b = inf;
+        for (double c : {s.wf[2], s.wf[4]}) if (c > t) b = std::min(b, c);
+        return b;
+    }
+    if (s.type == "AM") return t < s.wf[5] ? s.wf[5] : inf;
     if (s.type == "PWL") {  // the next corner, in absolute time
         const double tt = pwlLocalTime(s, t), shift = t - tt;
         const auto it = std::upper_bound(s.pwl_t.begin(), s.pwl_t.end(), tt);
