@@ -1,0 +1,6 @@
+* qa4: PWL voltage step driving inductor without step control stall
+V1 1 0 PWL(0 0 1n 1 1n 0 2n 0)
+R1 1 2 10
+L1 2 0 1u
+.tran 0.1n 3n
+.end

@@ -1,0 +1,5 @@
+* qa4: PWL step transition at t=0
+V1 1 0 PWL(0 0 0 1 1n 1 2n 0)
+R1 1 0 1k
+.tran 0.1n 2n
+.end

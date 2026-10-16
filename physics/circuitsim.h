@@ -1510,6 +1510,12 @@ public:
       addRes(r.nodeTerminal2, i_r);  // Current ENTERING node
     }
 
+    // 1.5 The transient OP's node gmin (addDiagonalConditioning(ptranGmin_)): the audit must
+    // see the current the matrix holds, or a node at volts never passes KCL there (10 V at
+    // 1e-12 S is 10 pA: a floating node behind a 1 ms RC failed every step at t = 0)
+    if (ptranGmin_ > 0.0)
+      for (int i = 1; i <= n; ++i) addRes(i, -ptranGmin_ * getV(i));
+
     // 2. V sources, inductors, E/F/H: branch-current elements, audited from
     //    the same triplets they are stamped with (see buildBranchSystem below)
 

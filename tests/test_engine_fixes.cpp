@@ -337,11 +337,10 @@ int main() {
         auto r = run(mode, "* series caps\nV1 1 0 DC 5\nC1 1 2 1u\nC2 2 0 1u\nR1 1 0 1k\n.op\n");
         check(r.converged && near(V(r, 2), 2.5, 1e-4),
               "node without a DC path: transient OP gives the capacitive divider V(2) = 2.5 (" + std::to_string(V(r, 2)) + ")");
-        // ...but only a settled transient OP: 1 mA into a cap-only node charges it for good
-        // (it "converged" at I*10us/C = 0.01 V, BUG-7)
+        // ...settled or not: 1 mA into a 1 uF cap-only node is I*10us/C = 0.01 V, as ngspice 47
         r = run(mode, "* cap-only node\nI1 0 2 DC 1m\nC1 2 0 1u\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
-        check(!r.converged && r.errorDetail.find("no DC path") != std::string::npos,
-              "current into a cap-only node: no operating point (" + r.errorDetail.substr(0, 60) + ")");
+        check(r.converged && near(V(r, 1), 0.01, 1e-6),  // node "2" is listed first: index 1
+              "current into a cap-only node: ngspice's transient OP value 0.01 V (" + std::to_string(V(r, 1)) + ")");
         // A pivot cancelled to rounding residue is singular: 1 mA into a floating 100-resistor
         // chain split over several fronts "converged" at 1e14 V (BUG-6)
         std::string net = "* floating chain\n.options gmin=0 gminsteps=0\nV1 1 0 DC 1\nR0 1 0 1k\nI1 0 f0 DC 1m\n";
@@ -349,6 +348,17 @@ int main() {
         r = run(mode, net + ".op\n");
         check(!r.converged && r.errorDetail.find("no DC path") != std::string::npos,
               "current into a floating 100-resistor chain: singular (" + r.errorDetail.substr(0, 60) + ")");
+        // ...and a floating star, whose cancelled pivot is fill (its own A entry is 0): only
+        // the absolute bound (ngspice's PIVTOL) catches it (BUG-6, Gemini round 3)
+        net = "* floating star\n.options gmin=0 gminsteps=0\nV1 1 0 DC 1\nR0 1 0 1k\nI1 0 c DC 1m\n";
+        for (int i = 0; i < 10; ++i) net += "RS" + std::to_string(i) + " c s" + std::to_string(i) + " 1k\n";
+        r = run(mode, net + ".op\n");
+        check(!r.converged && r.errorDetail.find("no DC path") != std::string::npos,
+              "current into a floating 10-spoke star: singular (" + r.errorDetail.substr(0, 60) + ")");
+        // A floating node behind a 1 ms RC: ngspice's 10 us transient OP leaves it mid-charge
+        r = run(mode, "* rc float\nV1 1 0 DC 10\nR1 1 2 1k\nC1 2 3 1u\nC2 3 4 1u\nR2 4 0 1k\n.op\n");
+        check(r.converged && near(V(r, 2), 5.049751, 1e-4) && near(V(r, 3), 5.0, 1e-4) && near(V(r, 4), 4.950249, 1e-4),
+              "floating node behind a 1 ms RC: ngspice's transient OP values 5.05 / 5.00 / 4.95 V");
     }
     {
         CircuitSim sim;

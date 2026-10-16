@@ -102,7 +102,8 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // nodes at 0 V and every capacitor uncharged, sources applied, to steady state,
   // so such a node keeps zero net charge (a capacitive divider decides it).
   bool finalSingular = false, floatingNodes = false;
-  Csr_matrix singularJacobian{};
+  double lastPivot = std::numeric_limits<double>::infinity();  // of the latest solve
+  int lastPivotRow = -1;
   double srcConv = 0.0, srcRaise = 1e-3;
   const std::vector<double> &seededGuess = coldSeed;  // gmin stepping restarts cold
   std::vector<double> lastGood;
@@ -153,6 +154,8 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       // Tensor-contraction direct solver for every circuit (the legacy
       // treewidth / MPO / Schur routes solved a voltage-only system)
       SolverResult result = solveLinear(matrix, rhsVector);
+      lastPivot = result.smallestPivot;
+      lastPivotRow = result.rankDeficientRow;
       if (iteration == 0 && si == 0) {
         std::cerr << "[TN-ROUTE] CONTRACTION (unknowns=" << nTot
                   << ", branches=" << nTot - netlist.numGlobalNodes
@@ -173,7 +176,6 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         singularMatrixDetected = true;
         singularRow = result.rankDeficientRow;
         if (finalStep && gminSteppingUsed && !sourceSteppingUsed) finalSingular = true;
-        singularJacobian = std::move(matrix);  // scales the transient OP's KCL check
         // If singular, retrying with same Jacobian won't help. Abort this GMIN
         // step.
         total_iterations += iteration + 1;
@@ -320,6 +322,17 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     finalStep = gmin_factor == 0.0;
   } // End GMIN stepping loop
 
+  // A DC solution needs a sound final factorization. Newton may cross near-singular
+  // iterates (a 100-stage RTL chain's source-stepping start has 1e-92 pivots and converges),
+  // but an answer factored through a pivot at or below ngspice's PIVTOL is no solution: a
+  // floating network with a current forced into it, split over fronts, left a 1e-18
+  // rounding residue and "converged" at 1e15 V (BUG-6: chains, stars, grids).
+  if (converged && !(lastPivot > PhysicsConstants::PIVTOL)) {
+    converged = false;
+    singularMatrixDetected = true;
+    singularRow = lastPivotRow;
+  }
+
   if (!converged && finalSingular) {
     // ngspice's defaults: 100 ns steps to 10 us (optran ... 100n 10u)
     srcFact_ = 1.0;  // source stepping may have left the sources scaled down
@@ -331,21 +344,10 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     if (runTransient(pseudo, 100e-9, 10e-6, /*uic=*/true, [](const SolverStep &) { return true; }).empty()) {
       voltageEstimate = lastSolution_;
       voltageEstimate.resize(nTot, 0.0);
-      // Only a settled transient is an operating point: a current forced into a node that has
-      // only capacitors charges it for good, and its 10 us value is not one (1 mA into 1 uF
-      // "converged" at 0.01 V, BUG-7). DC KCL (caps open, no gmin) must hold at every node to
-      // ngspice's reltol/abstol, scaled by the node's currents in the last DC Jacobian.
-      std::vector<double> r;
-      calculatePhysicalResiduals(netlist, voltageEstimate, r);
-      const Csr_matrix &J = singularJacobian;
-      bool settled = true;
-      for (int i = 0; i < netlist.numGlobalNodes && i < (int)r.size() && i < J.rows; ++i) {
-        double scale = 0.0;
-        for (int k = J.row_pointer[i]; k < J.row_pointer[i + 1]; ++k)
-          scale += std::abs(J.values[k]) * std::abs(voltageEstimate[J.col_indices[k]]);
-        settled = settled && std::abs(r[i]) <= 1e-3 * scale + 1e-12;
-      }
-      converged = floatingNodes = settled;
+      // As ngspice 47: the 10 us value is the operating point, settled or not (1 mA into a
+      // 1 uF cap-only node gives I*10us/C = 0.01 V there too; a floating node behind a 1 ms
+      // RC is mid-charge). BUG-7 asked for "singular" here; ngspice does not say that.
+      converged = floatingNodes = true;
     }
   }
 

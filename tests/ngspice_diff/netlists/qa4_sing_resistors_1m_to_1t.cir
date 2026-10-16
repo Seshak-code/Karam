@@ -1,0 +1,9 @@
+* qa4: Resistors spanning 1mOhm to 1TOhm (15 orders of magnitude dynamic range)
+V1 1 0 DC 10
+R1 1 2 1m
+R2 2 3 1k
+R3 3 4 1Meg
+R4 4 5 1G
+R5 5 0 1T
+.op
+.end

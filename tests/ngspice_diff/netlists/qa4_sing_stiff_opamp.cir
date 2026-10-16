@@ -1,0 +1,6 @@
+* qa4: Stiff E-source op-amp with gain 1e6 in unity-gain feedback
+VIN in 0 DC 2.5
+E1 out 0 in out 1e6
+RL out 0 1k
+.op
+.end
