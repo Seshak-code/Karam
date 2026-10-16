@@ -492,6 +492,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
 
     // Finalize: compute numGlobalNodes from nodeMap (max index)
+    result_.nodeIndex = nodeMap_;
     for (const auto& [name, idx] : nodeMap_) {
         if (idx > result_.netlist.numGlobalNodes)
             result_.netlist.numGlobalNodes = idx;

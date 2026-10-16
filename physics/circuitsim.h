@@ -38,7 +38,6 @@
 #include "corner_config.h"
 #include "../solvers/neural_seeder.h"
 #include "../solvers/lte_controller.h"
-#include "../solvers/digital_event_engine.h"
 
 // ============================================================================
 // CIRCUITSIM CLASS
@@ -447,11 +446,15 @@ public:
   // the kink measure the kink (an inductor's voltage jumps with dI/dt), not truncation error, and
   // rejected step after step down to femtoseconds. Three refill a trapezoidal history past it.
   int lteHold_ = 0;
+  // runTransient's loop state, kept between advanceTo calls
+  struct TranLoop {
+    double step = 0, dtMin = 0, endTol = 0, hMax = 0, h = 0, t = 0;
+    bool landedOnCorner = false;
+    int tinySteps = 0;
+    std::vector<std::function<double(double)>> corners;  // next waveform corner after x, per source
+  } tran_;
+  void tranCorners(const TensorNetlist &netlist);
   double lteTolerance_ = 1e-4;  // absolute LTE tolerance
-
-  // Gap 2: Mixed-signal digital event engine.
-  // Handles A2D/D2A boundary conditions and zero-delay digital propagation.
-  DigitalEventEngine digitalEngine_;
 
   // Callbacks for orchestration
   std::function<void(int, double)> onConvergenceStep;
@@ -1100,6 +1103,22 @@ public:
   // Returns an empty string on success, else the error.
   std::string runTransient(TensorNetlist &netlist, double step, double stop, bool uic,
                            const std::function<bool(const SolverStep &)> &onPoint);
+
+  // The same loop in lockstep with an outside driver: beginTransient runs the t = 0
+  // prologue (`stop` > 0 only sets ngspice's step caps; 0 = unknown, cap at `step`),
+  // advanceTo(tEnd) steps until time() == tEnd (the last step is clipped to it, the
+  // unclipped one carries to the next call), setSource re-drives a named V (or I)
+  // source from its value now to `volts` over `rampS` (0 = a step at the instant).
+  // The netlist must outlive the run and not be restructured. advanceTo and
+  // beginTransient return "" on success, else the error.
+  std::string beginTransient(TensorNetlist &netlist, double step, bool uic, double stop = 0.0);
+  std::string advanceTo(TensorNetlist &netlist, double tEnd,
+                        const std::function<bool(const SolverStep &)> &onPoint = {});
+  bool setSource(TensorNetlist &netlist, const std::string &name, double volts, double rampS);
+  double tranTime() const { return tran_.t; }
+  double nodeVoltage(int node) const {  // node 0 = ground
+    return node > 0 && node <= (int)lastSolution_.size() ? lastSolution_[node - 1] : 0.0;
+  }
 
   // AC small-signal sweep around the operating point of the last solveDC().
   // Y(jw) = G + jwC: G is the Newton Jacobian at the OP (the DC stamps, so every
@@ -2400,17 +2419,9 @@ public:
     // A node no element touches is not a circuit node (ngspice drops it after
     // flattening, e.g. an X pin wired to a port the .subckt never uses): pin it
     // to 0 V. A real floating node (series caps, an undriven gate) still fails.
-    // ponytail: skipped when D2A ports exist (they stamp nodes of their own).
-    if (!digitalEngine_.hasOutputPorts()) {
-      const std::vector<char> used = usedNodes(netlist);
-      for (int n = 1; n <= netlist.numGlobalNodes; ++n)
-        if (!used[n]) matrixBuilder.add(n - 1, n - 1, 1.0);
-    }
-
-    // ─── Gap 2: Digital Event Engine — D2A Stamping ──────────────────────
-    if (digitalEngine_.hasOutputPorts()) {
-        digitalEngine_.stampD2A(matrixBuilder, rhsVector, netlist.numGlobalNodes, h);
-    }
+    const std::vector<char> used = usedNodes(netlist);
+    for (int n = 1; n <= netlist.numGlobalNodes; ++n)
+      if (!used[n]) matrixBuilder.add(n - 1, n - 1, 1.0);
   }
 
 

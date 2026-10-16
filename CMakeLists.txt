@@ -187,7 +187,7 @@ target_link_libraries(acutesim_engine_dump PRIVATE acutesim_engine)
 # ---------------------------------------------------------------------------
 if(TREESPICE_STANDALONE)
     enable_testing()
-    foreach(t test_engine_fixes test_contraction_solver test_convergence_engine)
+    foreach(t test_engine_fixes test_transient_session test_contraction_solver test_convergence_engine)
         add_executable(${t} tests/${t}.cpp)
         target_link_libraries(${t} PRIVATE acutesim_engine)
         add_test(NAME ${t} COMMAND ${t})

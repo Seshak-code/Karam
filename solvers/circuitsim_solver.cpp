@@ -613,9 +613,30 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
                                      const std::function<bool(const SolverStep &)> &onPoint) {
   if (step == 0.0) step = stop / 50.0;  // .tran 0 tstop: ngspice's default TMAX
   if (!(step > 0.0) || !(stop > 0.0)) return "Transient needs step >= 0 and stop time > 0.";
+  const std::string err = beginTransient(netlist, step, uic, stop);
+  return err.empty() ? advanceTo(netlist, stop, onPoint) : err;
+}
+
+// Waveform sources whose corners the steps must land on (SPICE breakpoints).
+// ponytail: scans every waveform source per step; a merged corner queue is
+// the upgrade if designs carry thousands of PULSE sources.
+void CircuitSim::tranCorners(const TensorNetlist &netlist) {
+  auto &corners = tran_.corners;
+  corners.clear();
+  auto addCorners = [&](const TensorBlock &b) {
+    for (const auto &v : b.voltageSources)
+      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
+    for (const auto &i : b.currentSources)
+      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
+  };
+  addCorners(netlist.globalBlock);
+  for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);
+}
+
+std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool uic, double stop) {
+  if (!(step > 0.0)) return "Transient needs step > 0.";
   osdiFatal_.clear();
   osdiNonFinite_.clear();
-
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
   if (uic) {
@@ -644,23 +665,12 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   seedReactiveHistory(netlist, x0, uic);
   lastSolution_ = x0;  // seeds the first Newton iteration
 
-  // Waveform sources whose corners the steps must land on (SPICE breakpoints).
-  // ponytail: scans every waveform source per step; a merged corner queue is
-  // the upgrade if designs carry thousands of PULSE sources.
-  std::vector<std::function<double(double)>> corners;
-  auto addCorners = [&](const TensorBlock &b) {
-    for (const auto &v : b.voltageSources)
-      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
-    for (const auto &i : b.currentSources)
-      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
-  };
-  addCorners(netlist.globalBlock);
-  for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);
-
   // A failed step returns converged=false at the SAME time: shrink h and
   // retry, give up below dtMin, regrow toward the user step.
-  const double dtMin = step * 1e-9;
-  const double endTol = step * 1e-9;  // absorb FP drift at the final step
+  tran_ = {};
+  tran_.step = step;
+  tran_.dtMin = step * 1e-9;
+  tran_.endTol = step * 1e-9;  // absorb FP drift at the final step
   // The step after a corner uses backward Euler (SPICE: order 1 after a
   // breakpoint): trapezoidal rings +-dv across a derivative jump (an L driven
   // by a ramp that stops) and LTE rejection then shrinks h until it gives up.
@@ -668,11 +678,17 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   // min(tstep, tstop/100)/100, then doubling under LTE rejection. Starting at tstep
   // sampled a 100 MHz sine only at its zeros and stepped an LC tank one period at a
   // time; LTE has no history to reject the first steps (QA3 BUG-6).
-  const double hMax = std::min(step, stop / 50.0);
-  double h = std::min(step, stop / 100.0) / 100.0, t = 0.0;
-  bool landedOnCorner = false;
-  int tinySteps = 0;
+  tran_.hMax = stop > 0.0 ? std::min(step, stop / 50.0) : step;
+  tran_.h = (stop > 0.0 ? std::min(step, stop / 100.0) : step) / 100.0;
+  tranCorners(netlist);
+  return "";
+}
+
+std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
+                                  const std::function<bool(const SolverStep &)> &onPoint) {
+  auto &[step, dtMin, endTol, hMax, h, t, landedOnCorner, tinySteps, corners] = tran_;
   while (stop - t > endTol) {
+    const bool endClip = stop - t < h;
     double hTry = std::min(h, stop - t);
     const double intended = hTry;  // before clipping to a corner (ngspice's CKTsaveDelta)
     bool toCorner = false;
@@ -693,10 +709,11 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
       continue;
     }
     const double taken = s.time - t;
+    const bool tickEnd = endClip && taken >= hTry * (1.0 - 1e-9);  // the tick, not the step size, ended this step
     // Stalled: a run of accepted steps far below the user step (an ill-posed model
     // that converges only at femtosecond steps) would take millions of them.
     // ponytail: 1000 consecutive steps below step*1e-4 is a heuristic bound.
-    tinySteps = taken < step * 1e-4 ? tinySteps + 1 : 0;
+    if (!tickEnd) tinySteps = taken < step * 1e-4 ? tinySteps + 1 : 0;
     if (tinySteps > 1000) {
       std::ostringstream msg;
       msg << "Transient stalled at t=" << t << " s: 1000 steps below " << step * 1e-4 << " s (timestep too small).";
@@ -709,8 +726,10 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     }
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
-    if (!onPoint(s)) return "Cancelled.";
+    if (onPoint && !onPoint(s)) return "Cancelled.";
+    const double hKept = h;
     h = std::min(hMax, taken * 2.0);
+    if (tickEnd && !toCorner) h = std::max(h, hKept);  // a clipped tick says nothing about the step size
     // After a corner, as ngspice dctran: at most 0.1 * min(the step that was intended
     // before it was clipped to the corner, the gap to the next corner). A source jump (a
     // PWL repeat) taken with one 4.5 ns backward-Euler step left an RC 13 mV low against
@@ -725,6 +744,35 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     }
   }
   return "";
+}
+
+bool CircuitSim::setSource(TensorNetlist &netlist, const std::string &name, double volts, double rampS) {
+  std::string key = name;
+  for (auto &c : key) c = (char)std::toupper((unsigned char)c);
+  const double t = tran_.t;
+  auto drive = [&](auto &srcs, auto dc) {  // V: voltage_V, I: current_A
+    for (auto &src : srcs) {
+      if (src.name != key) continue;
+      const double now = waveformValue(src, dc(src), t);
+      src.type = "PWL";
+      src.pwl_t = {t, t + std::max(rampS, 0.0)};
+      src.pwl_v = {now, volts};
+      src.pwl_td = 0.0;
+      src.pwl_r = -1.0;
+      return true;
+    }
+    return false;
+  };
+  auto &g = netlist.globalBlock;  // ponytail: top level only; sources inside a .subckt are not reachable by name
+  if (!drive(g.voltageSources, [](auto &v) { return v.voltage_V; }) &&
+      !drive(g.currentSources, [](auto &i) { return i.current_A; }))
+    return false;
+  tranCorners(netlist);
+  // The jump is a corner: the next step is backward Euler and short, as after any breakpoint
+  tran_.landedOnCorner = true;
+  lteHold_ = 3;
+  tran_.h = std::min(tran_.h, 0.1 * tran_.hMax);
+  return true;
 }
 
 bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
@@ -1261,15 +1309,6 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
                                          lteTolerance_, integrator->getType());
       if (lte_dt < next_dt_suggestion) {
         next_dt_suggestion = lte_dt;
-      }
-
-      // ─── Gap 2: Digital Event Engine — A2D Sampling ──────────────────
-      // After analog convergence, sample voltages at A2D boundary ports
-      // and propagate digital events. This prepares D2A stamps for the
-      // next transient step.
-      if (digitalEngine_.portCount() > 0) {
-        digitalEngine_.sampleAnalog(nrEstimate, currentTime + actualTimeStep);
-        digitalEngine_.propagateEvents();
       }
 
       finalVoltages = nrEstimate;
