@@ -503,8 +503,9 @@ private:
         std::string key = s.name + given;
         for (const auto &[k, v] : s.defaults) { double x; sc.lookup(k, x); key += " " + k + "=" + num(x); }
         // Generated names use '|', which SPICE names never hold (sky130's hold "__"): the parser's
-        // messages map them back to the user's names (SPICEParser::parse, fail)
-        auto [spec, isNew] = specialized_.emplace(key, s.defaults.empty() ? s.name : s.name + "|" + std::to_string(specialized_.size() + 1));
+        // messages map them back to the user's names (SPICEParser::parse, fail). Only a key with no
+        // parameters keeps the plain name: body-.param subckts (sky130) differ by `given` alone
+        auto [spec, isNew] = specialized_.emplace(key, key == s.name ? s.name : s.name + "|" + std::to_string(specialized_.size() + 1));
         if (isNew) {
             for (const auto &[bn, bl] : s.body) collectParams(bl, sc);  // body .params (any order)
             std::map<std::string, std::string> models;

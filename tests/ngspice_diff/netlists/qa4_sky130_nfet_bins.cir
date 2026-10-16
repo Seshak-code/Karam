@@ -1,0 +1,14 @@
+* qa4: Sky130 nfet bin edge sweep with NF=1, 2, 4 across multiple bin boundaries
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VG 2 0 DC 1.0
+R1 1 11 1k
+XM1 11 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=0.42 nf=1
+R2 1 12 1k
+XM2 12 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=1.26 nf=2
+R3 1 13 1k
+XM3 13 2 0 0 sky130_fd_pr__nfet_01v8 l=0.5 w=2.0 nf=4
+R4 1 14 1k
+XM4 14 2 0 0 sky130_fd_pr__nfet_01v8 l=1.0 w=5.0 nf=2
+.op
+.end

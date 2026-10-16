@@ -1,0 +1,6 @@
+* qa4: PWL source evaluated at DC operating point (should equal t=0 value)
+V1 1 0 PWL(0 1.25 10u 3.3)
+R1 1 2 10k
+R2 2 0 10k
+.op
+.end

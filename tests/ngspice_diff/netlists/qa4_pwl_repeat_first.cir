@@ -1,0 +1,6 @@
+* qa4: PWL with R=0 repeating from the initial point
+V1 1 0 PWL(0 0.5 1n 2.5 2n 0.5 R=0)
+R1 1 2 500
+C1 2 0 2p
+.tran 0.1n 8n
+.end

@@ -1,0 +1,6 @@
+* qa4: PWL with TD (delay) and R (repeat) across multiple periods
+V1 1 0 PWL(0 0 1n 1.8 2n 0 TD=1n R=1n)
+R1 1 2 1k
+C1 2 0 1p
+.tran 0.1n 10n
+.end

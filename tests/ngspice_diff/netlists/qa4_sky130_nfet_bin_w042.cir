@@ -1,0 +1,8 @@
+* qa4: Sky130 nfet bin edge W=0.42 NF=1
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VG 2 0 DC 1.0
+R1 1 11 1k
+XM1 11 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=0.42 nf=1
+.op
+.end

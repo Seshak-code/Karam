@@ -1,0 +1,16 @@
+* qa4: 3-stage ring oscillator with Sky130 BSIM4 to test bypass phase accumulation
+.lib lib/sky130_tt_min.lib tt
+.subckt inv in out vdd gnd
+XP out in vdd vdd sky130_fd_pr__pfet_01v8_hvt l=0.15 w=1.0
+XN out in gnd gnd sky130_fd_pr__nfet_01v8 l=0.15 w=0.65
+.ends
+VDD vdd 0 DC 1.8
+X1 n1 n2 vdd 0 inv
+X2 n2 n3 vdd 0 inv
+X3 n3 n1 vdd 0 inv
+C1 n1 0 5f
+C2 n2 0 5f
+C3 n3 0 5f
+.ic V(n1)=0.0 V(n2)=1.8 V(n3)=0.0
+.tran 10p 2n
+.end

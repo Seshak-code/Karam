@@ -1,0 +1,11 @@
+* qa4: PWL voltage and current sources inside subcircuit
+.subckt pwl_driver in_ref out
+V1 int 0 PWL(0 0 2n 1.0 4n 2.0 6n 0)
+I1 int out PWL(0 0 3n 1m 6n 0)
+R1 int out 1k
+.ends
+X1 0 1 pwl_driver
+RL 1 0 500
+CL 1 0 1p
+.tran 0.2n 10n
+.end
