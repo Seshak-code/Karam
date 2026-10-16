@@ -60,16 +60,18 @@ target_compile_options(acutesim_engine_objects PRIVATE
 # No -ffast-math: it implies -ffinite-math-only, which deletes every
 # isnan/isfinite guard in the solver (NaN results were reported as converged),
 # and it breaks the project's cross-platform determinism rule (see CLAUDE.md).
-if(NOT EMSCRIPTEN)
-    target_compile_options(acutesim_engine_objects PRIVATE
-        -march=native     # Enables AVX-512 / NEON auto-detection at runtime
-    )
+# No FMA contraction either: a fused a*b+c rounds once instead of twice, so arm64 (where
+# clang contracts within expressions and GCC across them) and x86 gave different bits.
+# No -march=native: the binary must run, and give the same results, on any machine.
+# The engine and every later target (tests and tools compile header-only engine parts)
+if(MSVC)
+    set(TREESPICE_FP_FLAGS /fp:strict)
+else()
+    set(TREESPICE_FP_FLAGS -ffp-contract=off)
+    target_compile_options(acutesim_engine_objects PRIVATE -O3)
 endif()
-
-# Enable exceptions and RTTI for legacy solver logic
-set_target_properties(acutesim_engine_objects PROPERTIES
-    COMPILE_FLAGS "-O3 -march=native"
-)
+target_compile_options(acutesim_engine_objects PRIVATE ${TREESPICE_FP_FLAGS})
+add_compile_options(${TREESPICE_FP_FLAGS})
 
 target_compile_definitions(acutesim_engine_objects PRIVATE
     ACUTESIM_ENGINE_INTERNAL=1
