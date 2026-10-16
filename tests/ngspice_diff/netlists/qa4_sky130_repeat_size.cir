@@ -1,0 +1,21 @@
+* qa4: Sky130 repeat size alongside different size (specialization caching)
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VG 2 0 DC 1.0
+* NFETs: XM1 and XM2 share identical size, XM3 has a different size
+R1 1 11 1k
+XM1 11 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=0.42 nf=1
+R2 1 12 1k
+XM2 12 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=0.42 nf=1
+R3 1 13 1k
+XM3 13 2 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=1.26 nf=2
+
+* PFETs: XP1 and XP2 share identical size, XP3 has a different size
+R4 14 0 1k
+XP1 14 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=1.0 nf=1
+R5 15 0 1k
+XP2 15 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=1.0 nf=1
+R6 16 0 1k
+XP3 16 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.5 w=2.0 nf=4
+.op
+.end

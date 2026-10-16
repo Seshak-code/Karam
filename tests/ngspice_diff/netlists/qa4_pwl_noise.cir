@@ -1,0 +1,8 @@
+* qa4: Noise analysis with PWL voltage source as input
+V1 in 0 AC 1 PWL(0 0.8 1n 1.5 2n 0.2)
+VDD vdd 0 DC 1.8
+RD vdd out 10k
+M1 out in 0 0 nmos W=10u L=0.18u
+.model nmos nmos level=1 vto=0.4 kp=100u
+.noise v(out) V1 dec 10 1k 100Meg
+.end

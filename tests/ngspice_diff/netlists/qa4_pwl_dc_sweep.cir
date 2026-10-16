@@ -1,0 +1,5 @@
+* qa4: DC sweep over a PWL voltage source
+V1 in 0 PWL(0 0.8 1n 1.5 2n 0.2)
+R1 in 0 1k
+.dc V1 0 1.8 0.1
+.end

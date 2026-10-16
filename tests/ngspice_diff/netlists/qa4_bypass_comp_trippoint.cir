@@ -1,0 +1,9 @@
+* qa4: CMOS comparator held right at its trip point with small perturbation
+.lib lib/sky130_tt_min.lib tt
+VDD vdd 0 DC 1.8
+VIN in 0 SIN(0.7909 2m 5MEG)
+XP out in vdd vdd sky130_fd_pr__pfet_01v8_hvt l=0.15 w=1.0
+XN out in 0 0 sky130_fd_pr__nfet_01v8 l=0.15 w=0.65
+CL out 0 10f
+.tran 1n 200n
+.end

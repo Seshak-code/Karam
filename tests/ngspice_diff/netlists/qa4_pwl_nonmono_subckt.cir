@@ -1,0 +1,8 @@
+* qa4: PWL source with non-monotonic decreasing time points inside subcircuit
+.subckt driver 1 0
+V1 1 0 PWL(0 0 2n 1 1n 0 3n 0)
+.ends driver
+X1 1 0 driver
+R1 1 0 1k
+.tran 0.1n 3n
+.end
