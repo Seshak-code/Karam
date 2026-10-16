@@ -2,7 +2,7 @@
 // Covers: grid (unsymmetric), circuit-like graph with supply-net hubs and
 // VCVS rows (1e10 off-diagonals: pivoting stress), disconnected components,
 // n=1, long chain; prints plan size and timings up to 1e6 unknowns. With a GPU,
-// fronts >= TREESPICE_GPU_FRONT (default 256) take the FP32 GPU path.
+// fronts >= TREESPICE_GPU_FRONT (default 512) take the FP32 GPU path.
 #include "math/contraction_solver.h"
 #include "math/gpu_front_lu.h"
 #include <chrono>
@@ -111,8 +111,8 @@ static void compareDense(const char* name, const Csr_matrix& A) {
 
 int main() {
     std::printf("== correctness vs dense LU ==\n");
-    if (gpuFrontLuAvailable()) {  // grid 150: peak front ~290
-        auto A = grid(150, true); auto b = rhsFor(A.rows, 3);
+    if (gpuFrontLuAvailable()) {  // grid 300: peak front ~570, past the default GPU cutoff (512)
+        auto A = grid(300, true); auto b = rhsFor(A.rows, 3);
         auto r = solveContraction(A, b, planContraction(A));
         check(r.gpuFronts > 0 && !r.fp64Refactor && backwardError(A, r.solution, b) <= 1e-13,
               "GPU FP32 fronts + FP64 refinement: backward error", backwardError(A, r.solution, b));

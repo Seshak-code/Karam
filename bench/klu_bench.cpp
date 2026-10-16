@@ -4,7 +4,8 @@
 //
 // tree: TreeSPICE's contraction solver. plan = planContraction (ordering + tree,
 //       once per pattern); fs = factor + solve without refinement (what every
-//       Newton iteration pays); omega after the engine's default 2 refinement steps.
+//       Newton iteration pays: factor memory reused through a ContractionCache, every
+//       front refactored); omega after the engine's default 2 refinement steps.
 //       gpu_fronts / fp64_redo: fronts factored in FP32 on the GPU, and whether that
 //       solve's refinement failed and was redone in FP64 (TREESPICE_GPU_FRONT=0: CPU only).
 // klu:  SuiteSparse KLU (BTF + AMD, the circuit-simulation baseline). analyze +
@@ -130,8 +131,17 @@ int main(int argc, char** argv) {
     if (solver == "tree") {
         ContractionPlan plan;
         double tPlan = timeMin(1, [&] { plan = planContraction(A); });
+        // As the engine's Newton loop: factor memory kept in a ContractionCache, every front
+        // dirty (A's sign flips between repetitions: same pivots, new values), like klu_refactor
         SolverResult res;
-        double tFs = timeMin(reps, [&] { res = solveContraction(A, b, plan, 0); });
+        ContractionCache cache;
+        solveContraction(A, b, plan, 0, &cache);
+        double tFs = INFINITY;
+        for (int k = 0; k < reps; ++k) {
+            for (double& v : A.values) v = -v;
+            tFs = std::min(tFs, timeMin(1, [&] { res = solveContraction(A, b, plan, 0, &cache); }));
+        }
+        if (reps % 2) for (double& v : A.values) v = -v;
         res = solveContraction(A, b, plan, 2);
         std::printf(" ok=%d plan=%.6g fs=%.6g flops=%.6g peak_front=%.0f fronts=%zu gpu_fronts=%d fp64_redo=%d omega=%.3g",
                     res.converged ? 1 : 0, tPlan, tFs, plan.flopEstimate, std::sqrt(plan.peakEntries),

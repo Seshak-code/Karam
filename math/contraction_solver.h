@@ -24,7 +24,7 @@
  *   solve: forward pass (same tree) + top-down back-substitution, followed by
  *     iterative refinement against the original A.
  *
- *   GPU (Phase 4): fronts of dimension >= TREESPICE_GPU_FRONT (env, default 256,
+ *   GPU (Phase 4): fronts of dimension >= TREESPICE_GPU_FRONT (env, default 512,
  *     0 = never) are factored in FP32 on the GPU when one is available
  *     (gpu_front_lu.h); FP64 refinement then restores full accuracy. If it does
  *     not converge (kappa * 2^-24 too large), the solve refactors in FP64.
