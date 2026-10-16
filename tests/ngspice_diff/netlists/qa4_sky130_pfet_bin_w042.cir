@@ -1,0 +1,8 @@
+* qa4: Sky130 pfet_hvt bin edge W=0.42 NF=1
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VG 2 0 DC 0.8
+R1 11 0 1k
+XP1 11 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=0.42 nf=1
+.op
+.end

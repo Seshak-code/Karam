@@ -1,0 +1,6 @@
+* qa4: Ramp voltage driving inductor abruptly stopping at breakpoint (order-1 Euler damping test)
+V1 1 0 PWL(0 0 10n 5.0 20n 5.0)
+R1 1 2 10
+L1 2 0 100n
+.tran 0.2n 20n
+.end

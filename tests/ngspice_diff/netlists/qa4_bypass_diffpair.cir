@@ -1,0 +1,17 @@
+* qa4: CMOS diff pair with Sky130 BSIM4 to stress device bypass
+.lib lib/sky130_tt_min.lib tt
+VDD vdd 0 DC 1.8
+VSS vss 0 DC 0
+VCM vcm 0 DC 0.9
+VIN in vcm SIN(0 20m 10MEG)
+* Tail current source
+ITAIL vtail vss DC 20u
+* Diff pair
+XN1 out1 in vtail vss sky130_fd_pr__nfet_01v8 l=0.5 w=2.0
+XN2 out2 vcm vtail vss sky130_fd_pr__nfet_01v8 l=0.5 w=2.0
+* Active load
+XP1 out1 out1 vdd vdd sky130_fd_pr__pfet_01v8 l=0.5 w=4.0
+XP2 out2 out1 vdd vdd sky130_fd_pr__pfet_01v8 l=0.5 w=4.0
+CL out2 0 10f
+.tran 1n 200n
+.end

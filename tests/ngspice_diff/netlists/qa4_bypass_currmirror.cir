@@ -1,0 +1,11 @@
+* qa4: Cascode current mirror with Sky130 BSIM4 to stress device bypass
+.lib lib/sky130_tt_min.lib tt
+VDD vdd 0 DC 1.8
+IIN vdd in PWL(0 1u 50n 20u 100n 50u)
+* Simple current mirror with drain-source sweep
+XN1 in in 0 0 sky130_fd_pr__nfet_01v8 l=0.5 w=2.0
+XN2 out in 0 0 sky130_fd_pr__nfet_01v8 l=0.5 w=2.0
+RL vdd out 10k
+CL out 0 20f
+.tran 1n 100n
+.end

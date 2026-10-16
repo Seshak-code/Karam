@@ -1,0 +1,15 @@
+* qa4: Sky130 nested subcircuits with .option scale and parameter overrides
+.lib lib/sky130_tt_min.lib tt
+.subckt leaf_inv in out vdd gnd params: width_p=1.0 width_n=0.65
+XP out in vdd vdd sky130_fd_pr__pfet_01v8_hvt l=0.15 w=width_p
+XN out in gnd gnd sky130_fd_pr__nfet_01v8 l=0.15 w=width_n
+.ends
+.subckt mid_block in out vdd gnd params: wp=1.5 wn=0.8
+X1 in out vdd gnd leaf_inv width_p=wp width_n=wn
+.ends
+VDD vdd 0 DC 1.8
+VIN in 0 DC 0.9
+Xtop in out vdd 0 mid_block wp=2.0 wn=1.0
+RL out 0 100k
+.op
+.end
