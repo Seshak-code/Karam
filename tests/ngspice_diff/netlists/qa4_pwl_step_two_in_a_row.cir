@@ -1,0 +1,5 @@
+* qa4: PWL two steps in a row at equal timestamps
+V1 1 0 PWL(0 0 1n 1 1n 0 1n 1 2n 1)
+R1 1 0 1k
+.tran 0.1n 2n
+.end

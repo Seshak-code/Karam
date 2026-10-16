@@ -1,0 +1,44 @@
+* qa4: 36-node island tied to ground by 1 T-ohm resistor with I-source
+.options gmin=0 gminsteps=0
+V1 1 0 DC 1
+R0 1 0 1k
+I1 0 f0 DC 1m
+RTIE f36 0 1T
+RF0 f0 f1 1k
+RF1 f1 f2 1k
+RF2 f2 f3 1k
+RF3 f3 f4 1k
+RF4 f4 f5 1k
+RF5 f5 f6 1k
+RF6 f6 f7 1k
+RF7 f7 f8 1k
+RF8 f8 f9 1k
+RF9 f9 f10 1k
+RF10 f10 f11 1k
+RF11 f11 f12 1k
+RF12 f12 f13 1k
+RF13 f13 f14 1k
+RF14 f14 f15 1k
+RF15 f15 f16 1k
+RF16 f16 f17 1k
+RF17 f17 f18 1k
+RF18 f18 f19 1k
+RF19 f19 f20 1k
+RF20 f20 f21 1k
+RF21 f21 f22 1k
+RF22 f22 f23 1k
+RF23 f23 f24 1k
+RF24 f24 f25 1k
+RF25 f25 f26 1k
+RF26 f26 f27 1k
+RF27 f27 f28 1k
+RF28 f28 f29 1k
+RF29 f29 f30 1k
+RF30 f30 f31 1k
+RF31 f31 f32 1k
+RF32 f32 f33 1k
+RF33 f33 f34 1k
+RF34 f34 f35 1k
+RF35 f35 f36 1k
+.op
+.end

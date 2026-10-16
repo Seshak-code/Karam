@@ -1,0 +1,5 @@
+* qa4: PWL step transition with TD delay
+V1 1 0 PWL(0 0 1n 1 1n 0 2n 0 TD 0.5n)
+R1 1 0 1k
+.tran 0.1n 3n
+.end

@@ -1,0 +1,5 @@
+* qa4: PWL current source with step transition
+I1 0 1 PWL(0 0 1n 1m 1n 0 2n 0)
+R1 1 0 1k
+.tran 0.1n 2n
+.end

@@ -1,0 +1,5 @@
+* qa4: Low-ohm 1mOhm wire to node with only gmin to ground (false positive check)
+V1 1 0 DC 5
+R1 1 2 1m
+.op
+.end
