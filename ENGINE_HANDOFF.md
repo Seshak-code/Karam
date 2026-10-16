@@ -128,6 +128,54 @@ then the two Roadmap sections it points to. Everything below was verified by run
   (5) the transient comparison allows a timing tolerance of tstep/10. Binning follows ngspice's probed rule;
   R `r=`/TC, model capacitors, `temper`, `.params`, `PARAMS:` are supported; `.param` arithmetic matches
   ngspice; parse errors show the user's names. Verified: see the commit message.
+- **Update 2026-10-15 (Claude Code, Phase 4, branch `phase4/gpu`, draft PR #9):** the KLU gap is closed
+  (`bench/results-2026-10-15.md`). The planner now also orders by approximate minimum degree (quotient graph,
+  degree buckets, element absorption, fundamental supernodes + CHOLMOD-rule relaxed amalgamation) and keeps the
+  cheaper of that and nested dissection (cost = flops + 1e4 per front; `TREESPICE_ORDERING=nd|md` forces one).
+  Per Newton iteration TreeSPICE is within 1.1-3x of KLU on the small circuit matrices and 1.5-2x faster on the
+  largest (rajat15, ASIC_100k, G2_circuit, scircuit); every SuiteSparse circuit matrix finishes (9 did not). A
+  persistent worker pool replaces per-level thread spawning. GPU: `math/gpu_front_lu.cpp` (dense FP32 LU of
+  fronts >= 512, FP64 refinement, CPU continues from a failed pivot) makes G2_circuit 7.2x and ASIC_100k 3.9x
+  faster than KLU and the 1e6 grid 2.5x faster than the CPU. A whole-tree GPU solver (one dispatch per level,
+  superposition as a gather) was correct but 1.5-10x slower than the CPU on every matrix (per-pivot barrier
+  latency on small fronts) and was deleted; the results file has the numbers. Verified: ctest, ngspice
+  544/0, Xyce 109/0, ibmpg 6/6, char_cells 0.087 %, IHP cells 74/77 (unchanged).
+- **Update 2026-10-16 (Claude Code, Phase 4 continued, branch `phase4/gpu`):** device evaluation and scale.
+  - **OSDI evaluation:** parallel on the worker pool (`math/worker_pool.h`). The KCL audit's evaluation is
+    reused by the next stamp. The device list is cached. Device bypass uses ngspice's voltage criterion
+    (`TREESPICE_BYPASS=0` turns it off). CSR assembly sorts only when the stamp pattern changes. A
+    1000-stage BSIM4 chain transient goes from 18.7 s to 4.9 s.
+  - **Scale:** delayed pivots no longer snowball. At most 8 rows per front are delayed (`kMaxDelayed`);
+    past that the largest fully-summed entry pivots, and a zero there is reported singular. Front buffers
+    that grew in a near-singular iterate give the excess back. A 1e5-stage chain (2e5 BSIM4 devices, 5e5
+    unknowns) used to die at a 133 GB peak footprint; it now runs a transient in 349 s at 2.65 GB.
+  - **New parser and solver features:**
+    - PWL sources, with TD= and R= as in ngspice (at a repeat boundary the waveform holds the last value).
+    - ngspice's step rule after a corner: at most 0.1 × min(the intended step, the gap to the next
+      corner).
+    - `.osdi` paths resolve against the netlist directory.
+  - **Scale-ladder gate** (`tests/scale_ladder.py`, BSIM4 chains against ngspice on the same OSDI):
+    - 1e3 stages: 1.9x ngspice, 50 % crossing 1.1 ps from ngspice's.
+    - 1e4 stages: 28 s; ngspice fails ("Timestep too small; initial timepoint").
+    - 1e5 stages: 349 s vs ngspice 3024 s (8.7x), 50 % crossing 1.1 ps from ngspice's.
+  - **QA (2026-10-16):** Gemini's Phase 4 pass (branch `qa/phase4`, 18 `qa4_*` netlists, merged into
+    `phase4/gpu` by Claude Code) found BUG-4: a subcircuit whose parameters are body `.param`s (sky130
+    devices) kept its plain name for every instance size, so two sizes emitted its models twice. Fixed in
+    `netlist/numparam.cpp` (only a parameterless key keeps the plain name).
+    Round 2 (`qa/phase4-r2`) found BUG-5: equal PWL times, ngspice's step, were rejected. They are
+    now accepted, and the step instant holds the earlier value, as in ngspice. Sonnet's solver QA
+    found two silent wrong answers on singular DC systems:
+    - BUG-6: a pivot cancelled to rounding residue (a current forced into a floating chain split over
+      fronts gave 1e15 V). Pivots below 1e-13 x their own entry in A are now singular.
+    - BUG-7: the transient-OP fallback accepted a capacitor-only node that was still charging. Its
+      result must now satisfy DC KCL to ngspice's reltol/abstol.
+    Not fixed:
+    - "check node N" uses the internal node number, not the netlist name.
+    - A 1 pF capacitor-only node still takes 6.5 s (the 10 us transient) before it reports singular.
+  - **Phase 4 Roadmap items not done:**
+    - Device evaluation on the GPU: OSDI models are host machine code, so evaluation stays on CPU threads.
+    - Isomorphism reuse beyond what bypass gives.
+    - Multirate integration.
 - **Status of the plan:** Roadmap Phase 1 (Foundations) is done. See `Roadmap.md` →
   "⚙️ ENGINE FEATURE LIST & VERIFIED SUPPORT STATUS" (what works, by device/analysis, with ✅/⚠️/❌/🚫/❓)
   and "🎯 END-TO-END GOAL & ENGINE SCALE PLAN" (phases and gates).

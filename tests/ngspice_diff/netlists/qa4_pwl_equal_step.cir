@@ -1,0 +1,5 @@
+* qa4: PWL source with equal timestamps representing step function
+V1 1 0 PWL(0 0 1n 1 1n 0 2n 0)
+R1 1 0 1k
+.tran 0.1n 2n
+.end

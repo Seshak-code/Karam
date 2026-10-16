@@ -1,0 +1,14 @@
+* qa4: Sky130 pfet_hvt multi-instance bin sweep across multiple sizes and finger counts
+.lib lib/sky130_tt_min.lib tt
+VDD 1 0 DC 1.8
+VG 2 0 DC 0.8
+R1 11 0 1k
+XP1 11 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=0.42 nf=1
+R2 12 0 1k
+XP2 12 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=1.0 nf=1
+R3 13 0 1k
+XP3 13 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.15 w=2.0 nf=2
+R4 14 0 1k
+XP4 14 2 1 1 sky130_fd_pr__pfet_01v8_hvt l=0.5 w=2.0 nf=4
+.op
+.end

@@ -1,4 +1,6 @@
 #include "contraction_solver.h"
+#include "gpu_front_lu.h"
+#include "worker_pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,10 +10,7 @@
 #include <limits>
 #include <numeric>
 #include <queue>
-#ifdef ACUTESIM_THREADS_ENABLED
-#include <atomic>
-#include <thread>
-#endif
+#include <string>
 
 namespace {
 
@@ -226,33 +225,174 @@ std::vector<int> sortedUnion(const std::vector<int>& a, const std::vector<int>& 
     return out;
 }
 
+// Approximate minimum degree (Amestoy, Davis & Duff) on the quotient graph of the
+// vertices in `vars`: eliminating a vertex p turns it into an element whose list
+// L[p] is p's elimination-graph neighbourhood; elements it touches are absorbed
+// into it (they become its children in the assembly tree), and so is any element
+// whose list the new one covers (aggressive absorption). Degrees are AMD's bound
+// |A_i| + |L_p| - 1 + sum over other elements e of |L_e \ L_p|. Fronts are the
+// fundamental supernodes of the assembly tree (a single child whose list is the
+// parent's plus the parent): what KLU's AMD gives sparse circuit matrices, where
+// BFS nested dissection builds huge dense separators (up to 20 000x KLU's flops).
+// ponytail: no supervariables or mass elimination; they speed up the ordering of
+// mesh-like graphs, not its quality on circuits.
+std::vector<ContractionFront> minDegreeFronts(const Adj& adj, const std::vector<int>& vars) {
+    const int n = (int)adj.size();
+    enum : char { OUT, LIVE, ELEMENT, ABSORBED };
+    std::vector<char> state(n, OUT);
+    for (int v : vars) state[v] = LIVE;
+    Adj A(n), E(n), L(n);
+    std::vector<int> deg(n, 0), parent(n, -1), w(n, -1), mark(n, -1), cnt(n, 0);  // cnt: |L_p|
+    // Degree buckets (doubly linked lists, as AMD): O(1) insert / remove / min
+    std::vector<int> head(n + 1, -1), nxt(n, -1), prv(n, -1);
+    int minDeg = n;
+    auto bucketIn = [&](int v) {
+        nxt[v] = head[deg[v]]; prv[v] = -1;
+        if (head[deg[v]] >= 0) prv[head[deg[v]]] = v;
+        head[deg[v]] = v;
+        minDeg = std::min(minDeg, deg[v]);
+    };
+    auto bucketOut = [&](int v) {
+        if (prv[v] >= 0) nxt[prv[v]] = nxt[v]; else head[deg[v]] = nxt[v];
+        if (nxt[v] >= 0) prv[nxt[v]] = prv[v];
+    };
+    for (int v : vars) {
+        for (int u : adj[v]) if (state[u] == LIVE) A[v].push_back(u);
+        deg[v] = (int)A[v].size();
+        bucketIn(v);
+    }
+    std::vector<int> order;
+    order.reserve(vars.size());
+    int live = (int)vars.size();
+    while (live > 0) {
+        while (head[minDeg] < 0) ++minDeg;
+        const int p = head[minDeg];
+        bucketOut(p);
+        order.push_back(p);
+        state[p] = ELEMENT;
+        --live;
+        // L_p: live neighbours through variables and through absorbed elements
+        auto& Lp = L[p];
+        mark[p] = p;
+        for (int u : A[p]) if (state[u] == LIVE && mark[u] != p) { mark[u] = p; Lp.push_back(u); }
+        for (int e : E[p]) {
+            if (state[e] != ELEMENT) continue;
+            for (int u : L[e]) if (state[u] == LIVE && mark[u] != p) { mark[u] = p; Lp.push_back(u); }
+            state[e] = ABSORBED;
+            parent[e] = p;
+            Adj::value_type().swap(L[e]);
+        }
+        cnt[p] = (int)Lp.size();
+        Adj::value_type().swap(A[p]);
+        Adj::value_type().swap(E[p]);
+        // w[e] = |L_e \ L_p| for the other elements next to L_p
+        for (int i : Lp)
+            for (int e : E[i]) {
+                if (state[e] != ELEMENT) continue;
+                if (w[e] < 0) w[e] = (int)L[e].size();
+                --w[e];
+            }
+        for (int i : Lp) {
+            auto& Ei = E[i];
+            int d = (int)Lp.size() - 1;
+            size_t k = 0;
+            for (int e : Ei) {
+                if (state[e] != ELEMENT) continue;
+                if (w[e] == 0) { state[e] = ABSORBED; parent[e] = p; continue; }  // L_e inside L_p
+                d += w[e];
+                Ei[k++] = e;
+            }
+            Ei.resize(k);
+            Ei.push_back(p);
+            auto& Ai = A[i];  // edges now covered by element p go
+            k = 0;
+            for (int u : Ai) if (state[u] == LIVE && mark[u] != p) Ai[k++] = u;
+            Ai.resize(k);
+            d += (int)k;
+            d = std::min(d, live - 1);
+            bucketOut(i);
+            deg[i] = d;
+            bucketIn(i);
+        }
+        for (int i : Lp) for (int e : E[i]) w[e] = -1;
+    }
+    // Fundamental supernodes: p joins its parent q when it is q's only child and
+    // |L_p| = |L_q| + 1 (same column structure below q).
+    std::vector<int> children(n, 0), front(n, -1);
+    for (int p : order) if (parent[p] >= 0) ++children[parent[p]];
+    std::vector<ContractionFront> fronts;
+    for (int p : order) {
+        if (front[p] < 0) { front[p] = (int)fronts.size(); fronts.emplace_back(); }
+        fronts[front[p]].pivots.push_back(p);
+        const int q = parent[p];
+        if (q >= 0 && children[q] == 1 && cnt[p] == cnt[q] + 1) front[q] = front[p];
+    }
+    for (int p : order)
+        if (const int q = parent[p]; q >= 0 && front[q] != front[p]) fronts[front[p]].parent = front[q];
+
+    // Relaxed amalgamation (CHOLMOD's default rule): a child front joins its parent when
+    // the explicit zeros that adds stay small, so very sparse circuits do not pay a
+    // front's fixed cost per unknown (hcircuit: 76k fronts for 2.6 Mflop). Fronts are
+    // in elimination order, children before parents.
+    const int nf = (int)fronts.size();
+    std::vector<int> into(nf, -1), np(nf), bnd(nf);
+    std::vector<double> zeros(nf, 0.0);  // explicit zeros a front already carries from merges
+    for (int f = 0; f < nf; ++f) { np[f] = (int)fronts[f].pivots.size(); bnd[f] = cnt[fronts[f].pivots.back()]; }
+    auto find = [&](int f) { while (into[f] >= 0) f = into[f]; return f; };
+    for (int c = 0; c < nf; ++c) {
+        if (fronts[c].parent < 0) continue;
+        const int f = find(fronts[c].parent);
+        const double cols = np[c] + np[f], rows = cols + bnd[f];
+        // the child's columns padded to the parent's rows, plus what both carry already
+        const double total = zeros[c] + zeros[f] + (double)np[c] * (np[f] + bnd[f] - bnd[c]);
+        const double z = total / (cols * rows);
+        if (cols <= 4 || (cols <= 16 && z < 0.8) || (cols <= 48 && z < 0.1) || z < 0.05) {
+            into[c] = f;
+            np[f] += np[c];
+            zeros[f] = total;
+        }
+    }
+    std::vector<ContractionFront> merged;
+    std::vector<int> id(nf, -1);
+    for (int f = 0; f < nf; ++f) if (into[f] < 0) { id[f] = (int)merged.size(); merged.emplace_back(); }
+    for (int f = 0; f < nf; ++f) {
+        auto& m = merged[id[find(f)]];
+        m.pivots.insert(m.pivots.end(), fronts[f].pivots.begin(), fronts[f].pivots.end());
+        if (into[f] < 0) m.parent = fronts[f].parent < 0 ? -1 : id[find(fronts[f].parent)];
+    }
+    return merged;
+}
+
 }  // namespace
 
 ContractionPlan planContraction(const Csr_matrix& A, int leafSize) {
-    ContractionPlan plan;
-    plan.n = A.rows;
-    plan.rowPtr = A.row_pointer;
-    plan.colIdx = A.col_indices;
+    ContractionPlan base;
+    base.n = A.rows;
+    base.rowPtr = A.row_pointer;
+    base.colIdx = A.col_indices;
     const int n = A.rows;
-    if (n == 0) return plan;
+    if (n == 0) return base;
 
-    plan.rowOfVar = matchLargeDiagonal(A);
+    base.rowOfVar = matchLargeDiagonal(A);
     std::vector<int> varOfRow(n);
-    for (int v = 0; v < n; ++v) varOfRow[plan.rowOfVar[v]] = v;
-    Adj adj = symmetricAdjacency(A, plan.rowOfVar);
-    Dissector nd{adj, std::max(1, leafSize), std::vector<int>(n, 0), 1, {}};
+    for (int v = 0; v < n; ++v) varOfRow[base.rowOfVar[v]] = v;
+    Adj adj = symmetricAdjacency(A, base.rowOfVar);
 
     // Hub nets (supply rails touching thousands of devices) go to a root front,
     // eliminated last — as AMD does with dense rows — so they never wreck the
-    // separators. Everything else is dissected under it.
+    // ordering of the rest, which goes under it.
     const double hubDegree = std::max(16.0, 10.0 * std::sqrt((double)n));
     std::vector<int> hubs, rest;
     for (int v = 0; v < n; ++v) ((double)adj[v].size() > hubDegree ? hubs : rest).push_back(v);
-    int root = hubs.empty() ? -1 : nd.addFront(hubs, -1);
-    nd.dissect(rest, root);
 
-    // Post-order (children before parents) with deterministic child order
-    auto& pre = nd.fronts;
+    // The rest is ordered both ways and the cheaper plan is kept: nested dissection
+    // wins on grids / power-delivery meshes, minimum degree on transistor-level
+    // circuits. Cost = flops + 1e4 per front: a front's fixed cost (layout,
+    // assembly, its vectors) measured ~0.8 us against ~1e-10 s per flop (Apple M4
+    // Pro, threaded), fitted on circuit_1, where flops alone chose the 2.7x slower
+    // plan. TREESPICE_ORDERING=nd|md forces one.
+    auto finish = [&](std::vector<ContractionFront> pre) {
+    ContractionPlan plan = base;
     std::vector<std::vector<int>> kids(pre.size());
     std::vector<int> roots;
     for (int f = 0; f < (int)pre.size(); ++f)
@@ -364,6 +504,29 @@ ContractionPlan planContraction(const Csr_matrix& A, int leafSize) {
         plan.levels[height[i]].push_back(i);
     }
     return plan;
+    };
+    const char* forced = std::getenv("TREESPICE_ORDERING");
+    const std::string only = forced ? forced : "";
+    ContractionPlan best;
+    if (only != "md") {
+        Dissector nd{adj, std::max(1, leafSize), std::vector<int>(n, 0), 1, {}};
+        const int root = hubs.empty() ? -1 : nd.addFront(hubs, -1);
+        nd.dissect(rest, root);
+        best = finish(std::move(nd.fronts));
+    }
+    if (only != "nd") {
+        std::vector<ContractionFront> pre;
+        if (!hubs.empty()) { pre.emplace_back(); pre.back().pivots = hubs; }
+        const int offset = (int)pre.size();
+        for (auto& f : minDegreeFronts(adj, rest)) {
+            f.parent = f.parent >= 0 ? f.parent + offset : (hubs.empty() ? -1 : 0);
+            pre.push_back(std::move(f));
+        }
+        ContractionPlan md = finish(std::move(pre));
+        auto cost = [](const ContractionPlan& c) { return c.flopEstimate + 1e4 * (double)c.fronts.size(); };
+        if (best.fronts.empty() || cost(md) < cost(best)) best = std::move(md);
+    }
+    return best;
 }
 
 namespace {
@@ -371,6 +534,7 @@ namespace {
 // Threshold for accepting a diagonal pivot inside a front: |a_kk| >= u * max
 // |a_rk| over ALL rows of the front (MUMPS uses the same default, 0.01).
 constexpr double kPivotThreshold = 0.01;
+constexpr int kMaxDelayed = 8;  // rows a front may delay to its parent (see the factor loop)
 
 // Per-front numeric data. Local layout: [own pivots p][delayed-in d][boundary b].
 // After factorization the first `e` columns hold L (unit diagonal implied), the
@@ -388,33 +552,6 @@ struct FrontFactor {
     bool singular = false;
     double minPivot = std::numeric_limits<double>::infinity();
 };
-
-// Run fn(i) for i in [0, n) on worker threads when the level carries enough
-// work to amortize thread start-up (~tens of us each); serial otherwise. Fronts
-// in a level share no writes and the result is independent of scheduling.
-// ponytail: threads are spawned per level; a persistent pool is the upgrade
-// once per-level overhead shows up in profiles.
-template <class Fn>
-void parallelFor(int n, double work, Fn&& fn) {
-#ifdef ACUTESIM_THREADS_ENABLED
-    constexpr double kMinParallelWork = 2e6;  // flops-ish
-    unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    if (const char* t = std::getenv("TREESPICE_THREADS"))  // e.g. 1 to compare with serial solvers
-        hw = (unsigned)std::max(1, std::atoi(t));
-    int nt = (n > 1 && work >= kMinParallelWork) ? (int)std::min<unsigned>(hw, (unsigned)n) : 1;
-    if (nt > 1) {
-        std::atomic<int> next{0};
-        auto worker = [&] { for (int i; (i = next.fetch_add(1)) < n;) fn(i); };
-        std::vector<std::thread> pool;
-        pool.reserve(nt - 1);
-        for (int t = 1; t < nt; ++t) pool.emplace_back(worker);
-        worker();
-        for (auto& th : pool) th.join();
-        return;
-    }
-#endif
-    for (int i = 0; i < n; ++i) fn(i);
-}
 
 // Work estimate for one level: factorization ~ sum dim^2 * pivots, solve ~ sum dim^2
 double levelWork(const ContractionPlan& plan, const std::vector<int>& level, bool factor) {
@@ -508,8 +645,30 @@ struct ContractionCache::Impl {
     std::vector<std::vector<double>> in;  // per front: the A values it assembled last time
 };
 
-SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
-                              const ContractionPlan& plan, int refineSteps, ContractionCache* cache) {
+namespace {
+// r = b - A x; returns the componentwise backward error max_i |r_i| / (|A||x| + |b|)_i
+double residual(const Csr_matrix& A, const std::vector<double>& b, const std::vector<double>& x, std::vector<double>& r) {
+    const int n = A.rows;
+    r.resize(n);
+    matrixMultiplication(A, x.data(), r.data());
+    double omega = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double scale = std::abs(b[i]);
+        for (int k = A.row_pointer[i]; k < A.row_pointer[i + 1]; ++k)
+            scale += std::abs(A.values[k] * x[A.col_indices[k]]);
+        r[i] = b[i] - r[i];
+        if (scale > 0.0) omega = std::max(omega, std::abs(r[i]) / scale);
+        else if (r[i] != 0.0) omega = std::numeric_limits<double>::infinity();
+    }
+    return omega;
+}
+
+}  // namespace
+
+namespace {
+SolverResult solve(const Csr_matrix& A, const std::vector<double>& b, const ContractionPlan& plan,
+                   int refineSteps, ContractionCache* cache, bool gpu) {
+    static const int gpuMin = [] { const char* s = std::getenv("TREESPICE_GPU_FRONT"); return s ? std::atoi(s) : 512; }();
     SolverResult res;
     res.iterations = 1;
     const int n = A.rows;
@@ -536,7 +695,19 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
         if (!warm) { c.plan = &plan; c.F.assign(nf, {}); c.in.assign(nf, {}); }
     } else local.resize(nf);
     std::vector<FrontFactor>& F = cache ? cache->impl->F : local;
-    std::vector<char> reused(nf, 0);
+    std::vector<char> reused(nf, 0), onGpu(nf, 0);
+    // A pivot below kSingularRel x its own entry in A was cancelled down to rounding residue,
+    // not to a value: a floating subnetwork with a current forced into it left ~1e-19 of a
+    // 2e-3 diagonal once the plan split it over fronts, and was solved at 1e15 V (BUG-6).
+    // (A row's largest entry is no scale: a BJT iterate's gm made normal pivots look small.)
+    // ponytail: fixed relative bound; gmin under a 1 S node still passes (1e-12), a gmin node
+    // behind < 0.1 ohm and chains of >~1e4 floating nodes do not.
+    constexpr double kSingularRel = 1e-13;
+    auto entry = [&](int r, int c) {
+        for (int q = A.row_pointer[r]; q < A.row_pointer[r + 1]; ++q)
+            if (A.col_indices[q] == c) return std::abs(A.values[q]);
+        return 0.0;
+    };
     bool singular = false;
     double smallestPivot = std::numeric_limits<double>::infinity();
     for (const auto& level : plan.levels) {
@@ -560,6 +731,10 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
             ff.minPivot = std::numeric_limits<double>::infinity();
             const int m = ff.m, p = (int)fr.pivots.size(), d = ff.full - p;
             auto& M = ff.M;
+            // A cached front keeps its buffer between solves; one that grew in an earlier,
+            // near-singular iterate (delayed rows) gives the excess back, or every front keeps
+            // its worst size for good (14 GB at 4e5 fronts of a 1e5-stage chain)
+            if (M.capacity() > 4 * (size_t)m * m + 64) std::vector<double>().swap(M);
             M.assign((size_t)m * m, 0.0);
             for (size_t t = 0; t < fr.assembleK.size(); ++t) {
                 int r = fr.assembleRow[t], c = fr.assembleCol[t];
@@ -575,8 +750,18 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
                         M[(size_t)cp[a] * m + cp[bb]] += cf.M[(size_t)(cf.e + a) * cf.m + (cf.e + bb)];
             }
 
-            ff.sw.clear();
-            for (int k = 0; k < ff.full; ++k) {
+            // Large fronts: the GPU eliminates in FP32 until a pivot fails the threshold;
+            // the CPU continues from there (column search, delayed pivots) in FP64.
+            ff.sw.resize(ff.full);
+            const int k0 = gpu && gpuMin > 0 && m >= gpuMin ? gpuFrontLu(M.data(), m, ff.full, kPivotThreshold, ff.sw.data()) : 0;
+            for (int k = 0; k < k0; ++k) {
+                std::swap(ff.rowLab[k], ff.rowLab[ff.sw[k]]);
+                ff.minPivot = std::min(ff.minPivot, std::abs(M[(size_t)k * m + k]));
+            }
+            ff.sw.resize(k0);
+            ff.e = k0;
+            onGpu[id] = k0 > 0;
+            for (int k = k0; k < ff.full; ++k) {
                 // Column search: first column j (from k) whose best fully-summed
                 // row passes the threshold against the whole column.
                 int pr = -1, pc = -1;
@@ -593,6 +778,19 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
                     if (ri >= 0 && ratio >= kPivotThreshold) { pr = ri; pc = j; }
                     bestRatio = std::max(bestRatio, ratio);
                 }
+                // Delayed rows must not snowball up the tree: a near-singular Newton
+                // iterate of a 30k-stage BSIM4 chain delayed 2e5 pivots into fronts 673
+                // wide (near O(n^2) memory, 131 GB at 1e5 stages). Past kMaxDelayed rows,
+                // the largest fully-summed entry pivots without the boundary rows' veto;
+                // if they are all zero the matrix is singular here: say so now instead of
+                // carrying the zero rows up the tree (they reached fronts ~100 wide).
+                if (pc < 0 && ff.full - k > kMaxDelayed) {
+                    double best = 0.0;
+                    for (int j = k; j < ff.full; ++j)
+                        for (int r = k; r < ff.full; ++r)
+                            if (const double a = std::abs(M[(size_t)r * m + j]); a > best) { best = a; pr = r; pc = j; }
+                    if (pc < 0) { ff.singular = true; break; }
+                }
                 if (pc < 0) break;  // delay the remaining rows/columns to the parent
                 if (pc != k) {
                     for (int r = 0; r < m; ++r) std::swap(M[(size_t)r * m + k], M[(size_t)r * m + pc]);
@@ -605,7 +803,10 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
                 ff.sw.push_back(pr);
                 const double piv = M[(size_t)k * m + k];
                 ff.minPivot = std::min(ff.minPivot, std::abs(piv));
-                if (!(std::abs(piv) > 0.0) || !std::isfinite(piv)) { ff.singular = true; break; }
+                if (!(std::abs(piv) > kSingularRel * entry(plan.rowOfVar[ff.rowLab[k]], ff.colLab[k])) || !std::isfinite(piv)) {
+                    ff.singular = true;
+                    break;
+                }
                 const double inv = 1.0 / piv;
                 for (int r = k + 1; r < m; ++r) {
                     double& l = M[(size_t)r * m + k];
@@ -620,10 +821,8 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
             // A root front has no parent to delay to: un-eliminated fully-summed rows
             // mean no pivot exists (e.g. a node with no DC path). They used to be left
             // silently at x = 0 and the solve reported success.
-            if (plan.fronts[id].parent < 0 && F[id].e < F[id].full && !F[id].singular) {
-                F[id].singular = true;
-                res.rankDeficientRow = plan.rowOfVar[F[id].rowLab[F[id].e]];
-            }
+            if (plan.fronts[id].parent < 0 && F[id].e < F[id].full) F[id].singular = true;
+            if (F[id].singular && res.rankDeficientRow < 0) res.rankDeficientRow = plan.rowOfVar[F[id].rowLab[F[id].e]];
             singular = singular || F[id].singular;
             smallestPivot = std::min(smallestPivot, F[id].minPivot);
         }
@@ -644,25 +843,26 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
 
     std::vector<double> x, r(n), dx;
     solveWithFactors(plan, F, b, x);
-    auto residual = [&]() {  // r = b - A x; returns componentwise backward error
-        matrixMultiplication(A, x.data(), r.data());
-        double omega = 0.0;
-        for (int i = 0; i < n; ++i) {
-            double scale = std::abs(b[i]);
-            for (int k = A.row_pointer[i]; k < A.row_pointer[i + 1]; ++k)
-                scale += std::abs(A.values[k] * x[A.col_indices[k]]);
-            r[i] = b[i] - r[i];
-            if (scale > 0.0) omega = std::max(omega, std::abs(r[i]) / scale);
-            else if (r[i] != 0.0) omega = std::numeric_limits<double>::infinity();
-        }
-        return omega;
-    };
-    double omega = residual();
-    for (int s = 0; s < refineSteps && omega > 4.0 * std::numeric_limits<double>::epsilon(); ++s) {
+
+    // FP32 fronts need refinement whatever the caller asked; it converges linearly
+    // (rate ~ kappa * 2^-24), so stop once a step no longer halves the error.
+    constexpr double eps = std::numeric_limits<double>::epsilon();
+    res.gpuFronts = (int)std::count(onGpu.begin(), onGpu.end(), 1);
+    const int steps = res.gpuFronts ? std::max(refineSteps, 10) : refineSteps;
+    double omega = residual(A, b, x, r);
+    for (int s = 0; s < steps && omega > 4.0 * eps; ++s) {
         solveWithFactors(plan, F, r, dx);
         for (int i = 0; i < n; ++i) x[i] += dx[i];
-        omega = residual();
+        const double prev = omega;
+        omega = residual(A, b, x, r);
         res.iterations++;
+        if (res.gpuFronts && !(omega < 0.5 * prev)) break;
+    }
+    if (res.gpuFronts && !(omega <= 64.0 * eps)) {  // FP32 factors too weak here: redo in FP64
+        if (cache) cache->impl.reset();
+        res = solve(A, b, plan, refineSteps, cache, false);
+        res.fp64Refactor = true;
+        return res;
     }
 
     double r2 = 0.0;
@@ -671,4 +871,10 @@ SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
     res.finalResidual = std::sqrt(r2);
     res.converged = std::isfinite(res.finalResidual);
     return res;
+}
+}  // namespace
+
+SolverResult solveContraction(const Csr_matrix& A, const std::vector<double>& b,
+                              const ContractionPlan& plan, int refineSteps, ContractionCache* cache) {
+    return solve(A, b, plan, refineSteps, cache, true);
 }

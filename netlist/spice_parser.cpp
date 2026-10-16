@@ -331,6 +331,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 path.erase(0, path.find_first_not_of(" \t"));
                 if (path.size() >= 2 && (path[0] == '"' || path[0] == '\'') && path.back() == path[0]) path = path.substr(1, path.size() - 2);
                 else if (tok.size() != 2) throw std::runtime_error(".osdi needs exactly one library path");
+                // a relative path resolves against the netlist's directory, as .include does
+                if (const auto p = std::filesystem::path(baseDir) / path;
+                    !baseDir.empty() && std::filesystem::path(path).is_relative() && std::filesystem::is_regular_file(p))
+                    path = p.string();
                 osdi::loadLibrary(path);
             } catch (const std::exception& e) { return fail(lineNum, e.what()); }
             continue;
@@ -923,7 +927,11 @@ void SPICEParser::parseSourceSpec(const std::vector<std::string>& tok, Src& s, d
             s.type = "SINE";  // canonical name used by the stampers
             parseSine(tok, i + 1, s);
             break;
-        } else if (kw == "EXP" || kw == "PWL" || kw == "SFFM" || kw == "AM") {
+        } else if (kw == "PWL") {
+            s.type = "PWL";
+            parsePwl(tok, i + 1, s);
+            break;
+        } else if (kw == "EXP" || kw == "SFFM" || kw == "AM") {
             throw std::runtime_error(kw + " sources are not supported yet");
         } else {
             dc = parseValue(tok[i++]);  // bare value, e.g. "V1 1 0 5"
@@ -943,6 +951,29 @@ void SPICEParser::parsePulse(const std::vector<std::string>& tok, size_t idx, Sr
     for (; n < 7 && idx + n < tok.size(); ++n) *f[n] = parseValue(tok[idx + n]);
     if (n < 6) s.pulse_pw = 1e99;  // SPICE default PW = TSTOP: never falls
     // TR/TF = 0 get SPICE's TSTEP default in parse() once .tran is known
+}
+
+// PWL t1 v1 t2 v2 ... [TD delay] [R repeat-from] (tokenize() splits KEY=val)
+template <class Src>
+void SPICEParser::parsePwl(const std::vector<std::string>& tok, size_t idx, Src& s) const {
+    for (; idx < tok.size(); ++idx) {
+        const std::string k = toUpper(tok[idx]);
+        if ((k == "TD" || k == "R") && idx + 1 < tok.size()) {
+            (k == "TD" ? s.pwl_td : s.pwl_r) = parseValue(tok[++idx]);
+            continue;
+        }
+        if (idx + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": PWL time without a value");
+        s.pwl_t.push_back(parseValue(tok[idx]));
+        s.pwl_v.push_back(parseValue(tok[++idx]));
+    }
+    if (s.pwl_t.empty()) throw std::runtime_error(tok[0] + ": PWL needs at least one (time, value) pair");
+    // Equal times are a step (ngspice warns and steps). Decreasing times fail closed (ngspice
+    // warns and clamps them).
+    for (size_t k = 1; k < s.pwl_t.size(); ++k)
+        if (s.pwl_t[k] < s.pwl_t[k - 1])
+            throw std::runtime_error(tok[0] + ": decreasing PWL times are not supported");
+    if (s.pwl_r >= 0.0 && std::find(s.pwl_t.begin(), s.pwl_t.end(), s.pwl_r) == s.pwl_t.end())
+        throw std::runtime_error(tok[0] + ": PWL R= must be one of its times");
 }
 
 // SIN VO VA FREQ TD THETA PHASE

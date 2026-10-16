@@ -1,0 +1,24 @@
+* qa4: Two-stage CMOS operational amplifier in open loop
+.lib lib/sky130_tt_min.lib tt
+VDD vdd 0 DC 1.8
+VSS vss 0 DC 0
+* Tail current bias
+IBIAS vdd nbias DC 20u
+XMNBIAS nbias nbias vss vss sky130_fd_pr__nfet_01v8 l=0.5 w=2.0
+XMNTAIL vtail nbias vss vss sky130_fd_pr__nfet_01v8 l=0.5 w=2.0
+* Stage 1: Diff pair with active PMOS load
+VCM vcm 0 DC 0.9
+VIN inm vcm DC 0
+VIP inp vcm SIN(0 1m 5MEG)
+XMN1 out1 inp vtail vss sky130_fd_pr__nfet_01v8 l=0.5 w=4.0
+XMN2 out1b inm vtail vss sky130_fd_pr__nfet_01v8 l=0.5 w=4.0
+XMP1 out1 out1b vdd vdd sky130_fd_pr__pfet_01v8 l=0.5 w=8.0
+XMP2 out1b out1b vdd vdd sky130_fd_pr__pfet_01v8 l=0.5 w=8.0
+* Stage 2: PMOS common source with NMOS current source load
+XMP3 out2 out1 vdd vdd sky130_fd_pr__pfet_01v8 l=0.5 w=16.0
+XMN3 out2 nbias vss vss sky130_fd_pr__nfet_01v8 l=0.5 w=4.0
+* Miller compensation cap & load
+CC out1 out2 0.2p
+CL out2 0 50f
+.tran 1n 200n
+.end

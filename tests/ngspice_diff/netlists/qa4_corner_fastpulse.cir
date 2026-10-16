@@ -1,0 +1,6 @@
+* qa4: Fast pulse train with sub-nanosecond edges and coarse tstep
+V1 1 0 PULSE(0 1.8 100p 20p 20p 200p 500p)
+R1 1 2 50
+C1 2 0 100f
+.tran 1n 5n
+.end

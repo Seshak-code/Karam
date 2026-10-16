@@ -102,14 +102,10 @@ GPUQueue GPUContextManager::sharedQueue() const {
     return queue_;
 }
 
-WGPUDevice GPUContextManager::rawDevice() const {
-    std::lock_guard<std::mutex> lk(poolMutex_);
-    return primaryDevice_.Get();
-}
-
-WGPUQueue GPUContextManager::rawQueue() const {
-    std::lock_guard<std::mutex> lk(poolMutex_);
-    return queue_.Get();
+void GPUContextManager::processEvents() {
+#ifndef __EMSCRIPTEN__
+    if (nativeInstance_) wgpuInstanceProcessEvents(nativeInstance_->Get());
+#endif
 }
 
 void GPUContextManager::shutdown() {

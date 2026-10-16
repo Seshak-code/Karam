@@ -1,0 +1,6 @@
+* qa4: PWL with a single point (constant after t0)
+V1 1 0 PWL(0 2.5)
+R1 1 2 1k
+C1 2 0 10p
+.tran 0.1u 2u
+.end

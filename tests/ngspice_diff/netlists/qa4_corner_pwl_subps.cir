@@ -1,0 +1,6 @@
+* qa4: PWL with sub-picosecond transitions (100 fs edges)
+V1 1 0 PWL(0 0 1n 0 1.0001n 1.8 2n 1.8 2.0001n 0)
+R1 1 2 100
+C1 2 0 100f
+.tran 50p 4n
+.end

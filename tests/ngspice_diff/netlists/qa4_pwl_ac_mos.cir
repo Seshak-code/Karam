@@ -1,0 +1,8 @@
+* qa4: AC analysis with PWL source biasing MOS amplifier at t=0 operating point
+V1 in 0 AC 1 PWL(0 0.8 1n 1.5 2n 0.2)
+VDD vdd 0 DC 1.8
+RD vdd out 10k
+M1 out in 0 0 nmos W=10u L=0.18u
+.model nmos nmos level=1 vto=0.4 kp=100u
+.ac dec 10 1k 100Meg
+.end

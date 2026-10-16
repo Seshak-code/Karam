@@ -22,6 +22,30 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
+# GPU (Phase 4): Dawn / WebGPU. OpenVLSI provides dawn_native when it builds the
+# engine as a subdirectory; standalone, -DTREESPICE_GPU=ON fetches the same Dawn
+# revision (point FETCHCONTENT_SOURCE_DIR_DAWN at an existing checkout to reuse it).
+# ---------------------------------------------------------------------------
+option(TREESPICE_GPU "Standalone build: fetch and build Dawn for the GPU path" OFF)
+if(TREESPICE_STANDALONE AND TREESPICE_GPU AND NOT TARGET dawn_native)
+    include(FetchContent)
+    FetchContent_Declare(dawn GIT_REPOSITORY https://dawn.googlesource.com/dawn
+                              GIT_TAG chromium/6943 GIT_SHALLOW ON GIT_SUBMODULES "")
+    foreach(opt DAWN_WERROR TINT_WERROR DAWN_BUILD_SAMPLES DAWN_ENABLE_VULKAN DAWN_ENABLE_D3D12
+                DAWN_ENABLE_D3D11 DAWN_ENABLE_OPENGLES DAWN_ENABLE_DESKTOP_GL TINT_BUILD_TESTS DAWN_BUILD_TESTS)
+        set(${opt} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    set(DAWN_ENABLE_METAL ${APPLE} CACHE BOOL "" FORCE)
+    set(DAWN_FETCH_DEPENDENCIES ON CACHE BOOL "" FORCE)
+    set(CMAKE_CXX_FLAGS_SAVED "${CMAKE_CXX_FLAGS}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")  # Dawn / Tint / Abseil warnings
+    FetchContent_MakeAvailable(dawn)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_SAVED}")
+    set(DAWN_INTERNAL_INCLUDES ${dawn_SOURCE_DIR} ${dawn_SOURCE_DIR}/src ${dawn_BINARY_DIR}/gen/src
+        ${dawn_SOURCE_DIR}/third_party/abseil-cpp ${dawn_SOURCE_DIR}/third_party/partition_alloc)
+endif()
+
+# ---------------------------------------------------------------------------
 # OBJECT target — compiled once, wrapped in STATIC (or SHARED later)
 # ---------------------------------------------------------------------------
 add_library(acutesim_engine_objects OBJECT)
@@ -103,6 +127,7 @@ target_sources(acutesim_engine_objects PRIVATE
 
     # === Math ===
     ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/math/gpu_front_lu.cpp
 
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp

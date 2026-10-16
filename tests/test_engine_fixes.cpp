@@ -337,6 +337,18 @@ int main() {
         auto r = run(mode, "* series caps\nV1 1 0 DC 5\nC1 1 2 1u\nC2 2 0 1u\nR1 1 0 1k\n.op\n");
         check(r.converged && near(V(r, 2), 2.5, 1e-4),
               "node without a DC path: transient OP gives the capacitive divider V(2) = 2.5 (" + std::to_string(V(r, 2)) + ")");
+        // ...but only a settled transient OP: 1 mA into a cap-only node charges it for good
+        // (it "converged" at I*10us/C = 0.01 V, BUG-7)
+        r = run(mode, "* cap-only node\nI1 0 2 DC 1m\nC1 2 0 1u\nV1 1 0 DC 1\nR1 1 0 1k\n.op\n");
+        check(!r.converged && r.errorDetail.find("no DC path") != std::string::npos,
+              "current into a cap-only node: no operating point (" + r.errorDetail.substr(0, 60) + ")");
+        // A pivot cancelled to rounding residue is singular: 1 mA into a floating 100-resistor
+        // chain split over several fronts "converged" at 1e14 V (BUG-6)
+        std::string net = "* floating chain\n.options gmin=0 gminsteps=0\nV1 1 0 DC 1\nR0 1 0 1k\nI1 0 f0 DC 1m\n";
+        for (int i = 0; i < 100; ++i) net += "RF" + std::to_string(i) + " f" + std::to_string(i) + " f" + std::to_string(i + 1) + " 1k\n";
+        r = run(mode, net + ".op\n");
+        check(!r.converged && r.errorDetail.find("no DC path") != std::string::npos,
+              "current into a floating 100-resistor chain: singular (" + r.errorDetail.substr(0, 60) + ")");
     }
     {
         CircuitSim sim;

@@ -102,6 +102,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // nodes at 0 V and every capacitor uncharged, sources applied, to steady state,
   // so such a node keeps zero net charge (a capacitive divider decides it).
   bool finalSingular = false, floatingNodes = false;
+  Csr_matrix singularJacobian{};
   double srcConv = 0.0, srcRaise = 1e-3;
   const std::vector<double> &seededGuess = coldSeed;  // gmin stepping restarts cold
   std::vector<double> lastGood;
@@ -172,6 +173,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
         singularMatrixDetected = true;
         singularRow = result.rankDeficientRow;
         if (finalStep && gminSteppingUsed && !sourceSteppingUsed) finalSingular = true;
+        singularJacobian = std::move(matrix);  // scales the transient OP's KCL check
         // If singular, retrying with same Jacobian won't help. Abort this GMIN
         // step.
         total_iterations += iteration + 1;
@@ -329,7 +331,21 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     if (runTransient(pseudo, 100e-9, 10e-6, /*uic=*/true, [](const SolverStep &) { return true; }).empty()) {
       voltageEstimate = lastSolution_;
       voltageEstimate.resize(nTot, 0.0);
-      converged = floatingNodes = true;
+      // Only a settled transient is an operating point: a current forced into a node that has
+      // only capacitors charges it for good, and its 10 us value is not one (1 mA into 1 uF
+      // "converged" at 0.01 V, BUG-7). DC KCL (caps open, no gmin) must hold at every node to
+      // ngspice's reltol/abstol, scaled by the node's currents in the last DC Jacobian.
+      std::vector<double> r;
+      calculatePhysicalResiduals(netlist, voltageEstimate, r);
+      const Csr_matrix &J = singularJacobian;
+      bool settled = true;
+      for (int i = 0; i < netlist.numGlobalNodes && i < (int)r.size() && i < J.rows; ++i) {
+        double scale = 0.0;
+        for (int k = J.row_pointer[i]; k < J.row_pointer[i + 1]; ++k)
+          scale += std::abs(J.values[k]) * std::abs(voltageEstimate[J.col_indices[k]]);
+        settled = settled && std::abs(r[i]) <= 1e-3 * scale + 1e-12;
+      }
+      converged = floatingNodes = settled;
     }
   }
 
@@ -513,7 +529,7 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     junctionCurrents(j, x, netlist.environment.ambient_temp_K, h, j.st);
   });
   // OSDI charges, likewise (osdiCurrents with accept)
-  forEachOsdi(netlist, [&](const OsdiRef &r) { osdiCurrents(r, v, h, nullptr, true); });
+  osdiAll(netlist, v, h, false, true);
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);
@@ -580,6 +596,7 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     osdiCurrents(r, x, 0.0, nullptr, true);
     r.in->vHist[1] = r.in->vHist[2] = r.in->vHist[0];
   });
+  osdiAtValid_ = false;  // the charge history moved
   for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
     const auto &inst = netlist.instances[k];
     auto it = netlist.blockDefinitions.find(inst.blockName);
@@ -621,6 +638,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     x0.resize(nTot, 0.0);
   }
   arbiterInitialized = false;  // this run's cold start (the DC bias may itself have run a transient OP)
+  lteHold_ = 0;
   seedReactiveHistory(netlist, x0, uic);
   lastSolution_ = x0;  // seeds the first Newton iteration
 
@@ -630,9 +648,9 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   std::vector<std::function<double(double)>> corners;
   auto addCorners = [&](const TensorBlock &b) {
     for (const auto &v : b.voltageSources)
-      if (v.type == "PULSE" || v.type == "SINE") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
+      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
     for (const auto &i : b.currentSources)
-      if (i.type == "PULSE" || i.type == "SINE") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
+      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
   };
   addCorners(netlist.globalBlock);
   for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);
@@ -654,6 +672,7 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
   int tinySteps = 0;
   while (stop - t > endTol) {
     double hTry = std::min(h, stop - t);
+    const double intended = hTry;  // before clipping to a corner (ngspice's CKTsaveDelta)
     bool toCorner = false;
     for (const auto &next : corners)
       if (next(t + endTol) - t <= hTry) { hTry = next(t + endTol) - t; toCorner = true; }
@@ -690,6 +709,18 @@ std::string CircuitSim::runTransient(TensorNetlist &netlist, double step, double
     t = s.time;
     if (!onPoint(s)) return "Cancelled.";
     h = std::min(hMax, taken * 2.0);
+    // After a corner, as ngspice dctran: at most 0.1 * min(the step that was intended
+    // before it was clipped to the corner, the gap to the next corner). A source jump (a
+    // PWL repeat) taken with one 4.5 ns backward-Euler step left an RC 13 mV low against
+    // the exact response. The clipped step itself can be femtoseconds, and 0.1 of it made
+    // Newton fail on roundoff (an inverter's PWL input, Xyce tranInverterBinning).
+    if (lteHold_ > 0) --lteHold_;
+    if (landedOnCorner) {
+      lteHold_ = 3;
+      double gap = std::numeric_limits<double>::infinity();
+      for (const auto &next : corners) gap = std::min(gap, next(t + endTol) - t);
+      h = std::min(h, 0.1 * std::min(intended, gap));
+    }
   }
   return "";
 }
@@ -1196,7 +1227,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
             });
           });
 
-      if (lteResult.requiresRejection) {
+      if (lteResult.requiresRejection && lteHold_ == 0) {
         // LTE too large — timestep was too aggressive
         actualTimeStep = lteResult.suggestedDt;
         attempt++;
