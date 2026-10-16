@@ -1,0 +1,7 @@
+* PWL steps (equal times): one repeated with R=0, one at t=0. The instant holds the earlier value, as ngspice; the later value made the step onto the corner creep toward it (BUG-5)
+V1 1 0 PWL(0 0 1n 1 1n 0 2n 0) R=0
+R1 1 0 1k
+V2 2 0 PWL(0 0 0 1 1n 1)
+R2 2 0 1k
+.tran 0.1n 5n
+.end

@@ -962,15 +962,18 @@ void SPICEParser::parsePwl(const std::vector<std::string>& tok, size_t idx, Src&
             (k == "TD" ? s.pwl_td : s.pwl_r) = parseValue(tok[++idx]);
             continue;
         }
-        if (idx + 1 >= tok.size()) throw std::runtime_error("PWL: a time without a value");
+        if (idx + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": PWL time without a value");
         s.pwl_t.push_back(parseValue(tok[idx]));
         s.pwl_v.push_back(parseValue(tok[++idx]));
     }
-    if (s.pwl_t.empty()) throw std::runtime_error("PWL needs at least one (time, value) pair");
+    if (s.pwl_t.empty()) throw std::runtime_error(tok[0] + ": PWL needs at least one (time, value) pair");
+    // Equal times are a step (ngspice warns and steps). Decreasing times fail closed (ngspice
+    // warns and clamps them).
     for (size_t k = 1; k < s.pwl_t.size(); ++k)
-        if (!(s.pwl_t[k] > s.pwl_t[k - 1])) throw std::runtime_error("PWL times must increase");
+        if (s.pwl_t[k] < s.pwl_t[k - 1])
+            throw std::runtime_error(tok[0] + ": decreasing PWL times are not supported");
     if (s.pwl_r >= 0.0 && std::find(s.pwl_t.begin(), s.pwl_t.end(), s.pwl_r) == s.pwl_t.end())
-        throw std::runtime_error("PWL R= must be one of its times");
+        throw std::runtime_error(tok[0] + ": PWL R= must be one of its times");
 }
 
 // SIN VO VA FREQ TD THETA PHASE
