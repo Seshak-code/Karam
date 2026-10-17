@@ -10,6 +10,9 @@
 #include <stdexcept>
 
 namespace acutesim { namespace numparam {
+
+static double temperC = 27.0;  // TEMPER: the circuit temperature of the expand() call in progress
+
 namespace {
 
 std::string upper(std::string s) {
@@ -206,7 +209,7 @@ private:
             return call(name, args);
         }
         if (name == "PI") return M_PI;
-        if (name == "TEMPER") return 27.0;  // circuit temperature in C: .temp is not supported, always 27
+        if (name == "TEMPER") return temperC;  // circuit temperature in C
         double v;
         if (look_(name, v)) return v;
         fail("unknown parameter " + name);
@@ -536,7 +539,8 @@ double eval(const std::string &expr, const std::function<bool(const std::string 
     return Parser(expr, lookup).run();
 }
 
-std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine) {
+std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine, double tempC) {
+    temperC = tempC;
     return Expander(errLine).run(lines);
 }
 

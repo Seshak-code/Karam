@@ -25,6 +25,7 @@
 #include "engine_api/simulation_dto.h"
 #include "engine_api/isimulation_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <atomic>
@@ -141,50 +142,96 @@ SimulationResponseDTO SessionImpl::runDC(const SimulationRequestDTO& req,
     return result;
 }
 
-// .dc: the swept source's DC value at start + i*step (no drift), one solve per
-// point on the same CircuitSim so each point is seeded by the last (continuation).
-// Each point is a waveform point whose timeS holds the swept value.
-static SimulationResponseDTO dcSweep(CircuitSim& sim, TensorNetlist& netlist, const DCConfigDTO& sw,
-                                     const EngineCallbacks& cb, const std::function<bool()>& cancelled) {
+// The setter of a swept element's value at the top level (V/I source DC value, resistor nominal
+// resistance), or empty. A source sweeps its DC value only.
+static std::function<void(double)> sweepSetter(TensorNetlist& netlist, const std::string& name) {
+    auto up = [](std::string x) { for (auto& ch : x) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch))); return x; };
+    for (auto& v : netlist.globalBlock.voltageSources)
+        if (v.name == name) { v.type.clear(); return [&v](double x) { v.voltage_V = x; }; }
+    for (auto& i : netlist.globalBlock.currentSources)
+        if (i.name == name) { i.type.clear(); return [&i](double x) { i.current_A = x; }; }
+    for (auto& r : netlist.globalBlock.resistors)
+        if (up(r.name) == name) return [&r](double x) { r.resistance_ohms = x * r.tcFactor; };
+    return {};
+}
+
+// A DC run: every combination of the dimensions' values, the first dimension fastest (ngspice: the first
+// .dc source is the innermost). One solve per point on a CircuitSim that keeps its last solution, so a point
+// is seeded by the previous one and a failed step is approached in halves (continuation) down to 1/256
+// step. TEMP re-parses the netlist at that temperature: every temperature-dependent value is resolved by
+// the parser, and a sweep or .temp list pays one parse per temperature change.
+// Each point is a waveform point whose timeS holds the first dimension's value and outer the others'.
+struct DcDim { std::string name; std::vector<double> values; };
+
+static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseResult&& first, const std::vector<DcDim>& dims,
+                                   PrecisionMode prec, const EngineCallbacks& cb, const std::function<bool()>& cancelled) {
+    struct Run {  // the sim keeps references into the netlist: neither moves once built
+        SPICEParseResult parsed;
+        CircuitSim sim;
+        std::vector<std::function<void(double)>> set;  // per dimension; empty for TEMP
+        Run(SPICEParseResult&& p, PrecisionMode m) : parsed(std::move(p)) { sim.execMode = selectExecMode(m); }
+    };
     SimulationResponseDTO r;
     r.analysisType = AnalysisTypeDTO::DC;
-    std::string name = sw.sweepVariable;
-    for (auto& ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    double* value = nullptr;
-    for (auto& v : netlist.globalBlock.voltageSources)
-        if (v.name == name) { value = &v.voltage_V; v.type.clear(); }  // DC value only
-    for (auto& i : netlist.globalBlock.currentSources)
-        if (i.name == name) { value = &i.current_A; i.type.clear(); }
-    const double span = sw.step != 0.0 ? (sw.stop - sw.start) / sw.step : -1.0;
-    if (!value || !(span >= -1e-9)) {
-        r.errorDetail = !value ? ".dc source '" + sw.sweepVariable + "' not found at top level"
-                               : ".dc step must be non-zero and point from start to stop";
-        return r;
+    long total = 1;
+    for (size_t d = 0; d < dims.size(); ++d) {
+        total *= static_cast<long>(dims[d].values.size());
+        if (d) r.outerNames.push_back(dims[d].name);
     }
-    const long n = static_cast<long>(std::floor(span + 1e-9));
-    r.converged = true;
-    // A point that does not converge from the previous one is approached in
-    // halves from the last converged value (continuation), down to 1/256 step.
-    std::function<SolverStep(double, double, int)> reach = [&](double from, double to, int depth) {
-        *value = to;
-        SolverStep s = sim.solveDC(netlist);
-        if (s.stats.converged || depth == 0) return s;
-        const double mid = 0.5 * (from + to);
-        SolverStep m = reach(from, mid, depth - 1);
-        return m.stats.converged ? reach(mid, to, depth - 1) : m;
+    double runTempC = first.tempsC.empty() ? 27.0 : first.tempsC[0];
+    std::unique_ptr<Run> run;
+    auto build = [&](SPICEParseResult&& p) {
+        run = std::make_unique<Run>(std::move(p), prec);
+        run->sim.onConvergenceStep = [&cb](int it, double res) { cb.onConvergenceStep(it, res); };
+        for (const auto& d : dims) {
+            run->set.push_back(d.name == "TEMP" ? std::function<void(double)>() : sweepSetter(run->parsed.netlist, d.name));
+            if (d.name != "TEMP" && !run->set.back()) {
+                r.errorDetail = ".dc source '" + d.name + "' not found at top level";
+                return false;
+            }
+        }
+        return true;
     };
-    for (long k = 0; k <= n && !cancelled(); ++k) {
-        const double target = sw.start + k * sw.step;
-        SolverStep s = reach(target - sw.step, target, k == 0 ? 0 : 8);
-        *value = target;
+    r.converged = build(std::move(first));
+    std::vector<size_t> idx(dims.size(), 0), prev;
+    for (long k = 0; r.converged && k < total && !cancelled(); ++k) {
+        std::vector<double> val(dims.size());
+        double tempC = runTempC;
+        for (size_t d = 0; d < dims.size(); ++d) {
+            val[d] = dims[d].values[idx[d]];
+            if (dims[d].name == "TEMP") tempC = val[d];
+        }
+        if (tempC != runTempC) {
+            SPICEParseResult np = SPICEParser().parse(req.source.payload, req.source.baseDir, tempC);
+            if (!np.success) { r.converged = false; r.errorDetail = "SPICE parse error: " + np.errorMessage; break; }
+            if (!build(std::move(np))) { r.converged = false; break; }
+            runTempC = tempC;
+            prev.clear();  // a new circuit: no continuation
+        }
+        auto setAll = [&](size_t d0) { for (size_t d = d0; d < dims.size(); ++d) if (run->set[d]) run->set[d](val[d]); };
+        setAll(0);
+        const bool stepped = !prev.empty() && std::equal(idx.begin() + 1, idx.end(), prev.begin() + 1) && run->set[0];
+        std::function<SolverStep(double, double, int)> reach = [&](double from, double to, int depth) {
+            run->set[0](to);
+            SolverStep s = run->sim.solveDC(run->parsed.netlist);
+            if (s.stats.converged || depth == 0) return s;
+            const double mid = 0.5 * (from + to);
+            SolverStep m = reach(from, mid, depth - 1);
+            return m.stats.converged ? reach(mid, to, depth - 1) : m;
+        };
+        SolverStep s = stepped ? reach(dims[0].values[prev[0]], val[0], 8) : run->sim.solveDC(run->parsed.netlist);
+        setAll(0);
         if (!s.stats.converged) {
-            r.converged   = false;
-            r.errorDetail = "DC sweep failed at " + name + "=" + std::to_string(*value) + ": " +
-                            s.stats.error_detail;
+            r.converged = false;
+            r.errorDetail = "DC sweep failed at " + dims[0].name + "=" + std::to_string(val[0]) + ": " + s.stats.error_detail;
             break;
         }
-        r.waveformPoints.push_back({*value, s.nodeVoltages});
-        cb.onProgress(static_cast<int>(k + 1), static_cast<int>(n + 1));
+        WaveformDataPoint pt{val[0], s.nodeVoltages, {}, {}, {}};
+        pt.outer.assign(val.begin() + 1, val.end());
+        r.waveformPoints.push_back(std::move(pt));
+        cb.onProgress(static_cast<int>(k + 1), static_cast<int>(total));
+        prev = idx;
+        for (size_t d = 0; d < dims.size() && ++idx[d] == dims[d].values.size(); ++d) idx[d] = 0;
     }
     return r;
 }
@@ -194,21 +241,37 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
     SPICEParseResult parsed;
     SimulationResponseDTO failure;
     if (!deserialiseRequest(req, parsed, failure)) return failure;
-    TensorNetlist& netlist = parsed.netlist;
-    DCConfigDTO sweep = req.dc;  // an explicit request wins over the netlist's .dc
-    if (sweep.sweepVariable.empty() && !parsed.dcSource.empty())
-        sweep = {parsed.dcSource, parsed.dcStart, parsed.dcStop, parsed.dcStep};
-
-    CircuitSim sim;
-    sim.execMode = selectExecMode(precision_);
-    
-    // Wire callbacks
-    sim.onConvergenceStep = [&](int it, double res) {
-        cb.onConvergenceStep(it, res);
-    };
-
-    if (sweep.sweepVariable.empty()) return stepToResponse(sim.solveDC(netlist), jobId_, precision_);
-    return dcSweep(sim, netlist, sweep, cb, [this] { return status_.load() == JobStatus::Cancelled; });
+    std::vector<DCConfigDTO> sweeps;  // innermost first
+    if (!req.dc.sweepVariable.empty()) {  // an explicit request wins over the netlist's .dc
+        sweeps.push_back(req.dc);
+        sweeps.insert(sweeps.end(), req.dc.outer.begin(), req.dc.outer.end());
+    } else {
+        for (const auto& d : parsed.dcSweeps) sweeps.push_back({d.name, d.start, d.stop, d.step, {}});
+    }
+    std::vector<DcDim> dims;
+    for (auto& sw : sweeps) {
+        for (auto& ch : sw.sweepVariable) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        const double span = sw.step != 0.0 ? (sw.stop - sw.start) / sw.step : -1.0;
+        if (!(span >= -1e-9)) {
+            failure.errorDetail = ".dc step must be non-zero and point from start to stop";
+            return failure;
+        }
+        DcDim d{sw.sweepVariable, {}};
+        for (long k = 0, n = static_cast<long>(std::floor(span + 1e-9)); k <= n; ++k) d.values.push_back(sw.start + k * sw.step);
+        dims.push_back(std::move(d));
+    }
+    if (parsed.tempsC.size() > 1) {  // .temp t1 t2 ...: the whole run once per temperature, outermost
+        for (const auto& d : dims)
+            if (d.name == "TEMP") { failure.errorDetail = "a .temp list and a .dc TEMP sweep together are not supported yet"; return failure; }
+        dims.push_back({"TEMP", parsed.tempsC});
+    }
+    if (dims.empty()) {
+        CircuitSim sim;
+        sim.execMode = selectExecMode(precision_);
+        sim.onConvergenceStep = [&](int it, double res) { cb.onConvergenceStep(it, res); };
+        return stepToResponse(sim.solveDC(parsed.netlist), jobId_, precision_);
+    }
+    return dcRun(req, std::move(parsed), dims, precision_, cb, [this] { return status_.load() == JobStatus::Cancelled; });
 }
 
 

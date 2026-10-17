@@ -18,6 +18,6 @@ double eval(const std::string &expr, const std::function<bool(const std::string 
 // Expand the (line number, text) lines of a netlist whose .include/.lib are already
 // spliced. Line 1 (the title) passes through. errLine: the line an error refers to.
 std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines,
-                                                int &errLine);
+                                                int &errLine, double tempC = 27.0);  // tempC: TEMPER
 
 }}  // namespace acutesim::numparam

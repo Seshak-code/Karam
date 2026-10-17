@@ -297,7 +297,10 @@ int main() {
         check(r.converged && r.waveformPoints.size() == 2 && near(r.waveformPoints[1].nodeVoltages[0], 2.0, 1e-6),
               "DCConfigDTO sweep of a current source: V(1) = 2 V at 1 mA");
         r = run(mode, "* nested\nV1 1 0 1\nV2 2 0 1\nR1 1 2 1k\n.dc V1 0 1 0.5 V2 0 1 0.5\n");
-        check(!r.converged && r.errorDetail.find("one source") != std::string::npos, "nested .dc is a parse error");
+        check(r.converged && r.waveformPoints.size() == 9 && r.outerNames.size() == 1 &&
+                  near(r.waveformPoints[4].timeS, 0.5, 1e-12) && near(r.waveformPoints[4].outer[0], 0.5, 1e-12) &&
+                  near(r.waveformPoints[8].timeS, 1.0, 1e-12) && near(r.waveformPoints[8].outer[0], 1.0, 1e-12),
+              "nested .dc: 3 x 3 points, the first source innermost");
         r = run(mode, "* missing\nV1 1 0 1\nR1 1 0 1k\n.dc V9 0 1 0.5\n");
         check(!r.converged && r.errorDetail.find("not found") != std::string::npos, ".dc of an unknown source is an error");
     }
@@ -421,7 +424,7 @@ int main() {
             {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 NM\n.model NM NMOS\n", "is NMOS, not a NPN/PNP model"},
             {"V1 1 0 DC 1\nR1 1 2 1k\nM1 2 2 0 NM W=10u\n.model NM NMOS\n", "expected 4 nodes"},
             // QA round 2 and the parameter front end
-            {"V1 1 0 DC 1\nR1 1 0 1k\n.options temp=50\n", "TEMP is not supported"},
+            {"V1 1 0 DC 1\nR1 1 2 1k\nJ1 2 0 0 JM\n.model JM NJF\n.options temp=50\n", "JFET temperature dependence is not supported"},
             {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D\n.model DM D IS=1e-15\n", "defined twice"},
             {"V1 1 0 DC {nosuch*2}\nR1 1 0 1k\n", "unknown parameter NOSUCH"},
             {".param a={b+1} b={a}\nV1 1 0 DC {a}\nR1 1 0 1k\n", "depends on itself"},

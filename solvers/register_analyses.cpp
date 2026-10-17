@@ -28,6 +28,15 @@ namespace solvers {
 
 using namespace orchestration;
 
+// Device values are resolved at the netlist's temperature (.temp) when it is parsed, so a corner
+// asking for another one cannot be applied here: refuse it (27 C is the request's default).
+static bool cornerTempOk(const SimulationRequestDTO& req, const TensorNetlist& n, SimulationResponseDTO& errOut) {
+    if (req.corner.temperature == 27.0 || req.corner.temperature + 273.15 == n.environment.ambient_temp_K) return true;
+    errOut.success = false;
+    errOut.errorDetail = "corner temperature is not supported yet: set it with .temp in the netlist";
+    return false;
+}
+
 // ── Helper: apply corner and run DC ─────────────────────────────────────────
 static bool applyCornerAndDC(
     CircuitSim& sim,
@@ -36,6 +45,7 @@ static bool applyCornerAndDC(
     SolverStep& dcOut,
     SimulationResponseDTO& errOut)
 {
+    if (!cornerTempOk(req, runNetlist, errOut)) return false;
     acutesim::physics::CornerConfig corner;
     corner.name           = req.corner.processCorner;
     corner.temperatureC   = req.corner.temperature;
@@ -73,6 +83,7 @@ static SimulationResponseDTO fourierHandler(
 {
     // Fourier requires a transient waveform — run transient first.
     TensorNetlist runNetlist = netlist;
+    if (SimulationResponseDTO bad; !cornerTempOk(req, runNetlist, bad)) return bad;
     acutesim::physics::CornerConfig corner;
     corner.name           = req.corner.processCorner;
     corner.temperatureC   = req.corner.temperature;

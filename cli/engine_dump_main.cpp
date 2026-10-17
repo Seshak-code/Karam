@@ -4,6 +4,8 @@
 //   <time> <v1> <v2> ...   (engine-internal node order)
 //   ac: <freq> <re1> <im1> <re2> <im2> ...
 //   noise: <freq> <onoise> <inoise> ... then "TOTAL <onoise_total> <inoise_total>"
+// A nested .dc / .temp list adds "SWEEP <name>=<value> ..." before the first row of each outer value
+//   (the row's first column is the innermost sweep value).
 #include "engine_api/isimulation_engine.h"
 #include "engine_api/simulation_session.h"
 #include "engine_api/simulation_dto.h"
@@ -48,7 +50,15 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < nz.frequencies.size(); ++k)
         std::printf("%.9g %.9g %.9g\n", nz.frequencies[k], nz.onoise[k], nz.inoise[k]);
     if (r.extended.hasNoise) std::printf("TOTAL %.9g %.9g\n", nz.onoiseTotal, nz.inoiseTotal);
+    const std::vector<double>* shown = nullptr;
     for (const auto& p : r.waveformPoints) {
+        if (!p.outer.empty() && (!shown || *shown != p.outer)) {
+            std::printf("SWEEP");
+            for (size_t i = 0; i < p.outer.size() && i < r.outerNames.size(); ++i)
+                std::printf(" %s=%.9g", r.outerNames[i].c_str(), p.outer[i]);
+            std::printf("\n");
+            shown = &p.outer;
+        }
         std::printf("%.9g", p.timeS);
         for (size_t i = 0; i < p.nodeVoltages.size(); ++i) {
             std::printf(" %.9g", p.nodeVoltages[i]);
