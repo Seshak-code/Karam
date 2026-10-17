@@ -57,6 +57,8 @@ struct ModelCard {
  *   G[n1][n1] += 1/R, G[n2][n2] += 1/R
  *   G[n1][n2] -= 1/R, G[n2][n1] -= 1/R
  */
+inline constexpr const char* TEMP_LIST_ERR = "a .temp list is supported for .op/.dc only";
+
 // Instance temperature (ngspice TEMP in Celsius, DTEMP offset): TEMP wins, else DTEMP shifts the circuit's.
 struct InstTemp {
     double temp = NAN, dtemp = 0.0;
@@ -478,6 +480,7 @@ struct BusProbe {
  */
 struct SimulationEnvironment {
     double ambient_temp_K = 300.15;   // 27°C
+    int temp_count = 1;               // values in the netlist's .temp list: more than one is for .op/.dc only
     double temp_ramp_K_per_s = 0.0;   // For thermal cycling
     
     // Process Corners (Monte Carlo)

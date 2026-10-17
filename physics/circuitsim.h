@@ -1168,7 +1168,6 @@ public:
   // Phase 1.8: PVT Application
   void applyCorner(TensorNetlist &netlist, const acutesim::physics::CornerConfig& corner) {
       netlist.environment.process = (SimulationEnvironment::Corner)corner.process;
-      // temperature: device values are resolved at parse time (.temp); see register_analyses.cpp
       
       // If voltage scale is 0 or negative, ignore (safety)
       if (corner.voltageScale > 0.1) {

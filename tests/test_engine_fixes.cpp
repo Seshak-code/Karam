@@ -301,6 +301,24 @@ int main() {
                   near(r.waveformPoints[4].timeS, 0.5, 1e-12) && near(r.waveformPoints[4].outer[0], 0.5, 1e-12) &&
                   near(r.waveformPoints[8].timeS, 1.0, 1e-12) && near(r.waveformPoints[8].outer[0], 1.0, 1e-12),
               "nested .dc: 3 x 3 points, the first source innermost");
+        {   // a corner temperature is the netlist's .temp; a .temp list is for .op/.dc only
+            const std::string ckt = "* corner\nV1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D(IS=1e-14 EG=1.11 XTI=3)\n";
+            auto eng = ISimulationEngine::create();
+            eng->setPrecisionMode(mode);
+            SimulationRequestDTO cr;
+            cr.source.payload = ckt;
+            cr.corner.temperature = 85.0;
+            EngineCallbacks ccb;
+            auto a = eng->createSession()->runDC(cr, ccb);
+            auto b = run(mode, ckt + ".temp 85\n");
+            check(a.converged && b.converged && near(a.waveformPoints[0].nodeVoltages[1], b.waveformPoints[0].nodeVoltages[1], 1e-12) &&
+                      !near(a.waveformPoints[0].nodeVoltages[1], run(mode, ckt).waveformPoints[0].nodeVoltages[1], 1e-3),
+                  "corner temperature 85 equals .temp 85");
+            cr.corner.temperature = 27.0;
+            cr.source.payload = ckt + ".temp 10 20\n";
+            auto t = eng->createSession()->runTransient(cr, ccb, nullptr);
+            check(!t.converged && t.errorDetail.find(".temp list") != std::string::npos, ".temp list with .tran is an error");
+        }
         r = run(mode, "* missing\nV1 1 0 1\nR1 1 0 1k\n.dc V9 0 1 0.5\n");
         check(!r.converged && r.errorDetail.find("not found") != std::string::npos, ".dc of an unknown source is an error");
     }

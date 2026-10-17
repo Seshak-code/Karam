@@ -87,12 +87,22 @@ static JobID generateJobID() {
 // Supports .model, .subckt/.ends, .param, waveform specs (PULSE, SIN), and SI suffixes.
 // Returns false (filling `failure`) on a parse error. It used to be logged and the
 // partial (or empty) netlist solved anyway, reporting "converged".
+// The corner temperature wins over the netlist's .temp (as an explicit .dc request wins over its .dc);
+// every temperature-dependent value is resolved by the parser. A .temp list is for .op/.dc (listOk) only.
 static bool deserialiseRequest(const SimulationRequestDTO& req, SPICEParseResult& out,
-                               SimulationResponseDTO& failure) {
-    out = SPICEParser().parse(req.source.payload, req.source.baseDir);
-    if (out.success) return true;
-    failure.errorDetail = "SPICE parse error: " + out.errorMessage;
-    return false;
+                               SimulationResponseDTO& failure, bool listOk = false) {
+    // ponytail: 27 is the DTO's default, so a corner asking for 27 C cannot override a netlist .temp
+    out = SPICEParser().parse(req.source.payload, req.source.baseDir,
+                              req.corner.temperature != 27.0 ? req.corner.temperature : NAN);
+    if (!out.success) {
+        failure.errorDetail = "SPICE parse error: " + out.errorMessage;
+        return false;
+    }
+    if (!listOk && out.netlist.environment.temp_count > 1) {
+        failure.errorDetail = TEMP_LIST_ERR;
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -178,7 +188,7 @@ static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseRe
         total *= static_cast<long>(dims[d].values.size());
         if (d) r.outerNames.push_back(dims[d].name);
     }
-    double runTempC = first.tempsC.empty() ? 27.0 : first.tempsC[0];
+    double runTempC = first.netlist.environment.ambient_temp_K - 273.15;
     std::unique_ptr<Run> run;
     auto build = [&](SPICEParseResult&& p) {
         run = std::make_unique<Run>(std::move(p), prec);
@@ -240,7 +250,7 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
                                                           const EngineCallbacks& cb) {
     SPICEParseResult parsed;
     SimulationResponseDTO failure;
-    if (!deserialiseRequest(req, parsed, failure)) return failure;
+    if (!deserialiseRequest(req, parsed, failure, true)) return failure;
     std::vector<DCConfigDTO> sweeps;  // innermost first
     if (!req.dc.sweepVariable.empty()) {  // an explicit request wins over the netlist's .dc
         sweeps.push_back(req.dc);

@@ -543,6 +543,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
 
     ambientK_ = (std::isnan(tempC) ? (result_.tempsC.empty() ? 27.0 : result_.tempsC[0]) : tempC) + 273.15;
     result_.netlist.environment.ambient_temp_K = ambientK_;
+    result_.netlist.environment.temp_count = std::max<int>(1, (int)result_.tempsC.size());
     const double tnomK = tnomC_ + 273.15;
     // Every temperature-dependent value below is resolved at ambientK_ (instance TEMP/DTEMP shift it), as ngspice's
     // *temp.c from the model's TNOM (.options tnom, 27 C); a netlist at TNOM keeps its cards exactly.
