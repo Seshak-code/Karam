@@ -897,14 +897,14 @@ public:
   }
 
   template <typename T>
-  int junctionCharges(const Junction &j, const std::array<T, 7> &x, double tempK, T *v, T *q,
+  int junctionCharges(const Junction &j, const std::array<T, 7> &x, T *v, T *q,
                       const JShift *sh = nullptr) const {
     if (j.d) {
       v[0] = shifted(T(x[2] - x[1]), sh, 0);
-      q[0] = diode_iq(v[0], diodeModel(*j.d, tempK)).second;
+      q[0] = diode_iq(v[0], diodeModel(*j.d)).second;
       return 1;
     }
-    const auto p = bjtModel(*j.q, tempK);
+    const auto p = bjtModel(*j.q);
     const double t = p.type;
     for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
     v[3] = t * j.subSign * (x[3] - x[j.sub]);
@@ -923,20 +923,20 @@ public:
   // integrated from the last accepted step (TRAP, else BE), as mosCurrents().
   // next != null: write the accepted charge state (history update).
   template <typename T>
-  std::array<T, 7> junctionCurrents(const Junction &j, const std::array<T, 7> &x, double tempK, double h,
+  std::array<T, 7> junctionCurrents(const Junction &j, const std::array<T, 7> &x, double h,
                                     BlockState::DeviceCharge *next = nullptr, const JShift *sh = nullptr) const {
     std::array<T, 7> I{};
     for (auto &i : I) i = T(0.0);
     double type = 1.0;
     const int *from, *to;
     if (j.d) {
-      const auto p = diodeModel(*j.d, tempK);
+      const auto p = diodeModel(*j.d);
       if (p.rs > 0.0) { const T ir = (x[0] - x[2]) / p.rs; I[0] += ir; I[2] -= ir; }
       const T id = diode_iq(shifted(T(x[2] - x[1]), sh, 0), p).first;
       I[2] += id; I[1] -= id;
       from = diodeFrom; to = diodeTo;
     } else {
-      const auto p = bjtModel(*j.q, tempK);
+      const auto p = bjtModel(*j.q);
       type = p.type;
       auto res = [&](int a, int b, double r) {
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
@@ -951,7 +951,7 @@ public:
     const BlockState::DeviceCharge *st = j.st;
     if (!st || !(h > 1e-15) || !integrator || !junctionHasCharge(j)) return I;
     T v[5], q[5];
-    const int K = junctionCharges(j, x, tempK, v, q, sh);
+    const int K = junctionCharges(j, x, v, q, sh);
     if constexpr (std::is_same_v<T, double>)
       if (next) {  // shift the voltage history (next may alias st)
         std::copy(st->v[1], st->v[1] + 5, next->v[2]);
@@ -1002,13 +1002,13 @@ public:
   // raw junction voltages at x are limited against the last iteration's
   // (DeviceCharge::jv) and the device is linearised there; node voltages are
   // left alone. First iteration of a solve: vcrit (BJT vbc = 0), as MODEINITJCT.
-  JShift junctionLimit(const Junction &j, const std::vector<double> &x, double tempK) const {
+  JShift junctionLimit(const Junction &j, const std::vector<double> &x) const {
     JShift sh;
     if (!j.st) return sh;
     auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
     auto *st = j.st;
     if (j.d) {
-      const auto m = diodeModel(*j.d, tempK);
+      const auto m = diodeModel(*j.d);
       const double vcrit = compute_vcrit(m.vte, m.is), raw = V(2) - V(1);
       double vl = vcrit;
       if (st->jvState) {
@@ -1020,7 +1020,7 @@ public:
       sh.d[0] = vl - raw;
       return sh;
     }
-    const auto m = bjtModel(*j.q, tempK);
+    const auto m = bjtModel(*j.q);
     const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
     const double raw[2] = {m.type * (V(5) - V(6)), m.type * (V(5) - V(4))};
     for (int k = 0; k < 2; ++k) {
@@ -1050,15 +1050,15 @@ public:
   // Newton stamp of a junction device: I(x) ~ I(vl) + G (v(x) - vl) at the
   // limited junction voltages vl (ngspice's companion), i.e. stampByDual at the
   // shifted point plus the G*(vl - v) correction from one seeded pass.
-  void stampJunction(const Junction &j, const std::vector<double> &v, double tempK, double h) {
-    const JShift sh = limitJunctions_ ? junctionLimit(j, v, tempK) : JShift{};
-    stampByDual(j.n, j.terms, v, [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, tempK, h, nullptr, &sh); });
+  void stampJunction(const Junction &j, const std::vector<double> &v, double h) {
+    const JShift sh = limitJunctions_ ? junctionLimit(j, v) : JShift{};
+    stampByDual(j.n, j.terms, v, [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, h, nullptr, &sh); });
     if (sh.d[0] == 0.0 && sh.d[1] == 0.0) return;
     JShift seeded = sh;
     seeded.seed = true;
     std::array<Dual<double>, 7> x;
     for (int k = 0; k < 7; ++k) x[k] = Dual<double>(j.n[k] > 0 && j.n[k] <= (int)v.size() ? v[j.n[k] - 1] : 0.0, 0.0);
-    const auto cur = junctionCurrents(j, x, tempK, h, nullptr, &seeded);
+    const auto cur = junctionCurrents(j, x, h, nullptr, &seeded);
     for (int t = 0; t < j.terms; ++t)
       if (j.n[t] > 0) rhsVector[j.n[t] - 1] += cur[t].grad;
   }
@@ -1186,7 +1186,6 @@ public:
   // Phase 1.8: PVT Application
   void applyCorner(TensorNetlist &netlist, const acutesim::physics::CornerConfig& corner) {
       netlist.environment.process = (SimulationEnvironment::Corner)corner.process;
-      netlist.environment.ambient_temp_K = corner.temperatureC + 273.15;
       
       // If voltage scale is 0 or negative, ignore (safety)
       if (corner.voltageScale > 0.1) {
@@ -1342,18 +1341,18 @@ public:
     const TensorBlock *blk;
     const BlockState *st;
     std::function<int(int)> map;   // local node -> global node
-    int vs, ind, e, h, tl, dev;    // first matrix row of each branch kind; tl: two per transmission line; dev: device internal nodes
+    int vs, ind, e, h, tl, bv, dev;  // first matrix row of each branch kind (tl: two per transmission line; bv: voltage behavioural sources); dev: device internal nodes
   };
   std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
     std::vector<BranchSlot> branchList;
-    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0});
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0, 0});
     for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
       auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
       if (it == nl.blockDefinitions.end()) continue;
       const auto *inst = &nl.instances[k];
       branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
         return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
-      }, 0, 0, 0, 0, 0, 0});
+      }, 0, 0, 0, 0, 0, 0, 0});
     }
     int next = nl.numGlobalNodes;
     for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
@@ -1361,6 +1360,10 @@ public:
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.tl = next; next += 2 * (int)s.blk->transmissionLines.size(); }
+    for (auto &s : branchList) {
+      s.bv = next;
+      for (const auto &b : s.blk->behavioural) next += b.voltage;
+    }
     for (auto &s : branchList) { s.dev = next; next += deviceInternals(*s.blk, *s.st); }
     total = next;
     return branchList;
@@ -1407,6 +1410,7 @@ public:
       for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
       for (const auto &e : b.currentControlledCurrentSources) mark({e.outPos, e.outNeg});
       for (const auto &e : b.transmissionLines) mark({e.nodePort1Pos, e.nodePort1Neg, e.nodePort2Pos, e.nodePort2Neg});
+      for (const auto &e : b.behavioural) mark({e.outPos, e.outNeg});
       for (const auto &e : b.powerRails) mark({e.nodeRail});
       for (const auto &e : b.parasiticResistors) mark({e.node1, e.node2});
       for (const auto &e : b.parasiticCapacitors) mark({e.node1, e.node2});
@@ -1507,6 +1511,9 @@ public:
         if (hs.ctrlSource >= 0 && hs.ctrlSource < (int)blk.voltageSources.size())
           add(b, sl.vs + hs.ctrlSource, -hs.rm);
       }
+      int bv = sl.bv;
+      for (const auto &bs : blk.behavioural)
+        if (bs.voltage) branch(bv++, node(bs.outPos), node(bs.outNeg));  // f(x) itself: stampBehav
       for (const auto &f : blk.currentControlledCurrentSources) {
         if (f.ctrlSource < 0 || f.ctrlSource >= (int)blk.voltageSources.size()) continue;
         const int bc = sl.vs + f.ctrlSource;  // alpha * I(ctrl) leaves out+ through the source
@@ -1538,6 +1545,73 @@ public:
     buildBranchSystem(nl, h, time, S);
     for (size_t t = 0; t < S.r.size(); ++t) matrixBuilder.add(S.r[t], S.c[t], S.v[t]);
     for (size_t i = 0; i < S.rhs.size() && i < rhsVector.size(); ++i) rhsVector[i] += S.rhs[i];
+  }
+
+  // Behavioural sources: f(x) over the unknowns x (node voltages, branch currents), plus df/dx_col for
+  // every column it reads, from one Dual pass per V()/I() reference (the seed is that reference).
+  struct BehavEnv {
+    static constexpr bool strict = false;
+    const std::vector<double> &rv;
+    int seed;
+    double t;
+    double time() const { return t; }
+    Dual<double> ref(int k) const { return Dual<double>(rv[k], k == seed ? 1.0 : 0.0); }
+  };
+  struct BehavEval { double f = 0.0; std::vector<std::pair<int, double>> d; };
+  BehavEval behavEval(const Behavioural &b, const BranchSlot &sl, const std::vector<double> &x, double time, bool grad) const {
+    const size_t n = b.refs.size();
+    auto X = [&](int c) { return c >= 0 && c < (int)x.size() ? x[c] : 0.0; };
+    std::vector<int> ca(n, -1), cb(n, -1);
+    std::vector<double> rv(n);
+    for (size_t k = 0; k < n; ++k) {
+      const auto &r = b.refs[k];
+      if (r.kind == 0) { ca[k] = sl.map(r.a) - 1; cb[k] = sl.map(r.b) - 1; }  // ground: -1, reads 0
+      else ca[k] = r.kind == 1 ? sl.vs + r.a : r.kind == 2 ? sl.ind + r.a : sl.bv + r.a;
+      rv[k] = X(ca[k]) - X(cb[k]);
+    }
+    BehavEnv env{rv, -1, time};
+    const acutesim::numparam::Evaluator<BehavEnv> ev{*b.expr, env};
+    BehavEval out;
+    if (!grad || n == 0) { out.f = ev(b.expr->root).val; return out; }
+    for (size_t k = 0; k < n; ++k) {
+      env.seed = (int)k;
+      const auto r = ev(b.expr->root);
+      out.f = r.val;
+      if (ca[k] >= 0) out.d.push_back({ca[k], r.grad});
+      if (cb[k] >= 0) out.d.push_back({cb[k], -r.grad});
+    }
+    return out;
+  }
+  // f(x) of each behavioural source in every block; row: its branch row (voltage sources), else -1
+  template <class F> void forEachBehav(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      int row = sl.bv;
+      for (const auto &b : sl.blk->behavioural) f(b, sl, b.voltage ? row++ : -1);
+    }
+  }
+  // Newton stamp at x: f ~ f0 + g.(x' - x). A voltage source's row reads v+ - v- - g.x' = f0 - g.x; a
+  // current source leaves + (enters -) with g.x' + f0 - g.x.
+  void stampBehav(const Behavioural &b, const BranchSlot &sl, int row, const std::vector<double> &x, double time) {
+    auto ev = behavEval(b, sl, x, time, true);
+    // ponytail: outside a function's domain (ln(0) at the cold start, V = 0) the Newton step sees 0 here;
+    // the audit (calculatePhysicalResiduals) keeps the exact value, so a real domain error cannot converge
+    if (!std::isfinite(ev.f)) ev.f = 0.0;
+    for (auto &[c, g] : ev.d) if (!std::isfinite(g)) g = 0.0;
+    double rhs = ev.f;
+    for (auto [c, g] : ev.d) rhs -= g * (c < (int)x.size() ? x[c] : 0.0);
+    const int np = sl.map(b.outPos) - 1, nn = sl.map(b.outNeg) - 1;
+    if (b.voltage) {
+      for (auto [c, g] : ev.d) matrixBuilder.add(row, c, -g);
+      rhsVector[row] += rhs;
+      return;
+    }
+    for (auto [c, g] : ev.d) {
+      if (np >= 0) matrixBuilder.add(np, c, g);
+      if (nn >= 0) matrixBuilder.add(nn, c, -g);
+    }
+    if (np >= 0) rhsVector[np] -= rhs;
+    if (nn >= 0) rhsVector[nn] += rhs;
   }
 
   /**
@@ -1631,7 +1705,7 @@ public:
     forEachJunction(netlist, [&](const Junction &j) {
         std::array<double, 7> x{};
         for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
-        const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, h);
+        const auto I = junctionCurrents(j, x, h);
         for (int k = 0; k < j.terms; ++k)
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
     });
@@ -1815,6 +1889,14 @@ public:
       for (size_t i = 0; i < S.rhs.size(); ++i) node_residuals[i] += S.rhs[i];
     }
 
+    // Behavioural sources: the exact f(x), not the linearisation just stamped
+    forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) {
+      const double f = behavEval(b, sl, v_candidate, time, false).f;
+      if (b.voltage) { node_residuals[row] += f; return; }
+      addRes(sl.map(b.outPos), -f);
+      addRes(sl.map(b.outNeg), f);
+    });
+
     // 6. Find Max Residual
     double max_err = 0.0;
     for (double val : node_residuals) {
@@ -1932,7 +2014,7 @@ public:
     forEachJunction(netlist, [&](const Junction &j) {
       std::array<double, 7> x{};
       for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
-      const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, 0.0);
+      const auto I = junctionCurrents(j, x, 0.0);
       DeviceAttribution a{j.d ? j.d->instanceName : j.q->instanceName, j.d ? "Diode" : "BJT", {}};
       for (int k = 0; k < j.terms; ++k) {
         addRes(j.n[k], -I[k]);
@@ -2123,8 +2205,8 @@ public:
               std::array<double, 7> x{};
               for (int k = 0; k < jj.terms; ++k) x[k] = getV(jj.n[k]);
               const double p0 = *par, dp = 1e-6 * std::max(std::abs(p0), 1e-30);
-              *par = p0 + dp; const auto Ip = junctionCurrents(jj, x, netlist.environment.ambient_temp_K, 0.0);
-              *par = p0 - dp; const auto Im = junctionCurrents(jj, x, netlist.environment.ambient_temp_K, 0.0);
+              *par = p0 + dp; const auto Ip = junctionCurrents(jj, x, 0.0);
+              *par = p0 - dp; const auto Im = junctionCurrents(jj, x, 0.0);
               for (int k = 0; k < jj.terms; ++k)
                   if (jj.n[k] > 0 && jj.n[k] <= (int)b_sens.size()) b_sens[jj.n[k] - 1] -= (Ip[k] - Im[k]) / (2.0 * dp);
           }
@@ -2450,10 +2532,10 @@ public:
 
     // Branch-current elements (V, L+K, E, F, H), MOSFETs, diodes and BJTs: one implementation for both paths
     stampBranchSystem(netlist, h, time);
+    forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) { stampBehav(b, sl, row, v_guess, time); });
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
-    const double tempK = netlist.environment.ambient_temp_K;
-    forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
+    forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, h); });
     osdiAll(netlist, v_guess, h, true, false);  // stamped in device order: the same sequence every iteration
     for (size_t i = 0; i < osdiRefs_.size(); ++i) stampOsdi(osdiRefs_[i], osdiI_[i], osdiJ_[i], v_guess);
 
