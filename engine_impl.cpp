@@ -544,7 +544,7 @@ SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
     if (deserialiseRequest(req, parsed, r)) {
         TensorNetlist& netlist = parsed.netlist;
         const auto freqs = CircuitSim::acFrequencies(parsed.noiseSweep, parsed.noisePoints,
-                                                     parsed.noiseStart, parsed.noiseStop);
+                                                     parsed.noiseStart, parsed.noiseStop, true);
         CircuitSim sim;
         sim.execMode = selectExecMode(precision_);
         if (parsed.noiseSource.empty() || freqs.empty())

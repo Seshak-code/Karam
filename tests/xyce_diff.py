@@ -57,6 +57,9 @@ DIALECT = {
     "CCCS/ftest.cir": "values written 1A: Xyce reads amps, ngspice (and the engine) atto",
     "MINCAPRES/mincr.cir": ".options DEVICE MINRES=1 gives the RS=0 diode 1 ohm (Xyce V(2a) = ngspice v(2b)); ngspice agrees with the engine",
     "LOAD/load.cir": "Xyce gold is 0.5 mV off ngspice near V4 = 54.7 V; the engine matches ngspice to 33 uV",
+    "Certification_Tests/BUG_1962/ic2.cir": "gold samples every 0.5 ms; its first interval holds the .ic transient (tau 10 us), which a "
+                                            "linear interpolation misreads. The engine matches the gold at its own points to 2 mV",
+    "Certification_Tests/BUG_507_SON/": "Xyce reads 3.361e-02A as amperes (ngspice: atto)",
     "ABM_LOG/log.cir": "Xyce log() is log10 (gold V(3) = 2 for 100); ngspice and the engine: natural log",
     "Certification_Tests/BUG_254/atanh_tanh.cir": "atanh(tanh(100)) = atanh(1): Xyce clamps, ngspice prints -inf (so does the engine's Newton fail)",
     "Certification_Tests/BUG_133/": "gold is Xyce's sparse output times; ngspice and the engine agree (v(3) = 1, 2, 3 at 0.500035, .075, .125 ms)",

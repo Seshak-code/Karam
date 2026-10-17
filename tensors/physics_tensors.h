@@ -21,9 +21,10 @@
 // Level-1 parameters of a MOSFET instance from its parser-resolved .model card
 // (Mosfet::card). An unresolved card (the GUI's Verilog-A path) keeps the
 // engine's 200u/0.7 V/0.02 NMOS and 100u/-0.7 V/0.02 PMOS by model name, no caps.
-inline Mos1Params<double> mos1Params(const Mosfet& m) {
+inline Mos1Params<double> mos1Params(const Mosfet& m, double gmin = PhysicsConstants::JUNCTION_GMIN) {
     const auto& c = m.card;
     Mos1Params<double> p;
+    p.gmin = gmin;
     const bool pmos = c.resolved ? c.pmos
                                  : m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos;
     p.polarity = pmos ? -1.0 : 1.0;
@@ -56,9 +57,10 @@ inline Mos1Params<double> mos1Params(const Mosfet& m) {
 // scale, resistances divide). Devices built without a card keep the IS/N or
 // IS/BF/BR they were constructed with and SPICE defaults for the rest.
 // The parser holds them at the instance temperature (Vt in thermalVoltage_V_T_V, IS, betas, junctions).
-inline DiodeModel<double> diodeModel(const Diode& d) {
+inline DiodeModel<double> diodeModel(const Diode& d, double gmin = PhysicsConstants::JUNCTION_GMIN) {
     const auto& c = d.card;
     DiodeModel<double> p;
+    p.gmin = gmin;
     const double vt = d.thermalVoltage_V_T_V, is = d.saturationCurrent_I_S_A;
     p.is = is * d.area;
     p.vte = d.emissionCoefficient_N * vt;
@@ -72,9 +74,10 @@ inline DiodeModel<double> diodeModel(const Diode& d) {
     return p;
 }
 
-inline JfetModel<double> jfetModel(const JFET& j) {
+inline JfetModel<double> jfetModel(const JFET& j, double gmin = PhysicsConstants::JUNCTION_GMIN) {
     const auto& c = j.card;
     JfetModel<double> p;
+    p.gmin = gmin;
     p.type = j.isNChannel ? 1.0 : -1.0;
     p.beta = j.beta * j.area; p.vto = j.Vto; p.lambda = j.lambda; p.b = c.b;
     p.is = c.is * j.area; p.vt = c.n * j.thermalVoltage_V_T_V;
@@ -82,11 +85,12 @@ inline JfetModel<double> jfetModel(const JFET& j) {
     return p;
 }
 
-inline BjtModel<double> bjtModel(const BJT& q) {
+inline BjtModel<double> bjtModel(const BJT& q, double gmin = PhysicsConstants::JUNCTION_GMIN) {
     const auto& c = q.card;
     const double a = q.area;
     const double vt = q.thermalVoltage_V_T_V, is = q.saturationCurrent_I_S_A;
     BjtModel<double> p;
+    p.gmin = gmin;
     p.type = q.isNPN ? 1.0 : -1.0;
     p.is = is * a; p.bf = q.betaF; p.br = q.betaR;
     p.vtf = c.nf * vt; p.vtr = c.nr * vt;
