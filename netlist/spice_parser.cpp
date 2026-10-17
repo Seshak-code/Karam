@@ -457,6 +457,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 case 'M': parseMosfet(tok, blk);      break;
                 case 'Q': parseBJT(tok, blk);         break;
                 case 'J': parseJFET(tok, blk);        break;
+                case 'S': case 'W': parseSwitch(tok, blk); break;
                 case 'N': parseOsdiDevice(tok, blk);  break;
                 case 'E': parseVCVS(tok, blk);        break;
                 case 'G': parseVCCS(tok, blk);        break;
@@ -621,6 +622,18 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             for (const char* k : keys) if (c->params.count(k)) return c->params.at(k);
             return def;
         };
+        for (auto& s : blk.switches) {
+            const ModelCard* c = card(s.modelName);
+            const bool w = !s.ctrlName.empty();
+            if (c->type != (w ? "CSW" : "SW"))
+                throw std::runtime_error(s.name + ": model " + c->name + " is " + c->type + ", not a " + (w ? "CSW" : "SW") + " model");
+            if (w) supported(c, {"IT", "IH", "RON", "ROFF"}); else supported(c, {"VT", "VH", "RON", "ROFF"});
+            s.vt = c->get(w ? "IT" : "VT", 0.0); s.vh = c->get(w ? "IH" : "VH", 0.0);
+            s.ron = c->get("RON", 1.0); s.roff = c->get("ROFF", 1e12);
+            // ponytail: ngspice also runs a negative hysteresis (it turns on at VT+VH and off at VT-VH); not modelled
+            if (!(s.vh >= 0.0 && s.ron > 0.0 && s.roff > 0.0))
+                throw std::runtime_error("model " + c->name + ": needs " + (w ? "IH" : "VH") + " >= 0 (negative is not supported yet) and RON, ROFF > 0");
+        }
         // Resistors (ngspice restemp): a model card gives the value from its sheet resistance and the
         // geometry, R = RSH (L - 2 SHORT) / (W - 2 NARROW), unless the instance gives it. The circuit
         // runs at 27 C, so TC1/TC2 act through the model's TNOM only.
@@ -1137,6 +1150,27 @@ void SPICEParser::parseBJT(const std::vector<std::string>& tok, TensorBlock& blk
     blk.bjts.push_back(q);
 }
 
+// S<name> <n+> <n-> <nc+> <nc-> <model> [ON|OFF]   W<name> <n+> <n-> <Vctrl> <model> [ON|OFF]
+void SPICEParser::parseSwitch(const std::vector<std::string>& tok, TensorBlock& blk) {
+    const bool w = toUpper(tok[0])[0] == 'W';
+    const size_t m = w ? 4 : 5;
+    requireFields(tok, m + 1);
+    Switch s;
+    s.name = toUpper(tok[0]);
+    s.nodePos = nodeIndex(tok[1]);
+    s.nodeNeg = nodeIndex(tok[2]);
+    if (w) s.ctrlName = toUpper(tok[3]);
+    else { s.ctrlPos = nodeIndex(tok[3]); s.ctrlNeg = nodeIndex(tok[4]); }
+    s.modelName = tok[m];
+    if (tok.size() > m + 2) throw std::runtime_error(tok[0] + ": expected the model and ON or OFF");
+    if (tok.size() == m + 2) {
+        const std::string k = toUpper(tok[m + 1]);
+        if (k != "ON" && k != "OFF") throw std::runtime_error(tok[0] + ": parameter " + k + " is not supported yet");
+        s.init = k == "ON";
+    }
+    blk.switches.push_back(s);
+}
+
 // J<name> <nd> <ng> <ns> <modelName>   (params from .model in parse())
 void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 5);
@@ -1289,6 +1323,7 @@ void SPICEParser::resolveControlledSources(TensorBlock& blk) {
     };
     for (auto& h : blk.currentControlledVoltageSources) h.ctrlSource = find(h.ctrlName);
     for (auto& f : blk.currentControlledCurrentSources) f.ctrlSource = find(f.ctrlName);
+    for (auto& s : blk.switches) if (!s.ctrlName.empty()) s.ctrlSource = find(s.ctrlName);
 }
 
 void SPICEParser::parseSubcktEnd() {

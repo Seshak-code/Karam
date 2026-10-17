@@ -679,6 +679,39 @@ public:
     }
   }
 
+  // Switches (S, W) of the flattened netlist. n: node unknowns 1-based (0 = ground): n+, n-, then the
+  // control nodes (S) or the controlling V source's branch current (W).
+  struct SwitchRef { const Switch *s; std::array<int, 3> n; char *on, *prev; };
+  template <class F> void forEachSwitch(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      auto *st = const_cast<BlockState *>(sl.st);
+      for (size_t i = 0; i < sl.blk->switches.size() && i < st->swOn.size(); ++i) {
+        const Switch &s = sl.blk->switches[i];
+        SwitchRef r{&s, {sl.map(s.nodePos), sl.map(s.nodeNeg), 0}, &st->swOn[i], &st->swPrev[i]};
+        r.n[2] = s.ctrlName.empty() ? 0 : sl.vs + s.ctrlSource + 1;
+        f(r, s.ctrlName.empty() ? std::array<int, 2>{sl.map(s.ctrlPos), sl.map(s.ctrlNeg)} : std::array<int, 2>{0, 0});
+      }
+    }
+  }
+  // ngspice swload: above VT+VH on, below VT-VH off, in between the state of the last iteration
+  // (the last accepted one at the start of a step)
+  // The first DC iteration (swForce_) holds the accepted state, as ngspice's INITJCT / INITFIX.
+  bool swForce_ = false;
+  bool swAcOff_ = false;  // small-signal matrix: ngspice's swacload stamps ROFF whatever the operating point
+  bool switchState(const SwitchRef &w, const std::array<int, 2> &c, const std::vector<double> &x) const {
+    if (swForce_) return *w.prev != 0;
+    auto V = [&](int g) { return g > 0 && g <= (int)x.size() ? x[g - 1] : 0.0; };
+    const double ctrl = w.s->ctrlName.empty() ? V(c[0]) - V(c[1]) : V(w.n[2]);
+    return ctrl > w.s->vt + w.s->vh ? true : ctrl < w.s->vt - w.s->vh ? false : *w.on != 0;
+  }
+  // The accepted state moves to the last stamped one (ngspice sets no breakpoint at a toggle)
+  bool acceptSwitches(const TensorNetlist &nl) const {
+    bool toggled = false;
+    forEachSwitch(nl, [&](const SwitchRef &w, const std::array<int, 2> &) { toggled = toggled || *w.on != *w.prev; *w.prev = *w.on; });
+    return toggled;
+  }
+
   // Independent source value: its waveform in transient, else DC, times the
   // source-stepping factor (1 except while solveDC ramps the sources).
   double srcFact_ = 1.0;
@@ -1385,6 +1418,7 @@ public:
       for (const auto &e : b.osdiDevices)
         for (int t : e.nodes) mark({t});
       for (const auto &e : b.jfets) mark({e.drain, e.gate, e.source});
+      for (const auto &e : b.switches) mark({e.nodePos, e.nodeNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledVoltageSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
@@ -1584,6 +1618,13 @@ public:
         const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, h);
         for (int k = 0; k < j.terms; ++k)
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
+    });
+    // 3.62 Switches: the stamped state's conductance; a state the iterate would change is not converged
+    forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &c) {
+        const double i = (getV(w.n[0]) - getV(w.n[1])) / (*w.on ? w.s->ron : w.s->roff);
+        addRes(w.n[0], -i);
+        addRes(w.n[1], i);
+        if (switchState(w, c, v_candidate) != (*w.on != 0)) addRes(w.n[0], 1.0);
     });
     // 3.65 OSDI devices: the stamped osdiCurrents(), internal-node rows included
     osdiAll(netlist, v_candidate, h, false, false);
@@ -2413,6 +2454,10 @@ public:
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     const double tempK = netlist.environment.ambient_temp_K;
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
+    forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &c) {
+      *w.on = !swAcOff_ && switchState(w, c, v_guess);
+      stampResistor(w.n[0], w.n[1], *w.on ? w.s->ron : w.s->roff, matrixBuilder);
+    });
     osdiAll(netlist, v_guess, h, true, false);  // stamped in device order: the same sequence every iteration
     for (size_t i = 0; i < osdiRefs_.size(); ++i) stampOsdi(osdiRefs_[i], osdiI_[i], osdiJ_[i], v_guess);
 

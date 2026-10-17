@@ -32,6 +32,7 @@ static constexpr int COLD_START_SUBSTEPS = 100;
 SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   if (netlist.numGlobalNodes == 0)
     return {0.0, {}, {0, 0.0, true}, 0};
+  forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev; });
 
   // GPU mode currently solves on the CPU path: the former WebGPU "hybrid" loop
   // stamped and solved on the CPU anyway with its own copy of the device
@@ -125,7 +126,9 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       matrixBuilder.setDimensions(nTot, nTot);
       rhsVector.assign(nTot, 0.0);
 
+      swForce_ = iteration == 0;
       stampAllElements(netlist, 0.0, voltageEstimate, 0.0);
+      swForce_ = false;
       addDiagonalConditioning(netlist.numGlobalNodes, gmin_factor);
       if (gmin_factor > 0.0) {  // device-internal nodes are nodes too (ngspice CKTdiagGmin)
         int totalRows = 0;
@@ -333,7 +336,9 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     singularRow = lastPivotRow;
   }
 
-  if (!converged && finalSingular) {
+  bool anySwitch = false;
+  forEachSwitch(netlist, [&](const SwitchRef &, const std::array<int, 2> &) { anySwitch = true; });
+  if (!converged && (finalSingular || anySwitch)) {  // ngspice: a switch circuit without a DC state falls back to its transient OP
     // ngspice's defaults: 100 ns steps to 10 us (optran ... 100n 10u)
     srcFact_ = 1.0;  // source stepping may have left the sources scaled down
     TensorNetlist pseudo = netlist;
@@ -441,6 +446,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // Gap 3: Save converged voltages for next solve's adaptive precision routing
   // Gap 4: Record solution in neural seeder history
   if (converged) {
+    acceptSwitches(netlist);
     prevVoltages_ = voltageEstimate;
     neuralSeeder_.recordSolution(voltageEstimate, final_kcl_error,
                                  total_iterations);
@@ -523,6 +529,7 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     if (st) mosCurrents<double>({getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3])}, mos1Params(m), st, h,
                                 const_cast<BlockState::DeviceCharge *>(st));
   });
+  acceptSwitches(netlist);
   // Diode / BJT charges, likewise (junctionCurrents with next = st)
   forEachJunction(netlist, [&](const Junction &j) {
     if (!j.st) return;
@@ -637,6 +644,7 @@ std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool
   if (!(step > 0.0)) return "Transient needs step > 0.";
   osdiFatal_.clear();
   osdiNonFinite_.clear();
+  forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev = w.s->init; });
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
   if (uic) {
@@ -786,7 +794,9 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   matrixBuilder.setDimensions(sys.n, sys.n);
   rhsVector.assign(sys.n, 0.0);
   limitJunctions_ = false;  // the Jacobian at the operating point itself
+  swAcOff_ = true;
   stampAllElements(netlist, 0.0, lastSolution_, 0.0);
+  swAcOff_ = false;
   limitJunctions_ = true;
   int rtotal = 0;
   for (const auto &sl : branchSlots(netlist, rtotal))  // AC=: the resistance .ac sees instead of R
@@ -954,6 +964,8 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     const auto &blk = *sl.blk;
     for (const auto &rr : blk.resistors)
       gens.push_back({sl.map(rr.nodeTerminal1), sl.map(rr.nodeTerminal2), kT4 / rr.resistance_ohms});
+    for (const auto &sw : blk.switches)  // thermal noise of the conductance the small-signal matrix holds (ROFF)
+      gens.push_back({sl.map(sw.nodePos), sl.map(sw.nodeNeg), kT4 / sw.roff});
     for (const auto &m : blk.mosfets) {
       const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source), b = sl.map(m.body);
       // channel gm = dI_drain/dV_gate (the bulk junctions do not see the gate)
@@ -1203,6 +1215,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
 
   if (!isFirstTransientStepHandled) {
     while (attempt < MAX_ATTEMPTS) {
+      // each attempt starts from the accepted switch states
+      forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev; });
       integrator->prepareStep(actualTimeStep);
 
       const int nTot = systemSize(netlist);
@@ -1261,6 +1275,16 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       if (!nrConverged) {
         actualTimeStep *= 0.5;
         attempt++;
+        continue;
+      }
+
+      // A switch toggled in a step much longer than the step/200 resolution: bisect to the
+      // crossing. ngspice (whose steps are what the user's tstep allows) toggles at the end of
+      // whichever step crosses; this lands within step/200 of the threshold instead.
+      bool toggled = false;
+      forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { toggled = toggled || *w.on != *w.prev; });
+      if (toggled && tran_.step > 0.0 && actualTimeStep > tran_.step / 200.0) {
+        actualTimeStep *= 0.5;
         continue;
       }
 

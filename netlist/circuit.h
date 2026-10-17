@@ -85,6 +85,22 @@ struct Resistor {
  *   I_eq = G_eq * v_prev + i_prev
  * The capacitor is replaced by a conductance in parallel with a history current source.
  */
+/*
+ * Switch (S voltage-controlled, W current-controlled): a resistor of RON or ROFF with ngspice's
+ * hysteresis. The state is decided from the control value of the Newton iterate against the
+ * last accepted state (BlockState::swPrev): on above VT+VH, off below VT-VH, else unchanged.
+ */
+struct Switch {
+    std::string name;
+    int nodePos = 0, nodeNeg = 0;
+    int ctrlPos = 0, ctrlNeg = 0;   // S: control nodes
+    std::string ctrlName;           // W: the V source whose current controls it
+    int ctrlSource = -1;            // ... its index in the same block (resolveControlledSources)
+    std::string modelName;
+    double vt = 0.0, vh = 0.0, ron = 1.0, roff = 1e12;
+    bool init = false;              // ON: the state before the first decision
+};
+
 struct Capacitor {
     std::string name;             // e.g. "C1"
     int nodePlate1;               // Positive plate (node index)
@@ -799,6 +815,7 @@ struct TensorBlock {
     
     // Passive Components
     std::vector<Resistor> resistors;
+    std::vector<Switch> switches;
     std::vector<Capacitor> capacitors;
     std::vector<Inductor> inductors;
     std::vector<MutualInductor> mutualInductors;
@@ -1228,6 +1245,7 @@ struct BlockState {
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
     std::vector<DeviceCharge> mosfetState, diodeState, bjtState;
+    std::vector<char> swOn, swPrev;  // per Switch: the state the last stamp used / the last accepted one
     std::vector<std::shared_ptr<osdi::Instance>> osdiState;  // per OsdiDevice (TensorNetlist::instantiateOsdi)
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
@@ -1243,6 +1261,9 @@ struct BlockState {
         powerRailState.resize(block.powerRails.size());
         for(auto& h : powerRailState) h.resize(3);
 
+        swOn.resize(block.switches.size());
+        swPrev.resize(block.switches.size());
+        for (size_t i = 0; i < block.switches.size(); ++i) swOn[i] = swPrev[i] = block.switches[i].init;
         mosfetState.resize(block.mosfets.size());
         diodeState.resize(block.diodes.size());
         bjtState.resize(block.bjts.size());
