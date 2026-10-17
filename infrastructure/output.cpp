@@ -167,6 +167,19 @@ OutputTable selectOutputs(const SimulationResponseDTO& r, const std::vector<std:
     return t;
 }
 
+std::vector<SimulationResponseDTO> splitByOuter(const SimulationResponseDTO& r) {
+    std::vector<SimulationResponseDTO> out;
+    for (const auto& p : r.waveformPoints) {
+        if (out.empty() || out.back().waveformPoints.back().outer != p.outer) {
+            out.push_back(r);
+            out.back().waveformPoints.clear();
+        }
+        out.back().waveformPoints.push_back(p);
+    }
+    if (out.empty()) out.push_back(r);
+    return out;
+}
+
 std::vector<std::string> requestedSpecs(const SimulationResponseDTO& r, char kind) {
     std::vector<std::string> out;
     const std::string an = analysisName(r);

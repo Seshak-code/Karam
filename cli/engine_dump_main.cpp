@@ -1,6 +1,6 @@
 // acutesim_engine_dump <netlist> <cpu|gpu> <dc|tran|ac|noise> [step stop]
 // Machine-readable waveform dump for differential testing (tests/ngspice_diff).
-// Prints: "CONVERGED <0|1>", "ERROR <text>", then one line per waveform point:
+// Prints: "CONVERGED <0|1>", "ERROR <text>", "BACKEND <what ran>", then one line per waveform point:
 //   <time> <v1> <v2> ...   (engine-internal node order)
 //   ac: <freq> <re1> <im1> <re2> <im2> ...
 //   then the branch currents (V/L/E/H/B-voltage, into the + terminal as ngspice's i(name)), after all the
@@ -8,6 +8,8 @@
 //   "BRANCHES b1 b2 ..." (lower case) precede the points and name the columns in order.
 //   (env TREESPICE_BASEDIR overrides the directory .include/.lib paths resolve against)
 //   noise: <freq> <onoise> <inoise> ... then "TOTAL <onoise_total> <inoise_total>"
+// A nested .dc / .temp list adds "SWEEP <name>=<value> ..." before the first row of each outer value
+//   (the row's first column is the innermost sweep value).
 #include "engine_api/isimulation_engine.h"
 #include "engine_api/simulation_session.h"
 #include "engine_api/simulation_dto.h"
@@ -49,7 +51,7 @@ int main(int argc, char** argv) {
     } else {
         r = session->runDC(req, cb);
     }
-    std::printf("CONVERGED %d\nERROR %s\n", r.converged ? 1 : 0, r.errorDetail.c_str());
+    std::printf("CONVERGED %d\nERROR %s\nBACKEND %s\n", r.converged ? 1 : 0, r.errorDetail.c_str(), r.backend.c_str());
     const auto& nz = r.extended.noise;
     for (size_t k = 0; k < nz.frequencies.size(); ++k)
         std::printf("%.9g %.9g %.9g\n", nz.frequencies[k], nz.onoise[k], nz.inoise[k]);
@@ -59,7 +61,15 @@ int main(int argc, char** argv) {
     std::printf("\nBRANCHES");
     for (const auto& n : r.branchNames) std::printf(" %s", n.c_str());
     std::printf("\n");
+    const std::vector<double>* shown = nullptr;
     for (const auto& p : r.waveformPoints) {
+        if (!p.outer.empty() && (!shown || *shown != p.outer)) {
+            std::printf("SWEEP");
+            for (size_t i = 0; i < p.outer.size() && i < r.outerNames.size(); ++i)
+                std::printf(" %s=%.9g", r.outerNames[i].c_str(), p.outer[i]);
+            std::printf("\n");
+            shown = &p.outer;
+        }
         std::printf("%.9g", p.timeS);
         for (size_t i = 0; i < p.nodeVoltages.size(); ++i) {
             std::printf(" %.9g", p.nodeVoltages[i]);

@@ -48,7 +48,7 @@ std::string text(const Expr &e);
 // Expand the (line number, text) lines of a netlist whose .include/.lib are already
 // spliced. Line 1 (the title) passes through. errLine: the line an error refers to.
 std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines,
-                                                int &errLine);
+                                                int &errLine, double tempC = 27.0);  // tempC: TEMPER
 
 // Evaluate node i. Env: time(), ref(k) (the Dual of e.refs[k]), strict (constants: /0 is an error).
 template <class Env>

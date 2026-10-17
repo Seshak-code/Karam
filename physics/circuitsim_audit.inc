@@ -48,7 +48,7 @@
     forEachJunction(netlist, [&](const Junction &j) {
         std::array<double, 7> x{};
         for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
-        const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, 0.0);
+        const auto I = junctionCurrents(j, x, 0.0);
         const std::string &name = j.d ? j.d->instanceName : j.q->instanceName;
         for (int k = 0; k < j.terms; ++k) {
             addRes(j.n[k], -I[k]);

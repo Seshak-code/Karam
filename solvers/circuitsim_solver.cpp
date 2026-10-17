@@ -530,7 +530,7 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     if (!j.st) return;
     std::array<double, 7> x{};
     for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
-    junctionCurrents(j, x, netlist.environment.ambient_temp_K, h, j.st);
+    junctionCurrents(j, x, h, j.st);
   });
   // OSDI charges, likewise (osdiCurrents with accept)
   osdiAll(netlist, v, h, false, true);
@@ -590,7 +590,7 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     std::array<double, 7> xv{};
     for (int k = 0; k < j.terms; ++k) xv[k] = getV(j.n[k]);
     double v[5], q[5];
-    const int K = junctionCharges(j, xv, netlist.environment.ambient_temp_K, v, q);
+    const int K = junctionCharges(j, xv, v, q);
     *j.st = {};
     for (auto &vh : j.st->v) std::copy(v, v + K, vh);
     std::copy(q, q + K, j.st->q);
@@ -828,7 +828,6 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   });
   // Diodes / BJTs: C_tu = dQ_t/dV_u of the junction charges (depletion + transit
   // time, XTF/VTF cross terms included) at the operating point, from Dual.
-  const double tempK = netlist.environment.ambient_temp_K;
   forEachJunction(netlist, [&](const Junction &j) {
     if (!junctionHasCharge(j)) return;
     auto V = [&](int k) { return j.n[k] > 0 ? lastSolution_[j.n[k] - 1] : 0.0; };
@@ -842,7 +841,7 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
       std::array<Dual<double>, 7> x;
       for (int k = 0; k < 7; ++k) x[k] = Dual<double>(V(k), k < j.terms && j.n[k] == j.n[u] ? 1.0 : 0.0);
       Dual<double> v[5], q[5];
-      const int K = junctionCharges(j, x, tempK, v, q);
+      const int K = junctionCharges(j, x, v, q);
       double Q[7] = {};
       for (int k = 0; k < K; ++k) {
         const double s = (j.q && k == 3 ? j.subSign : 1.0) * type;  // substrate: to Junction::sub
@@ -965,15 +964,14 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
   }
   // Diodes / BJTs (ngspice dionoise, bjtnoise): series-resistance thermal noise,
   // shot noise of the junction currents between the internal nodes
-  const double tempK = netlist.environment.ambient_temp_K;
   forEachJunction(netlist, [&](const Junction &j) {
     if (j.d) {
-      const auto m = diodeModel(*j.d, tempK);
+      const auto m = diodeModel(*j.d);
       if (m.rs > 0.0) gens.push_back({j.n[0], j.n[2], kT4 / m.rs});
       gens.push_back({j.n[2], j.n[1], q2 * std::abs(diode_iq(V(j.n[2]) - V(j.n[1]), m).first)});
       return;
     }
-    const auto m = bjtModel(*j.q, tempK);
+    const auto m = bjtModel(*j.q);
     if (m.rc > 0.0) gens.push_back({j.n[0], j.n[4], kT4 / m.rc});
     if (m.rb > 0.0) gens.push_back({j.n[1], j.n[5], kT4 / m.rb});
     if (m.re > 0.0) gens.push_back({j.n[2], j.n[6], kT4 / m.re});
@@ -1269,7 +1267,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
               std::array<double, 7> x{};
               for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
               double v[5], q[5];
-              const int K = junctionCharges(j, x, netlist.environment.ambient_temp_K, v, q);
+              const int K = junctionCharges(j, x, v, q);
               for (int k = 0; k < K; ++k) visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]});
             });
             // OSDI devices: their local node voltages

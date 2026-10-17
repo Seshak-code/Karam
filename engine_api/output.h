@@ -30,6 +30,11 @@ struct OutputTable {
 ENGINE_API OutputTable selectOutputs(const compute::orchestration::SimulationResponseDTO& r,
                                      const std::vector<std::string>& specs);
 
+// A nested .dc / .temp run as one response per value of the outer sweeps (for the .print tables); any other
+// response comes back whole.
+ENGINE_API std::vector<compute::orchestration::SimulationResponseDTO> splitByOuter(
+    const compute::orchestration::SimulationResponseDTO& r);
+
 // The specs of the response's netlist cards of `kind` ('p' print, 's' save/probe) that apply to its analysis.
 ENGINE_API std::vector<std::string> requestedSpecs(const compute::orchestration::SimulationResponseDTO& r, char kind);
 

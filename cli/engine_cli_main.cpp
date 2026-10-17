@@ -203,16 +203,23 @@ int main(int argc, char** argv) {
                 printNoise(out, r);
             } else {
                 const auto prints = requestedSpecs(r, 'p');
-                if (!rawPath.empty()) writeRaw(rawFile, selectOutputs(r, requestedSpecs(r, 's')), title(text), ascii);
-                if (!prints.empty()) writeTable(out, selectOutputs(r, prints), title(text));
-                else if (r.scaleName.empty()) printOp(out, r);
-                else if (rawPath.empty()) out << "." << an.kind << ": " << r.waveformPoints.size() << " points; add a .print card or -r FILE to see them\n";
+                if (!rawPath.empty()) writeRaw(rawFile, selectOutputs(r, requestedSpecs(r, 's')), title(text), ascii);  // ngspice: one plot, the inner sweep repeating
+                for (const auto& part : splitByOuter(r)) {  // a nested .dc / .temp list: one table per outer value
+                    if (!part.waveformPoints.empty() && !part.waveformPoints[0].outer.empty()) {
+                        out << "Sweep:";
+                        for (size_t i = 0; i < r.outerNames.size(); ++i) out << " " << r.outerNames[i] << "=" << part.waveformPoints[0].outer[i];
+                        out << "\n";
+                    }
+                    if (!prints.empty()) writeTable(out, selectOutputs(part, prints), title(text));
+                    else if (part.scaleName.empty()) printOp(out, part);
+                    else if (rawPath.empty()) out << "." << an.kind << ": " << part.waveformPoints.size() << " points; add a .print card or -r FILE to see them\n";
+                }
             }
         } catch (const std::exception& e) {
             std::cerr << "treespice: ." << an.kind << " output: " << e.what() << "\n";
             status = 1;
         }
-        out << "." << an.kind << " analysis time (seconds) = " << secs << "\n\n";
+        out << "." << an.kind << " analysis time (seconds) = " << secs << (r.backend.empty() ? "" : ", backend: " + r.backend) << "\n\n";
     }
     return status;
 }

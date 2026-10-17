@@ -38,6 +38,10 @@ def num(s):
     suf = m.group(2)
     return float(m.group(1)) * (SUFFIX["meg"] if suf.startswith("meg") else SUFFIX.get(suf[:1], 1.0) if suf else 1.0)
 
+def temps(text):
+    """The .temp card's list of Celsius values (ngspice itself takes one: each is run on its own)."""
+    return next((list(map(num, t[1:])) for t in map(str.split, cards(text)) if t[0].lower() == ".temp"), [])
+
 def toks(line): return re.sub(r"[(),=]", " ", line).split()
 
 def cards(text):
@@ -78,7 +82,7 @@ def node_map(text):
         if c == "N":  # N<name> <terminals...> <model> [params]: terminals precede the first model name
             pos = range(1, next((k for k in range(1, len(t)) if t[k].upper() in models), 1))
         # Q c b e [s] model ...: the 4th field is a substrate node when the 5th is a name (engine rule)
-        if c == "Q" and len(t) >= 6 and not re.fullmatch(r"[-+.\d].*", t[5]) and t[5].upper() not in ("AREA", "OFF", "IC", "M"):
+        if c == "Q" and len(t) >= 6 and not re.fullmatch(r"[-+.\d].*", t[5]) and t[5].upper() not in ("AREA", "OFF", "IC", "M", "TEMP", "DTEMP"):
             pos = [1, 2, 3, 4]
         for p in pos:
             if p < len(t) and t[p].upper() not in GROUND: m.setdefault(t[p].upper(), len(m) + 1)
@@ -106,7 +110,7 @@ def branch_names(text):
     return out
 
 def analysis(text):
-    """-> ('op',) | ('dc', src, start, stop, step) | ('tran', tstep, tstop, uic) | ('ac', sweep, n, f1, f2)
+    """-> ('op',) | ('dc', src, start, stop, step[, src2, start2, ...]) | ('tran', tstep, tstop, uic) | ('ac', sweep, n, f1, f2)
        | ('noise', "v(out[,ref])", src, sweep, n, f1, f2) | ('unsupported', why)"""
     for line in cards(text):
         t = line.split()
@@ -115,8 +119,9 @@ def analysis(text):
         if kw == ".noise":
             k = next(i for i, x in enumerate(t) if x.lower() in ("dec", "oct", "lin"))
             return ("noise", " ".join(t[1:k - 1]), t[k - 1], t[k].lower(), int(num(t[k + 1])), num(t[k + 2]), num(t[k + 3]))
-        if kw == ".dc":
-            return ("dc", t[1], *map(num, t[2:5])) if len(t) == 5 else ("unsupported", "nested/multi-source .dc")
+        if kw == ".dc":  # SRC start stop step, repeated for each nested sweep (the first source is the innermost)
+            if len(t) < 5 or (len(t) - 1) % 4: return ("unsupported", ".dc form (LIST/DEC/...)")
+            return ("dc", *[x if k % 4 == 0 else num(x) for k, x in enumerate(t[1:])])
         if kw == ".tran":
             n = [num(x) for x in t[1:] if x.lower() != "uic"]
             return ("tran", n[0], n[1], any(x.lower() == "uic" for x in t[1:]))
@@ -126,9 +131,9 @@ def analysis(text):
 def run_engine(args, text, mode, kind, step=0.0, stop=0.0):
     path = os.path.join(args.tmp, "eng.cir")
     open(path, "w").write(text)
-    cmd = [args.engine, path, mode, kind] + ([repr(step), repr(stop)] if kind == "tran" else [])
+    cmd = [os.path.abspath(args.engine), path, mode, kind] + ([repr(step), repr(stop)] if kind == "tran" else [])
     env = {**os.environ, **({"TREESPICE_BASEDIR": args.basedir} if getattr(args, "basedir", None) else {})}
-    try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env).stdout
+    try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env, cwd=args.tmp).stdout  # cwd: bsim4.osdi writes bsim4v5.out there
     except subprocess.TimeoutExpired: return dict(conv=False, err="TIMEOUT", pts=[])
     conv, err, pts, total, branches, nodes = False, "", [], None, [], []
     for ln in out.splitlines():
@@ -164,7 +169,7 @@ def run_ngspice(args, text, an, names, cur=()):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
-    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end|osdi|save|probe)\b", re.I)
+    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end|osdi|save|probe|temp)\b", re.I)
     kept, skip = [], False
     for i, ln in enumerate(text.splitlines()):
         if i > 0 and ln.strip()[:1] == "+":
@@ -172,7 +177,7 @@ def run_ngspice(args, text, an, names, cur=()):
             continue
         skip = i > 0 and bool(drop.match(ln.strip()))
         if not skip: kept.append(ln)
-    cmd = {"op": "op", "dc": "dc {1} {2!r} {3!r} {4!r}".format(*an) if an[0] == "dc" else "",
+    cmd = {"op": "op", "dc": "dc " + " ".join(repr(x) if isinstance(x, float) else x for x in an[1:]) if an[0] == "dc" else "",
            "tran": "tran {0!r} {1!r} 0 {2!r}{3}".format(an[1], an[2], tran_tmax(text, an), " uic" if an[3] else "") if an[0] == "tran" else "",
            "ac": "ac {1} {2} {3!r} {4!r}".format(*an) if an[0] == "ac" else "", "noise": ""}[an[0]]
     keys = list(names) + [f"i({c})" for c in cur]
@@ -189,11 +194,15 @@ def run_ngspice(args, text, an, names, cur=()):
         shutil.copy(os.path.join(OSDI_DIR, lib) if not os.path.isabs(lib) else lib, dst)
         ctl.insert(1, f"pre_osdi {dst}")
     cir = os.path.join(args.tmp, "ng.cir")
-    open(cir, "w").write("\n".join(kept + ctl) + "\n")
-    p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout)
-    if not os.path.exists(out) or os.path.getsize(out) == 0:
-        raise RuntimeError("ngspice produced no data: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
-    rows = [[float(x) for x in ln.split()] for ln in open(out) if ln.strip()]
+    rows = []
+    # ngspice takes one .temp value: a list is one run per value, the rows joined (the engine's order)
+    for t in (temps(text) if an[0] in ("op", "dc") else temps(text)[:1]) or [None]:
+        if os.path.exists(out): os.remove(out)
+        open(cir, "w").write("\n".join(kept[:1] + ([f".temp {t!r}"] if t is not None else []) + kept[1:] + ctl) + "\n")
+        p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout)
+        if not os.path.exists(out) or os.path.getsize(out) == 0:
+            raise RuntimeError("ngspice produced no data: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
+        rows += [[float(x) for x in ln.split()] for ln in open(out) if ln.strip()]
     if an[0] == "noise":
         tot = dict(re.findall(r"(\w+_total) = (\S+)", p.stdout))
         return [r[0] for r in rows], {"onoise": [r[1] for r in rows], "inoise": [r[3] for r in rows],
@@ -273,10 +282,11 @@ def compare(args, text, an, mode, nm, ref):
         r = run_engine(args, text, mode, "dc")   # .op: one row; .dc: one row per sweep point
         if unsupported(r): return "ENGINE-UNSUPPORTED", 0, 0, r["err"]
         if not r["conv"] or not r["pts"]: return "FAIL", math.inf, math.inf, f"engine not converged: {r['err']}"
-        if an[0] == "dc" and len(r["pts"]) != len(xs):
-            return "FAIL", math.inf, math.inf, f"engine swept {len(r['pts'])} points, ngspice {len(xs)}"
+        want = len(xs) or len(next(iter(vals.values()), [None]))  # .op: one row per .temp value
+        if len(r["pts"]) != want:
+            return "FAIL", math.inf, math.inf, f"engine gave {len(r['pts'])} points, ngspice {want}"
         for k, row in enumerate(r["pts"]):
-            at = "" if an[0] == "op" else f"{an[1]}={row[0]:g} "
+            at = "" if an[0] == "op" and want == 1 else f"row {k} " + (f"{an[1]}={row[0]:g} " if an[0] == "dc" else "")
             if an[0] == "dc" and abs(row[0] - xs[k]) > 1e-9 * max(1.0, abs(xs[k])): bad.append(f"{at}sweep value vs ngspice {xs[k]:g}")
             for n in names:
                 c, exp = ecol(r, n), vals[n][k]
@@ -345,6 +355,7 @@ def main():
         if args.k not in name: continue
         text = open(path).read()
         an = analysis(text)
+        if len(temps(text)) > 1 and an[0] not in ("op", "dc"): an = ("unsupported", ".temp list with a transient/AC/noise run")
         if an[0] == "unsupported":
             print(f"{'SKIPPED':<19} {name} ({an[1]})"); continue
         missing = [l for l in osdi_libs(text) if not os.path.exists(os.path.join(OSDI_DIR, l))]

@@ -36,7 +36,7 @@ def main():
         if ts.returncode: fail(f"{name}: treespice exit {ts.returncode}: {ts.stderr.strip()[:200]}"); continue
         th, tr = table(ts.stdout)
         if not tr: fail(f"{name}: no table"); continue
-        if "tran" not in name:  # tran steps differ between the simulators: raw check only
+        if "tran" not in name and "dcnest" not in name:  # tran steps differ between the simulators: raw check only
             ng = subprocess.run([a.ngspice, "-b", net], capture_output=True, text=True).stdout
             # ngspice prints one table per output column when a column is complex: keep to real-valued columns
             nh, nr = table(ng)
@@ -82,6 +82,7 @@ def main():
             # a printed column's cells: scale first, then per column (complex = 2 cells)
             width = lambda h: 2 if "ac" in name and h in ("v(out)",) else 1
             off = 1 + sum(width(h) for h in th[1:ci])
+            if "dcnest" in name: got = got[:len(tr)]  # one plot holds every outer value; the table is the first
             if len(got) != len(tr): fail(f"{name}: raw has {len(got)} points, table {len(tr)}")
             elif not all(close(g[1], r[off]) for g, r in zip(got, tr)): fail(f"{name}: raw v(out) differs from the table")
             else: print("PASS", name, "ascii raw" if ascii_ else "binary raw")

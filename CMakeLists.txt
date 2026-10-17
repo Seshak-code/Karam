@@ -44,6 +44,15 @@ if(TREESPICE_STANDALONE AND TREESPICE_GPU AND NOT TARGET dawn_native)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")  # Dawn / Tint / Abseil warnings
     FetchContent_MakeAvailable(dawn)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_SAVED}")
+    # Dawn's pinned Abseil lists "-Xarch_x86_64;-maes;-Xarch_x86_64;-msse4.1" on Apple without SHELL:,
+    # and CMake de-duplicates the repeated "-Xarch_x86_64", leaving a bare -msse4.1 that arm64 rejects.
+    foreach(t absl_random_internal_randen_hwaes absl_random_internal_randen_hwaes_impl)
+        if(APPLE AND TARGET ${t})
+            get_target_property(o ${t} COMPILE_OPTIONS)
+            string(REGEX REPLACE "(-Xarch_[a-z0-9_]+);([^;]+)" "SHELL:\\1 \\2" o "${o}")
+            set_property(TARGET ${t} PROPERTY COMPILE_OPTIONS "${o}")
+        endif()
+    endforeach()
     set(DAWN_INTERNAL_INCLUDES ${dawn_SOURCE_DIR} ${dawn_SOURCE_DIR}/src ${dawn_BINARY_DIR}/gen/src
         ${dawn_SOURCE_DIR}/third_party/abseil-cpp ${dawn_SOURCE_DIR}/third_party/partition_alloc)
 endif()
