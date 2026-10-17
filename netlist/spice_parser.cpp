@@ -913,13 +913,17 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                     return ia != m.given.end() && ip != m.given.end() && ia->second <= 0.0 && ip->second <= 0.0;
                 };
                 auto shim = [&](const char* area, const char* per, double js, double xti, double nj, double jswg) {
-                    if (!zeroGeo(area, per) || js <= 0.0 || jswg != 0.0) return;
+                    if (!zeroGeo(area, per) || js <= 0.0 || jswg != 0.0) return false;
                     const double jsT = js * std::exp((eg(Tn) / devtemp::vt(Tn) - eg(T) / devtemp::vt(T) + xti * std::log(T / Tn)) / nj);
                     p[area] = 1e-14 / jsT;
+                    return true;
                 };
-                const double jss = get("JSS", 1e-4), xtis = get("XTIS", 3.0), njs = get("NJS", 1.0);
-                shim("AS", "PS", jss, xtis, njs, get("JSWGS", 0.0));
-                shim("AD", "PD", get("JSD", jss), get("XTID", xtis), get("NJD", njs), get("JSWGD", get("JSWGS", 0.0)));
+                const double jss = get("JSS", 1e-4), xtis = get("XTIS", 3.0), njs = get("NJS", 1.0), cjs = get("CJS", 5e-4);
+                const bool s = shim("AS", "PS", jss, xtis, njs, get("JSWGS", 0.0));
+                const bool d = shim("AD", "PD", get("JSD", jss), get("XTID", xtis), get("NJD", njs), get("JSWGD", get("JSWGS", 0.0)));
+                // The stand-in area must not add bottom-junction capacitance (CJS/CJD * area): that side had none
+                if (s) { if (!d && !p.count("CJD")) p["CJD"] = cjs; p["CJS"] = 0.0; }
+                if (d) p["CJD"] = 0.0;
             }
             auto& model = osdiModels_[key];
             if (!model) model = std::make_shared<osdi::Model>(osdi::findModule(module), c.name, p);
