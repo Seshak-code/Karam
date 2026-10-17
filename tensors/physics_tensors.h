@@ -38,6 +38,7 @@ inline Mos1Params<double> mos1Params(const Mosfet& m) {
     p.vto = c.vto; p.lambda = c.lambda; p.gamma = c.gamma; p.phi = c.phi;
     p.beta = c.kp * m.w / leff * M;
     p.isat = c.is * M; p.vt = c.vt;
+    if (c.js > 0.0 && m.geo.ad > 0.0 && m.geo.as > 0.0) { p.isat = c.js * m.geo.ad * M; p.isats = c.js * m.geo.as * M; }  // ngspice mos1temp
     p.cox = c.tox > 0.0 ? 3.9 * 8.854214871e-12 / c.tox * m.w * leff * M : 0.0;
     p.cgso = c.cgso * m.w * M; p.cgdo = c.cgdo * m.w * M; p.cgbo = c.cgbo * leff * M;
     // CBD/CBS win over CJ * area (ngspice mos1temp)
@@ -63,8 +64,21 @@ inline DiodeModel<double> diodeModel(const Diode& d) {
     p.vte = d.emissionCoefficient_N * vt;
     p.rs = c.rs / d.area;
     p.cjo = c.cjo * d.area; p.vj = c.vj; p.m = c.m; p.fc = c.fc; p.tt = c.tt;
+    p.isw = c.jsw * d.pj * d.mult; p.vtesw = c.ns * vt;
+    p.cjsw = c.cjsw * d.pj * d.mult; p.mjsw = c.mjsw; p.vjsw = c.php;
+    p.ikf = c.ikf * d.area; p.ikr = c.ikr * d.area;
     p.breakdown = c.bvGiven;
     if (p.breakdown) p.xbv = diode_breakdown_xbv(c.bv, c.ibv * d.area, p.is, p.vte);
+    return p;
+}
+
+inline JfetModel<double> jfetModel(const JFET& j) {
+    const auto& c = j.card;
+    JfetModel<double> p;
+    p.type = j.isNChannel ? 1.0 : -1.0;
+    p.beta = j.beta * j.area; p.vto = j.Vto; p.lambda = j.lambda; p.b = c.b;
+    p.is = c.is * j.area; p.vt = c.n * j.thermalVoltage_V_T_V;
+    p.cgs = c.cgs * j.area; p.cgd = c.cgd * j.area; p.pb = c.pb; p.fc = c.fc;
     return p;
 }
 
@@ -80,6 +94,8 @@ inline BjtModel<double> bjtModel(const BJT& q) {
     p.oikf = c.ikf != 0.0 ? 1.0 / (c.ikf * a) : 0.0; p.oikr = c.ikr != 0.0 ? 1.0 / (c.ikr * a) : 0.0;
     p.ise = c.ise * a; p.vte = c.ne * vt; p.isc = c.isc * a; p.vtc = c.nc * vt;
     p.rb = c.rb / a; p.rc = c.rc / a; p.re = c.re / a;
+    p.varRb = c.rb > 0.0 && c.rbm != c.rb;
+    p.rbm = c.rbm / a; p.xjrb = c.irb * a; p.nk = c.nk;
     p.cje = c.cje * a; p.vje = c.vje; p.mje = c.mje;
     p.cjcInt = c.cjc * c.xcjc * a; p.cjcExt = c.cjc * (1.0 - c.xcjc) * a; p.vjc = c.vjc; p.mjc = c.mjc;
     p.cjs = c.cjs * a; p.vjs = c.vjs; p.mjs = c.mjs; p.fc = c.fc;

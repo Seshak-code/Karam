@@ -105,6 +105,7 @@ private:
     void parseDiode      (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseMosfet     (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseBJT        (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseSwitch     (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseJFET       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseOsdiDevice (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCVS       (const std::vector<std::string>& tok, TensorBlock& blk);

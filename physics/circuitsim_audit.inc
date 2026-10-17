@@ -49,7 +49,7 @@
         std::array<double, 7> x{};
         for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
         const auto I = junctionCurrents(j, x, 0.0);
-        const std::string &name = j.d ? j.d->instanceName : j.q->instanceName;
+        const std::string &name = j.d ? j.d->instanceName : j.f ? j.f->instanceName : j.q->instanceName;
         for (int k = 0; k < j.terms; ++k) {
             addRes(j.n[k], -I[k]);
             if (std::abs(I[k]) > 10.0)

@@ -81,6 +81,9 @@ struct Resistor {
     std::string expression;         // Symbolic override (e.g. "Rload", "2*Vbias/Iref")
 
     double tc1 = 0.0, tc2 = 0.0;    // TC1, TC2: applied by the parser's resolve step, with inst
+    bool tc1Given = false, tc2Given = false;  // an instance TC overrides the model's
+    double m = 1.0;                 // M=: parallel copies (applied by the parser's model resolution)
+    double ac_ohms = NAN;           // AC=: the resistance .ac uses (NaN: resistance_ohms)
     InstTemp inst;
     double tcFactor = 1.0;          // resistance_ohms / nominal: .dc sweeps the nominal value
 };
@@ -93,6 +96,22 @@ struct Resistor {
  *   I_eq = G_eq * v_prev + i_prev
  * The capacitor is replaced by a conductance in parallel with a history current source.
  */
+/*
+ * Switch (S voltage-controlled, W current-controlled): a resistor of RON or ROFF with ngspice's
+ * hysteresis. The state is decided from the control value of the Newton iterate against the
+ * last accepted state (BlockState::swPrev): on above VT+VH, off below VT-VH, else unchanged.
+ */
+struct Switch {
+    std::string name;
+    int nodePos = 0, nodeNeg = 0;
+    int ctrlPos = 0, ctrlNeg = 0;   // S: control nodes
+    std::string ctrlName;           // W: the V source whose current controls it
+    int ctrlSource = -1;            // ... its index in the same block (resolveControlledSources)
+    std::string modelName;
+    double vt = 0.0, vh = 0.0, ron = 1.0, roff = 1e12;
+    bool init = false;              // ON: the state before the first decision
+};
+
 struct Capacitor {
     std::string name;             // e.g. "C1"
     int nodePlate1;               // Positive plate (node index)
@@ -104,7 +123,7 @@ struct Capacitor {
     double width_m = 0.0;
     double length_m = 0.0;
     double m = 1.0;               // Multiplier
-    
+
     double tolerance_percent = 0.0;
     std::string expression;         // Symbolic override for capacitance
 
@@ -196,6 +215,9 @@ struct VoltageSource {
     std::vector<double> pwl_t, pwl_v;
     double pwl_td = 0.0, pwl_r = -1.0;  // r < 0: no repeat
 
+    // EXP v1 v2 td1 tau1 td2 tau2 | SFFM vo va fc mdi fs | AM vo vmo vma fm fc td (ngspice order)
+    std::vector<double> wf;
+
     std::string expression;  // Symbolic override for DC/main value
     std::string name;        // instance name (F/H cards reference it)
 };
@@ -233,6 +255,7 @@ struct CurrentSource {
 
     std::vector<double> pwl_t, pwl_v;
     double pwl_td = 0.0, pwl_r = -1.0;
+    std::vector<double> wf;  // EXP / SFFM / AM arguments, as VoltageSource::wf
 
     std::string expression;  // Symbolic override for DC/main value
 };
@@ -281,6 +304,22 @@ inline double waveformValue(const Src& s, double dcValue, double t) {
         if (tt < s.pulse_tf) return s.pulse_v2 + (s.pulse_v1 - s.pulse_v2) * (tt / s.pulse_tf);
         return s.pulse_v1;
     }
+    if (s.type == "EXP") {  // ngspice: the second rise starts at TD2, on top of the first
+        const auto& w = s.wf;
+        if (t <= w[2]) return w[0];
+        const double a = w[0] + (w[1] - w[0]) * (1.0 - std::exp(-(t - w[2]) / w[3]));
+        return t <= w[4] ? a : a + (w[0] - w[1]) * (1.0 - std::exp(-(t - w[4]) / w[5]));
+    }
+    if (s.type == "SFFM") {
+        const auto& w = s.wf;
+        const double kTwoPi = 6.283185307179586;
+        return w[0] + w[1] * std::sin(kTwoPi * w[2] * t + w[3] * std::sin(kTwoPi * w[4] * t));
+    }
+    if (s.type == "AM") {
+        const auto& w = s.wf;
+        const double kTwoPi = 6.283185307179586, tt = t - w[5];  // 0 (not VO) until TD, as ngspice
+        return tt <= 0.0 ? 0.0 : w[0] + std::sin(kTwoPi * w[4] * tt) * (w[1] + w[2] * std::sin(kTwoPi * w[3] * tt));
+    }
     if (s.type == "SINE") {
         const double kPi = 3.141592653589793;
         double phase = s.sine_phase * (kPi / 180.0);
@@ -301,6 +340,12 @@ template <class Src>
 inline double nextBreakpoint(const Src& s, double t) {
     const double inf = std::numeric_limits<double>::infinity();
     if (s.type == "SINE") return t < s.sine_td ? s.sine_td : inf;
+    if (s.type == "EXP") {  // the two rise starts
+        double b = inf;
+        for (double c : {s.wf[2], s.wf[4]}) if (c > t) b = std::min(b, c);
+        return b;
+    }
+    if (s.type == "AM") return t < s.wf[5] ? s.wf[5] : inf;
     if (s.type == "PWL") {  // the next corner, in absolute time
         const double tt = pwlLocalTime(s, t), shift = t - tt;
         const auto it = std::upper_bound(s.pwl_t.begin(), s.pwl_t.end(), tt);
@@ -556,10 +601,13 @@ struct Diode {
     // parser with SPICE defaults; area = the instance AREA factor.
     struct Card {
         double rs = 0.0, cjo = 0.0, vj = 1.0, m = 0.5, fc = 0.5, tt = 0.0;
+        double jsw = 0.0, ns = 1.0, cjsw = 0.0, mjsw = 0.33, php = 1.0, ikf = 0.0, ikr = 0.0;  // sidewall, knees
+        double kf = 0.0, af = 1.0;                                                            // flicker noise
         double bv = 0.0, ibv = 1e-3;
         bool bvGiven = false;
     } card;
     double area = 1.0;
+    double pj = 0.0, mult = 1.0;  // PJ= (sidewall perimeter) and M= (the sidewall terms scale by M, not by AREA)
     InstTemp inst;  // card and saturation current are held at the instance temperature (resolved by the parser)
 };
 
@@ -666,6 +714,8 @@ struct Mosfet {
         double cgso = 0.0, cgdo = 0.0, cgbo = 0.0;          // overlap [F/m]
         double cbd = 0.0, cbs = 0.0, cj = 0.0, cjsw = 0.0;  // bulk junctions [F, F/m^2, F/m]
         double mj = 0.5, mjsw = 0.33, pb = 0.8, fc = 0.5;
+        double js = 0.0;                                    // bulk junction saturation current density [A/m^2]
+        double kf = 0.0, af = 1.0;                          // flicker noise (AF is the frequency exponent in ngspice mos1noise)
         double vt = PhysicsConstants::V_THERMAL_NOM;        // bulk junctions' kT/q at the instance temperature
     } card;
     InstTemp inst;  // card is held at the instance temperature (resolved by the parser)
@@ -699,6 +749,8 @@ struct BJT {
         double nf = 1.0, nr = 1.0, vaf = 0.0, var = 0.0, ikf = 0.0, ikr = 0.0;
         double ise = 0.0, ne = 1.5, isc = 0.0, nc = 2.0;
         double rb = 0.0, rc = 0.0, re = 0.0;
+        double rbm = 0.0, irb = 0.0, nk = 0.5;                // RBM (= RB unless given), IRB, NK
+        double kf = 0.0, af = 1.0;                            // flicker noise
         double cje = 0.0, vje = 0.75, mje = 0.33, cjc = 0.0, vjc = 0.75, mjc = 0.33, xcjc = 1.0;
         double cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
         double iss = 0.0, ns = 1.0;                        // substrate junction
@@ -748,8 +800,15 @@ struct JFET {
     double beta = 1e-4;                   // Transconductance parameter [A/V^2]
     double Vto = -2.0;                    // Pinch-off voltage [V] (negative for N-ch)
     double lambda = 0.01;                 // Channel-length modulation [1/V]
-    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM; // For gate-source diode (optional)
-    
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM; // gate junctions: Vt (N applied below)
+
+    // ngspice level 1 .model values beyond BETA/VTO/LAMBDA, resolved by the parser; area = AREA * M
+    // (scales BETA, IS, CGS, CGD; RD and RS become parser-added series resistors)
+    struct Card {
+        double is = 1e-14, n = 1.0, b = 1.0, cgs = 0.0, cgd = 0.0, pb = 1.0, fc = 0.5, kf = 0.0, af = 1.0;
+    } card;
+    double area = 1.0;
+
     double temperature_K = 300.15;
 };
 
@@ -808,6 +867,7 @@ struct TensorBlock {
     
     // Passive Components
     std::vector<Resistor> resistors;
+    std::vector<Switch> switches;
     std::vector<Capacitor> capacitors;
     std::vector<Inductor> inductors;
     std::vector<MutualInductor> mutualInductors;
@@ -1238,7 +1298,8 @@ struct BlockState {
     std::vector<History> capacitorState;
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
-    std::vector<DeviceCharge> mosfetState, diodeState, bjtState;
+    std::vector<DeviceCharge> mosfetState, diodeState, bjtState, jfetState;
+    std::vector<char> swOn, swPrev;  // per Switch: the state the last stamp used / the last accepted one
     std::vector<std::shared_ptr<osdi::Instance>> osdiState;  // per OsdiDevice (TensorNetlist::instantiateOsdi)
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
@@ -1254,9 +1315,13 @@ struct BlockState {
         powerRailState.resize(block.powerRails.size());
         for(auto& h : powerRailState) h.resize(3);
 
+        swOn.resize(block.switches.size());
+        swPrev.resize(block.switches.size());
+        for (size_t i = 0; i < block.switches.size(); ++i) swOn[i] = swPrev[i] = block.switches[i].init;
         mosfetState.resize(block.mosfets.size());
         diodeState.resize(block.diodes.size());
         bjtState.resize(block.bjts.size());
+        jfetState.resize(block.jfets.size());
         osdiState.resize(block.osdiDevices.size());
         busProbeState.resize(block.busProbes.size());
     }

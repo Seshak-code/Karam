@@ -646,6 +646,7 @@ public:
   struct Junction {
     const Diode *d = nullptr;
     const BJT *q = nullptr;
+    const JFET *f = nullptr;  // terminals D, G, S (RD / RS are series resistors from the parser)
     std::array<int, 7> n{};
     int terms = 0;
     int sub = 4;           // BJT: substrate junction's inner terminal, C' (vertical) or B' (lateral)
@@ -679,7 +680,48 @@ public:
         j.st = i < st->bjtState.size() ? &st->bjtState[i] : nullptr;
         f(j);
       }
+      for (size_t i = 0; i < sl.blk->jfets.size(); ++i) {
+        const JFET &jf = sl.blk->jfets[i];
+        Junction j;
+        j.f = &jf; j.terms = 3;
+        j.n[0] = sl.map(jf.drain); j.n[1] = sl.map(jf.gate); j.n[2] = sl.map(jf.source);
+        j.st = i < st->jfetState.size() ? &st->jfetState[i] : nullptr;
+        f(j);
+      }
     }
+  }
+
+  // Switches (S, W) of the flattened netlist. n: node unknowns 1-based (0 = ground): n+, n-, then the
+  // control nodes (S) or the controlling V source's branch current (W).
+  struct SwitchRef { const Switch *s; std::array<int, 3> n; char *on, *prev; };
+  template <class F> void forEachSwitch(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      auto *st = const_cast<BlockState *>(sl.st);
+      for (size_t i = 0; i < sl.blk->switches.size() && i < st->swOn.size(); ++i) {
+        const Switch &s = sl.blk->switches[i];
+        SwitchRef r{&s, {sl.map(s.nodePos), sl.map(s.nodeNeg), 0}, &st->swOn[i], &st->swPrev[i]};
+        r.n[2] = s.ctrlName.empty() ? 0 : sl.vs + s.ctrlSource + 1;
+        f(r, s.ctrlName.empty() ? std::array<int, 2>{sl.map(s.ctrlPos), sl.map(s.ctrlNeg)} : std::array<int, 2>{0, 0});
+      }
+    }
+  }
+  // ngspice swload: above VT+VH on, below VT-VH off, in between the state of the last iteration
+  // (the last accepted one at the start of a step)
+  // The first DC iteration (swForce_) holds the accepted state, as ngspice's INITJCT / INITFIX.
+  bool swForce_ = false;
+  bool swAcOff_ = false;  // small-signal matrix: ngspice's swacload stamps ROFF whatever the operating point
+  bool switchState(const SwitchRef &w, const std::array<int, 2> &c, const std::vector<double> &x) const {
+    if (swForce_) return *w.prev != 0;
+    auto V = [&](int g) { return g > 0 && g <= (int)x.size() ? x[g - 1] : 0.0; };
+    const double ctrl = w.s->ctrlName.empty() ? V(c[0]) - V(c[1]) : V(w.n[2]);
+    return ctrl > w.s->vt + w.s->vh ? true : ctrl < w.s->vt - w.s->vh ? false : *w.on != 0;
+  }
+  // The accepted state moves to the last stamped one (ngspice sets no breakpoint at a toggle)
+  bool acceptSwitches(const TensorNetlist &nl) const {
+    bool toggled = false;
+    forEachSwitch(nl, [&](const SwitchRef &w, const std::array<int, 2> &) { toggled = toggled || *w.on != *w.prev; *w.prev = *w.on; });
+    return toggled;
   }
 
   // Independent source value: its waveform in transient, else DC, times the
@@ -869,6 +911,8 @@ public:
   // be (B'->E'), bc (B'->C'), bx (B->C'), substrate (S->C'; lateral: S->B', Junction::sub).
   static constexpr int diodeFrom[1] = {2}, diodeTo[1] = {1};
   static constexpr int bjtFrom[4] = {5, 5, 1, 3}, bjtTo[4] = {6, 4, 4, 4};
+  static constexpr int jfetFrom[2] = {1, 1}, jfetTo[2] = {2, 0};  // JFET gs (G->S), gd (G->D)
+  static double jfetType(const JFET &f) { return f.isNChannel ? 1.0 : -1.0; }
 
   // Branch voltages and charges (type domain) of j at terminal values x.
   // Junction-limiting shifts (junctionLimit): added to the junction voltages
@@ -889,6 +933,13 @@ public:
       q[0] = diode_iq(v[0], diodeModel(*j.d)).second;
       return 1;
     }
+    if (j.f) {
+      const double t = jfetType(*j.f);
+      v[0] = shifted(T(t * (x[1] - x[2])), sh, 0); v[1] = shifted(T(t * (x[1] - x[0])), sh, 1);
+      const auto c = jfet_charges(v[0], v[1], jfetModel(*j.f));
+      q[0] = c[0]; q[1] = c[1];
+      return 2;
+    }
     const auto p = bjtModel(*j.q);
     const double t = p.type;
     for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
@@ -899,7 +950,8 @@ public:
     return 4;
   }
   static bool junctionHasCharge(const Junction &j) {
-    if (j.d) return j.d->card.cjo > 0.0 || j.d->card.tt > 0.0;
+    if (j.d) return j.d->card.cjo > 0.0 || j.d->card.cjsw > 0.0 || j.d->card.tt > 0.0;
+    if (j.f) return j.f->card.cgs > 0.0 || j.f->card.cgd > 0.0;
     const auto &c = j.q->card;
     return c.cje > 0.0 || c.cjc > 0.0 || c.cjs > 0.0 || c.tf > 0.0 || c.tr > 0.0;
   }
@@ -920,13 +972,26 @@ public:
       const T id = diode_iq(shifted(T(x[2] - x[1]), sh, 0), p).first;
       I[2] += id; I[1] -= id;
       from = diodeFrom; to = diodeTo;
+    } else if (j.f) {
+      const auto p = jfetModel(*j.f);
+      type = p.type;
+      const auto e = jfet_eval(shifted(T(type * (x[1] - x[2])), sh, 0), shifted(T(type * (x[1] - x[0])), sh, 1), p);
+      I[0] += type * (e.id - e.igd); I[2] += type * (-e.id - e.igs); I[1] += type * (e.igs + e.igd);
+      from = jfetFrom; to = jfetTo;
     } else {
       const auto p = bjtModel(*j.q);
       type = p.type;
       auto res = [&](int a, int b, double r) {
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
       };
-      res(0, 4, p.rc); res(1, 5, p.rb); res(2, 6, p.re);
+      double rbb = p.rb;  // RBM != RB: the base resistance at this iterate's bias, held in the Jacobian (ngspice's gx)
+      if (p.varRb) {
+        auto dv = [](const T &v) { if constexpr (std::is_same_v<T, double>) return v; else return v.val; };
+        const auto ev = bjt_gp<double, double>(dv(shifted(T(type * (x[5] - x[6])), sh, 0)), dv(shifted(T(type * (x[5] - x[4])), sh, 1)),
+                                               dv(T(type * (x[1] - x[4]))), dv(T(type * j.subSign * (x[3] - x[j.sub]))), p);
+        rbb = bjt_rbb<double, double>(ev.qb, ev.cb, p);
+      }
+      res(0, 4, p.rc); res(1, 5, rbb); res(2, 6, p.re);
       const auto e = bjt_gp(shifted(T(type * (x[5] - x[6])), sh, 0), shifted(T(type * (x[5] - x[4])), sh, 1),
                             T(type * (x[1] - x[4])), T(type * j.subSign * (x[3] - x[j.sub])), p);
       I[4] += type * e.cc; I[5] += type * e.cb; I[6] -= type * (e.cc + e.cb);
@@ -1005,6 +1070,17 @@ public:
       sh.d[0] = vl - raw;
       return sh;
     }
+    if (j.f) {  // both gate junctions start at -1 V (ngspice jfetload INITJCT)
+      const auto m = jfetModel(*j.f);
+      const double vcrit = compute_vcrit(m.vt, m.is), raw[2] = {m.type * (V(1) - V(2)), m.type * (V(1) - V(0))};
+      for (int k = 0; k < 2; ++k) {
+        const double vl = st->jvState ? pnjlim(raw[k], st->jv[k], m.vt, vcrit) : -1.0;
+        st->jv[k] = vl;
+        sh.d[k] = vl - raw[k];
+      }
+      st->jvState = 1;
+      return sh;
+    }
     const auto m = bjtModel(*j.q);
     const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
     const double raw[2] = {m.type * (V(5) - V(6)), m.type * (V(5) - V(4))};
@@ -1021,9 +1097,9 @@ public:
     forEachJunction(nl, [&](const Junction &j) {
       if (!j.st) return;
       auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
-      const double t = j.q ? (j.q->isNPN ? 1.0 : -1.0) : 1.0;
-      j.st->jv[0] = j.d ? V(2) - V(1) : t * (V(5) - V(6));
-      j.st->jv[1] = j.d ? 0.0 : t * (V(5) - V(4));
+      const double t = j.q ? (j.q->isNPN ? 1.0 : -1.0) : j.f ? jfetType(*j.f) : 1.0;
+      j.st->jv[0] = j.d ? V(2) - V(1) : j.f ? t * (V(1) - V(2)) : t * (V(5) - V(6));
+      j.st->jv[1] = j.d ? 0.0 : j.f ? t * (V(1) - V(0)) : t * (V(5) - V(4));
       j.st->jvState = 1;
     });
   }
@@ -1046,54 +1122,6 @@ public:
     const auto cur = junctionCurrents(j, x, h, nullptr, &seeded);
     for (int t = 0; t < j.terms; ++t)
       if (j.n[t] > 0) rhsVector[j.n[t] - 1] += cur[t].grad;
-  }
-
-  void stampJFET(const JFET& j, int nD, int nG, int nS,
-                 double v_d, double v_g, double v_s,
-                 MatrixConstructor& mb, std::vector<double>& rhs) {
-      double vgs = v_g - v_s;
-      double vds = v_d - v_s;
-
-      JFETParams<double> p;
-      p.Beta = j.beta;
-      p.Vto = j.Vto;
-      p.Lambda = j.lambda;
-
-      // P-channel: I = s*f(s*vgs, s*vds) with s = -1 (same form as the KCL
-      // audit). Chain rule: dI/dvgs = s*f'*s = f', so gm/gds take NO sign; only
-      // the current flips. (Previously ids was unsigned and gm/gds were signed,
-      // so P-channel JFETs were linearised around the wrong current.)
-      double sign = j.isNChannel ? 1.0 : -1.0;
-
-      Dual<double> gm_ad = jfet_ids(Dual<double>(vgs * sign, 1.0), Dual<double>(vds * sign, 0.0), p);
-      Dual<double> gds_ad = jfet_ids(Dual<double>(vgs * sign, 0.0), Dual<double>(vds * sign, 1.0), p);
-      double ids = sign * gm_ad.val;
-      double gm  = gm_ad.grad;
-      double gds = gds_ad.grad;
-
-      // Linearized current source
-      double i_eq = ids - (gm * vgs + gds * vds);
-
-      // Stamp JFET
-      // Ids = gm*Vgs + gds*Vds + I_eq
-
-      // Drain node (nD)
-      if (nD != 0) {
-          if (nG != 0) mb.add(nD-1, nG-1, gm);
-          if (nS != 0) mb.add(nD-1, nS-1, -gm - gds);
-          if (nD != 0) mb.add(nD-1, nD-1, gds);
-          rhs[nD-1] -= i_eq;
-      }
-
-      // Source node (nS)
-      // KCL at S: -Ids = Is
-      // Is = -Ids = -(gm*Vgs + gds*Vds + I_eq)
-      if (nS != 0) {
-          if (nG != 0) mb.add(nS-1, nG-1, -gm);
-          if (nS != 0) mb.add(nS-1, nS-1, gm + gds);
-          if (nD != 0) mb.add(nS-1, nD-1, -gds);
-          rhs[nS-1] += i_eq;
-      }
   }
 
   SolverStep solveDC(TensorNetlist &netlist);
@@ -1417,6 +1445,7 @@ public:
       for (const auto &e : b.osdiDevices)
         for (int t : e.nodes) mark({t});
       for (const auto &e : b.jfets) mark({e.drain, e.gate, e.source});
+      for (const auto &e : b.switches) mark({e.nodePos, e.nodeNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledVoltageSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
@@ -1688,6 +1717,13 @@ public:
         for (int k = 0; k < j.terms; ++k)
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
     });
+    // 3.62 Switches: the stamped state's conductance; a state the iterate would change is not converged
+    forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &c) {
+        const double i = (getV(w.n[0]) - getV(w.n[1])) / (*w.on ? w.s->ron : w.s->roff);
+        addRes(w.n[0], -i);
+        addRes(w.n[1], i);
+        if (switchState(w, c, v_candidate) != (*w.on != 0)) addRes(w.n[0], 1.0);
+    });
     // 3.65 OSDI devices: the stamped osdiCurrents(), internal-node rows included
     osdiAll(netlist, v_candidate, h, false, false);
     for (size_t i = 0; i < osdiRefs_.size(); ++i) {
@@ -1697,28 +1733,6 @@ public:
     }
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
-    
-    // 3.8 JFET Audit (Shichman-Hodges)
-    for (const auto &jfet_inst : netlist.globalBlock.jfets) {
-        double v_d = getV(jfet_inst.drain);
-        double v_g = getV(jfet_inst.gate);
-        double v_s = getV(jfet_inst.source);
-        double vgs = v_g - v_s;
-        double vds = v_d - v_s;
-        
-        JFETParams<double> params;
-        params.Beta = jfet_inst.beta;
-        params.Vto = jfet_inst.Vto;
-        params.Lambda = jfet_inst.lambda;
-        
-        // For P-channel, negate voltages and result
-        double sign = jfet_inst.isNChannel ? 1.0 : -1.0;
-        double ids = sign * jfet_ids(sign * vgs, sign * vds, params);
-        
-        // KCL: Current leaves drain, enters source
-        addRes(jfet_inst.drain, -ids);
-        addRes(jfet_inst.source, ids);
-    }
     
     // 3.7 Zener Audit
     for (const auto &z : netlist.globalBlock.zenerDiodes) {
@@ -1810,18 +1824,6 @@ public:
             double i_vccs = vccs.gm * v_ctrl;
             addRes(mapNode(vccs.outPos), -i_vccs);
             addRes(mapNode(vccs.outNeg), i_vccs);
-        }
-
-        // JFETs (Instance) — same form as the global audit
-        for (const auto &j : block.jfets) {
-            JFETParams<double> params;
-            params.Beta = j.beta; params.Vto = j.Vto; params.Lambda = j.lambda;
-            double sign = j.isNChannel ? 1.0 : -1.0;
-            double vgs = getV(mapNode(j.gate)) - getV(mapNode(j.source));
-            double vds = getV(mapNode(j.drain)) - getV(mapNode(j.source));
-            double ids = sign * jfet_ids(sign * vgs, sign * vds, params);
-            addRes(mapNode(j.drain), -ids);
-            addRes(mapNode(j.source), ids);
         }
 
         // Capacitors (Transient)
@@ -1994,7 +1996,7 @@ public:
       std::array<double, 7> x{};
       for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
       const auto I = junctionCurrents(j, x, 0.0);
-      DeviceAttribution a{j.d ? j.d->instanceName : j.q->instanceName, j.d ? "Diode" : "BJT", {}};
+      DeviceAttribution a{j.d ? j.d->instanceName : j.f ? j.f->instanceName : j.q->instanceName, j.d ? "Diode" : j.f ? "JFET" : "BJT", {}};
       for (int k = 0; k < j.terms; ++k) {
         addRes(j.n[k], -I[k]);
         if (j.n[k] > 0 && j.n[k] <= n) a.nodeCurrents.push_back({j.n[k], -I[k]});
@@ -2035,20 +2037,6 @@ public:
       addRes(m.body, -c.b);
       attributions.push_back({m.instanceName, "MOSFET",
           {{m.drain, -c.d}, {m.source, -c.s}, {m.body, -c.b}}});
-    }
-
-    // JFETs
-    for (const auto &j : netlist.globalBlock.jfets) {
-      double vgs = getV(j.gate) - getV(j.source);
-      double vds = getV(j.drain) - getV(j.source);
-      JFETParams<double> p;
-      p.Beta = j.beta; p.Vto = j.Vto; p.Lambda = j.lambda;
-      double sign = j.isNChannel ? 1.0 : -1.0;
-      double ids = sign * jfet_ids(sign * vgs, sign * vds, p);
-      addRes(j.drain, -ids);
-      addRes(j.source, ids);
-      attributions.push_back({j.instanceName, "JFET",
-          {{j.drain, -ids}, {j.source, ids}}});
     }
 
     // Zener Diodes
@@ -2431,17 +2419,6 @@ public:
       stampSchottky(sd, nA, nC, getV(nA) - getV(nC), temp_K, matrixBuilder, rhsVector);
     }
 
-    // 4. JFETs
-    for (const auto &j : block.jfets) {
-        int nD = mapNode(j.drain);
-        int nG = mapNode(j.gate);
-        int nS = mapNode(j.source);
-
-        stampJFET(j, nD, nG, nS,
-                  getV(nD), getV(nG), getV(nS),
-                  matrixBuilder, rhsVector);
-    }
-
     // 5. Zener Diodes
     for (const auto &z : block.zenerDiodes) {
         int nA = mapNode(z.anode);
@@ -2503,10 +2480,6 @@ public:
             for (const auto &g : blk.voltageControlledCurrentSources)
                 stampVCCS(mapNode(g.ctrlPos), mapNode(g.ctrlNeg), mapNode(g.outPos), mapNode(g.outNeg),
                           g.gm, matrixBuilder, rhsVector);
-            for (const auto &j : blk.jfets) {
-                int nD = mapNode(j.drain), nG = mapNode(j.gate), nS = mapNode(j.source);
-                stampJFET(j, nD, nG, nS, getV(nD), getV(nG), getV(nS), matrixBuilder, rhsVector);
-            }
         };
         stampUncovered(netlist.globalBlock, [](int n) { return n; });
         for (const auto &inst : netlist.instances) {
@@ -2524,6 +2497,10 @@ public:
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, h); });
+    forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &c) {
+      *w.on = !swAcOff_ && switchState(w, c, v_guess);
+      stampResistor(w.n[0], w.n[1], *w.on ? w.s->ron : w.s->roff, matrixBuilder);
+    });
     osdiAll(netlist, v_guess, h, true, false);  // stamped in device order: the same sequence every iteration
     for (size_t i = 0; i < osdiRefs_.size(); ++i) stampOsdi(osdiRefs_[i], osdiI_[i], osdiJ_[i], v_guess);
 
