@@ -85,6 +85,22 @@ OSDI_DIR = os.environ.get("TREESPICE_OSDI_PATH") or os.path.join(ROOT, "datasets
 os.environ.setdefault("TREESPICE_OSDI_PATH", OSDI_DIR)
 def osdi_libs(text): return re.findall(r"^\s*\.osdi\s+(\S+)", text, re.I | re.M)
 
+def with_includes(text, base, depth=0):
+    """The netlist and the .include / .lib files it pulls in (they may need OSDI models or a PDK too)."""
+    out = [text]
+    for f in re.findall(r"^\s*\.(?:include|inc|lib)\s+[\"']?([^\s\"']+)", text, re.I | re.M):
+        p = os.path.normpath(os.path.join(base, f))
+        if depth < 3 and os.path.isfile(p): out.append(with_includes(open(p, errors="ignore").read(), os.path.dirname(p), depth + 1))
+    return "\n".join(out)
+
+def needed_osdi(text):
+    """OSDI libraries a netlist needs: its .osdi cards, and the ones the native BSIM cards run on."""
+    libs = set(osdi_libs(text))
+    for lvl in re.findall(r"^\s*\.model\s+\S+\s+\w+\s*\(?[^\n]*?\blevel\s*=\s*(\d+)", text, re.I | re.M):
+        libs |= {"54": {"bsim4.osdi"}, "14": {"bsim4.osdi"}, "49": {"bsim3.osdi"}, "8": {"bsim3.osdi"},
+                 "10": {"bsimsoi.osdi"}, "58": {"bsimsoi.osdi"}}.get(lvl, set())
+    return sorted(libs)
+
 def node_map(text):
     """Engine column order: first appearance in top-level element cards (name -> 1-based column)."""
     m, depth = {}, 0  # depth: open .subckt definitions (they nest)
@@ -488,8 +504,9 @@ def main():
         if steps(text) and an[0] not in ("op", "dc"): an = ("unsupported", ".step with a transient/AC/noise run: tests/cli_check.py runs it per step")
         if an[0] == "unsupported":
             print(f"{'SKIPPED':<19} {name} ({an[1]})"); continue
-        missing = [l for l in osdi_libs(text) if not os.path.exists(os.path.join(OSDI_DIR, l))]
-        missing += sorted({p for p in re.findall(r"\bpdk/[\w.-]+", text) if not os.path.exists(os.path.join(ROOT, "datasets", p))})
+        full = with_includes(text, os.path.dirname(path))
+        missing = [l for l in needed_osdi(full) if not os.path.exists(os.path.join(OSDI_DIR, l))]
+        missing += sorted({p for p in re.findall(r"\bpdk/[\w.-]+", full) if not os.path.exists(os.path.join(ROOT, "datasets", p))})
         if missing:
             print(f"{'SKIPPED':<19} {name} (missing {', '.join(missing)}: datasets/osdi from tests/build_osdi.sh, datasets/pdk see ENGINE_HANDOFF)"); continue
         nm = node_map(text) if an[0] not in ("noise", "pz", "sens") else {}
