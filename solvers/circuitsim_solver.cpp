@@ -365,7 +365,7 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     // ngspice keeps a node gmin during its transient OP: a node with no capacitance
     // either (an isolated MOS1 gate) would leave even the transient singular.
     struct GminOn { double &g; ~GminOn() { g = 0.0; } } gminOn{ptranGmin_};
-    ptranGmin_ = PhysicsConstants::JUNCTION_GMIN;
+    ptranGmin_ = gmin_;
     if (runTransient(pseudo, 100e-9, 10e-6, /*uic=*/true, [](const SolverStep &) { return true; }).empty()) {
       voltageEstimate = lastSolution_;
       voltageEstimate.resize(nTot, 0.0);
@@ -572,7 +572,7 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
   update(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
   // MOSFET charges: the state mosCurrents() integrated at v (netlist is non-const here)
   forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::DeviceCharge *st) {
-    if (st) mosCurrents<double>({getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3])}, mos1Params(m), st, h,
+    if (st) mosCurrents<double>({getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3])}, mos1Params(m, gmin_), st, h,
                                 const_cast<BlockState::DeviceCharge *>(st));
   });
   acceptSwitches(netlist);
@@ -661,7 +661,7 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
   forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::DeviceCharge *st) {
     if (!st) return;
     const double zero[5] = {};
-    const auto c = mos1_charges(getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3]), mos1Params(m), zero, zero, zero);
+    const auto c = mos1_charges(getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3]), mos1Params(m, gmin_), zero, zero, zero);
     auto *s = const_cast<BlockState::DeviceCharge *>(st);  // netlist is non-const here
     *s = {};
     for (auto &vh : s->v) std::copy(c.v, c.v + 5, vh);
@@ -936,7 +936,7 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   // MOSFETs: C_tu = dQ_t/dV_u of the terminal charges at the operating point
   // (Meyer 2*half + overlap, junction dq/dv: ngspice mos1acld), from Dual.
   forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::DeviceCharge *) {
-    const auto p = mos1Params(m);
+    const auto p = mos1Params(m, gmin_);
     if (!p.caps) return;
     auto V = [&](int k) { return n[k] > 0 ? lastSolution_[n[k] - 1] : 0.0; };
     const double zero[5] = {};
@@ -1085,10 +1085,10 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
       const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source), b = sl.map(m.body);
       // channel gm = dI_drain/dV_gate (the bulk junctions do not see the gate)
       const double gm = mos1_currents(Dual<double>(V(d)), Dual<double>(V(g), 1.0), Dual<double>(V(s)),
-                                      Dual<double>(V(b)), mos1Params(m)).d.grad;
+                                      Dual<double>(V(b)), mos1Params(m, gmin_)).d.grad;
       gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
       if (m.card.kf != 0.0) {  // flicker (ngspice mos1noise, as probed): 1e-3 KF |Id| / (Cox W Leff M f^AF)
-        const auto p = mos1Params(m);
+        const auto p = mos1Params(m, gmin_);
         const double id = std::abs(mos1_currents(V(d), V(g), V(s), V(b), p).d);
         gens.push_back({d, s, 0.0, [k = 1e-3 * m.card.kf * id / p.cox, af = m.card.af](double f) { return k / std::pow(f, af); }});
       }
@@ -1098,7 +1098,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
   // shot noise of the junction currents between the internal nodes
   forEachJunction(netlist, [&](const Junction &j) {
     if (j.d) {
-      const auto m = diodeModel(*j.d);
+      const auto m = diodeModel(*j.d, gmin_);
       if (m.rs > 0.0) gens.push_back({j.n[0], j.n[2], kT4 / m.rs});
       const double id = diode_iq(V(j.n[2]) - V(j.n[1]), m).first;
       gens.push_back({j.n[2], j.n[1], q2 * std::abs(id)});
@@ -1108,7 +1108,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
       return;
     }
     if (j.f) {  // ngspice jfetnoi: channel 8kT gm/3 and flicker KF |Id|^AF / f between D and S (RD, RS are resistors)
-      const auto m = jfetModel(*j.f);
+      const auto m = jfetModel(*j.f, gmin_);
       const double t = m.type;
       auto eval = [&](double dv) {  // dv: vgs and vgd move together, i.e. vds is fixed (gm)
         return jfet_eval(Dual<double>(t * (V(j.n[1]) - V(j.n[2])), dv), Dual<double>(t * (V(j.n[1]) - V(j.n[0])), dv), m);
@@ -1120,7 +1120,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
                           return kf * std::pow(std::max(id, 1e-38), af) / f; }});
       return;
     }
-    const auto m = bjtModel(*j.q);
+    const auto m = bjtModel(*j.q, gmin_);
     if (m.rc > 0.0) gens.push_back({j.n[0], j.n[4], kT4 / m.rc});
     if (m.re > 0.0) gens.push_back({j.n[2], j.n[6], kT4 / m.re});
     const double t = m.type;
@@ -1137,6 +1137,7 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
   forEachOsdi(netlist, [&](const OsdiRef &r) {
     std::vector<double> x(r.n.size());
     for (size_t k = 0; k < x.size(); ++k) x[k] = V(r.n[k]);
+    r.in->gmin = gmin_;
     r.in->evaluate(x.data(), osdi::ANALYSIS_NOISE | osdi::CALC_NOISE, 0.0);
     const auto srcs = r.in->noise(1.0);
     for (size_t s = 0; s < srcs.size(); ++s) {

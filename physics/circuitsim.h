@@ -468,7 +468,6 @@ public:
     reltol_ = e.reltol; vntol_ = e.vntol; abstol_ = e.abstol; gmin_ = e.gmin;
     gshunt_ = e.rshunt > 0.0 ? 1.0 / e.rshunt : 0.0;
     itl1_ = e.itl1; itl2_ = e.itl2; itl4_ = e.itl4;
-    PhysicsConstants::JUNCTION_GMIN = e.gmin;
     lteController_.setTRTOL(e.trtol);
     lteTolerance_ = 1e-4 * e.reltol / 1e-3;  // the engine's LTE bound scales with RELTOL (default unchanged)
     lteController_.setTolerance(lteTolerance_);
@@ -562,6 +561,7 @@ public:
       DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
                                     sd.thermalVoltage_V_T_V};
       params.Vt *= (temp_K / 300.15);
+      params.gmin = gmin_;
 
       Dual<double> v_diff_dual(v_diff, 1.0);
       Dual<double> i_d = diode_current_clamped(v_diff_dual, params);
@@ -578,6 +578,7 @@ public:
       zp.BV = z.breakdownVoltage_V;
       zp.IBV = z.currentAtBreakdown_A;
       zp.Rs = z.seriesResistance_Rs_ohms;
+      zp.gmin = gmin_;
       zp.N = z.emissionCoefficient_N;
       zp.Is = z.saturationCurrent_I_S_A;
       zp.Vt = z.thermalVoltage_V_T_V * (temp_K / 300.15);
@@ -854,6 +855,7 @@ public:
     bool bypass = bypassOn && limitJunctions_ && in.evalFlags == flags && in.evalAt.size() == L;
     for (size_t k = 0; bypass && k < L; ++k)
       bypass = std::abs(x[k] - in.evalAt[k]) <= 1e-3 * std::max(std::abs(x[k]), std::abs(in.evalAt[k])) + 1e-6;
+    in.gmin = gmin_;
     if (!bypass && !in.evaluate(x.data(), flags, 0.0)) {
       std::lock_guard<std::mutex> lock(osdiErrorMutex());  // devices evaluate in parallel
       osdiFatal_ = r.dev->instanceName + ": " + in.error();  // reported instead of a singular matrix
@@ -948,17 +950,17 @@ public:
                       const JShift *sh = nullptr) const {
     if (j.d) {
       v[0] = shifted(T(x[2] - x[1]), sh, 0);
-      q[0] = diode_iq(v[0], diodeModel(*j.d)).second;
+      q[0] = diode_iq(v[0], diodeModel(*j.d, gmin_)).second;
       return 1;
     }
     if (j.f) {
       const double t = jfetType(*j.f);
       v[0] = shifted(T(t * (x[1] - x[2])), sh, 0); v[1] = shifted(T(t * (x[1] - x[0])), sh, 1);
-      const auto c = jfet_charges(v[0], v[1], jfetModel(*j.f));
+      const auto c = jfet_charges(v[0], v[1], jfetModel(*j.f, gmin_));
       q[0] = c[0]; q[1] = c[1];
       return 2;
     }
-    const auto p = bjtModel(*j.q);
+    const auto p = bjtModel(*j.q, gmin_);
     const double t = p.type;
     for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
     v[3] = t * j.subSign * (x[3] - x[j.sub]);
@@ -985,19 +987,19 @@ public:
     double type = 1.0;
     const int *from, *to;
     if (j.d) {
-      const auto p = diodeModel(*j.d);
+      const auto p = diodeModel(*j.d, gmin_);
       if (p.rs > 0.0) { const T ir = (x[0] - x[2]) / p.rs; I[0] += ir; I[2] -= ir; }
       const T id = diode_iq(shifted(T(x[2] - x[1]), sh, 0), p).first;
       I[2] += id; I[1] -= id;
       from = diodeFrom; to = diodeTo;
     } else if (j.f) {
-      const auto p = jfetModel(*j.f);
+      const auto p = jfetModel(*j.f, gmin_);
       type = p.type;
       const auto e = jfet_eval(shifted(T(type * (x[1] - x[2])), sh, 0), shifted(T(type * (x[1] - x[0])), sh, 1), p);
       I[0] += type * (e.id - e.igd); I[2] += type * (-e.id - e.igs); I[1] += type * (e.igs + e.igd);
       from = jfetFrom; to = jfetTo;
     } else {
-      const auto p = bjtModel(*j.q);
+      const auto p = bjtModel(*j.q, gmin_);
       type = p.type;
       auto res = [&](int a, int b, double r) {
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
@@ -1076,7 +1078,7 @@ public:
     auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
     auto *st = j.st;
     if (j.d) {
-      const auto m = diodeModel(*j.d);
+      const auto m = diodeModel(*j.d, gmin_);
       const double vcrit = compute_vcrit(m.vte, m.is), raw = V(2) - V(1);
       double vl = vcrit;
       if (st->jvState) {
@@ -1089,7 +1091,7 @@ public:
       return sh;
     }
     if (j.f) {  // both gate junctions start at -1 V (ngspice jfetload INITJCT)
-      const auto m = jfetModel(*j.f);
+      const auto m = jfetModel(*j.f, gmin_);
       const double vcrit = compute_vcrit(m.vt, m.is), raw[2] = {m.type * (V(1) - V(2)), m.type * (V(1) - V(0))};
       for (int k = 0; k < 2; ++k) {
         const double vl = st->jvState ? pnjlim(raw[k], st->jv[k], m.vt, vcrit) : -1.0;
@@ -1099,7 +1101,7 @@ public:
       st->jvState = 1;
       return sh;
     }
-    const auto m = bjtModel(*j.q);
+    const auto m = bjtModel(*j.q, gmin_);
     const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
     const double raw[2] = {m.type * (V(5) - V(6)), m.type * (V(5) - V(4))};
     for (int k = 0; k < 2; ++k) {
@@ -1194,22 +1196,28 @@ public:
   NoiseResult solveNoise(TensorNetlist &netlist, const std::vector<double> &freqs,
                          int outNode, int refNode, const std::string &inputSource);
 
-  // .ac frequencies as ngspice steps them: dec/oct multiply by 10^(1/n) / 2^(1/n)
-  // up to fstop (+1e-3 of a step, ngspice's reltol slack); lin gives n points;
-  // log (the GUI's sweep) gives n log-spaced points from f1 to f2.
-  static std::vector<double> acFrequencies(const std::string &sweep, int n, double f1, double f2) {
+  // The grid of ngspice 47's .ac (probed point by point). lin: n points, but n = 2 gives only the first.
+  // oct / dec: N = floor(log(f2/f1) * n) steps of 2^(1/n) / 10^(1/n). dec over more than one decade refits the
+  // step to (f2/f1)^(1/N) so the last point is f2 itself; oct, and dec within one decade, stop at the last point <= f2.
+  // .noise (noise = true) never refits and has no lin quirk.
+  // "log" (tf_analysis): n points from f1 to f2, evenly spaced in log.
+  static std::vector<double> acFrequencies(const std::string &sweep, int n, double f1, double f2, bool noise = false) {
     std::vector<double> f;
-    if (n < 1 || !(f1 > 0.0) || f2 < f1) return f;
+    if (n < 1 || !(f1 > 0.0 || (sweep == "lin" && f1 == 0.0)) || f2 < f1) return f;
     if (sweep == "lin" || sweep == "log") {
-      for (int k = 0; k < n; ++k) {
+      const int pts = sweep == "lin" && n == 2 && !noise ? 1 : n;
+      for (int k = 0; k < pts; ++k) {
         const double t = n == 1 ? 0.0 : double(k) / (n - 1);
         f.push_back(sweep == "lin" ? f1 + t * (f2 - f1) : f1 * std::pow(f2 / f1, t));
       }
       return f;
     }
-    const double delta = std::pow(sweep == "oct" ? 2.0 : 10.0, 1.0 / n);
-    for (int k = 0; f1 * std::pow(delta, k) <= f2 * (1.0 + 1e-3 * delta); ++k)
-      f.push_back(f1 * std::pow(delta, k));
+    const bool oct = sweep == "oct";
+    const double x = std::log(f2 / f1) / std::log(oct ? 2.0 : 10.0) * n;
+    const int steps = (int)std::floor(x + 1e-9);
+    const bool refit = !oct && !noise && x - n > 1e-9;
+    const double ratio = refit ? std::pow(f2 / f1, 1.0 / steps) : std::pow(oct ? 2.0 : 10.0, 1.0 / n);
+    for (int k = 0; k <= steps; ++k) f.push_back(k == steps && refit ? f2 : f1 * std::pow(ratio, k));
     return f;
   }
   
@@ -1745,6 +1753,7 @@ public:
       
       DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
                             sd.thermalVoltage_V_T_V};
+      params.gmin = gmin_;
       double i_d = diode_current_clamped(v_d, params);
       
       addRes(sd.anode, -i_d);
@@ -1755,7 +1764,7 @@ public:
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &t,
                                const BlockState::DeviceCharge *st) {
         const auto I = mosCurrents<double>({getV(t[0]), getV(t[1]), getV(t[2]), getV(t[3])},
-                                           mos1Params(m), st, h);
+                                           mos1Params(m, gmin_), st, h);
         for (int k = 0; k < 4; ++k) addRes(t[k], -I[k]);
     });
     // 3.6 Diodes and BJTs, global block and every instance: the stamped
@@ -1794,6 +1803,7 @@ public:
         params.BV = z.breakdownVoltage_V;
         params.IBV = z.currentAtBreakdown_A;
         params.Rs = z.seriesResistance_Rs_ohms;
+        params.gmin = gmin_;
         params.N = z.emissionCoefficient_N;
         params.Is = z.saturationCurrent_I_S_A;
         params.Vt = z.thermalVoltage_V_T_V;
@@ -2071,6 +2081,7 @@ public:
       double v_d = getV(sd.anode) - getV(sd.cathode);
       DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
                             sd.thermalVoltage_V_T_V};
+      params.gmin = gmin_;
       double i_d = diode_current_clamped(v_d, params);
       addRes(sd.anode, -i_d);
       addRes(sd.cathode, i_d);
@@ -2081,7 +2092,7 @@ public:
     // MOSFETs
     for (const auto &m : netlist.globalBlock.mosfets) {
       const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
-                                   mos1Params(m));
+                                   mos1Params(m, gmin_));
       addRes(m.drain, -c.d);
       addRes(m.source, -c.s);
       addRes(m.body, -c.b);
@@ -2094,7 +2105,7 @@ public:
       double vd = getV(z.anode) - getV(z.cathode);
       ZenerParams<double> zp;
       zp.BV = z.breakdownVoltage_V; zp.IBV = z.currentAtBreakdown_A;
-      zp.Rs = z.seriesResistance_Rs_ohms; zp.N = z.emissionCoefficient_N;
+      zp.Rs = z.seriesResistance_Rs_ohms; zp.N = z.emissionCoefficient_N; zp.gmin = gmin_;
       zp.Is = z.saturationCurrent_I_S_A; zp.Vt = z.thermalVoltage_V_T_V;
       double iz = zener_current(vd, zp);
       addRes(z.anode, -iz);
@@ -2232,7 +2243,7 @@ public:
               const auto& m = netlist.globalBlock.mosfets[index];
 
               // dI/dp of the same mos1_currents() the solve used: Vth (VTO), W, L
-              const Mos1Params<double> p = mos1Params(m);
+              const Mos1Params<double> p = mos1Params(m, gmin_);
               Mos1Params<Dual<double>> pd{p.polarity, p.beta, p.vto, p.lambda, p.gamma, p.phi, p.isat, p.vt};
               const double leff = m.l - 2.0 * m.card.ld;
               if (paramName == "Vth") pd.vto.grad = 1.0;
@@ -2536,7 +2547,7 @@ public:
     stampBranchSystem(netlist, h, time);
     forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) { stampBehav(b, sl, row, v_guess, time); });
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
-                               const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
+                               const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m, gmin_), st, h, v_guess); });
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, h); });
     forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &c) {
       *w.on = !swAcOff_ && switchState(w, c, v_guess);

@@ -104,7 +104,7 @@ constexpr int MAX_PCG_ITER = 1000;
 
 /** ngspice GMIN: 1e-12 S in parallel with every PN junction (diode, BJT, zener),
  *  in the AoS models, every SoA kernel and both KCL audits. Never node-to-ground. */
-inline double JUNCTION_GMIN = 1e-12;  // .options gmin, set by each analysis entry (CircuitSim::applyOptions); process-wide
+constexpr double JUNCTION_GMIN = 1e-12;  // the default; a run's .options gmin travels in each device's parameters (.gmin)
 
 /** GMIN stepping stages */
 constexpr int GMIN_STEPS = 10;
