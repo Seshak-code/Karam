@@ -199,7 +199,7 @@ def run_ngspice(args, text, an, names, cur=()):
     for t in (temps(text) if an[0] in ("op", "dc") else temps(text)[:1]) or [None]:
         if os.path.exists(out): os.remove(out)
         open(cir, "w").write("\n".join(kept[:1] + ([f".temp {t!r}"] if t is not None else []) + kept[1:] + ctl) + "\n")
-        p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout)
+        p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout, cwd=args.tmp)  # cwd: ngspice BSIM4v5 paramchk writes bsim4v5.out
         if not os.path.exists(out) or os.path.getsize(out) == 0:
             raise RuntimeError("ngspice produced no data: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
         rows += [[float(x) for x in ln.split()] for ln in open(out) if ln.strip()]

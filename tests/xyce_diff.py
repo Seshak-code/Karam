@@ -53,6 +53,7 @@ DIALECT = {
     "IPULSE/": "values written 1A: Xyce reads amps, ngspice (and the engine) atto, so the source is 1e-18 A",
     "IPWL/": "values written 1A: Xyce reads amps, ngspice (and the engine) atto",
     "ISIN/": "values written 0.3A: Xyce reads amps, ngspice (and the engine) atto",
+    "IEXP/": "values written 1A/5A: Xyce reads amps, ngspice (and the engine) atto",
     "CCCS/ftest.cir": "values written 1A: Xyce reads amps, ngspice (and the engine) atto",
     "MINCAPRES/mincr.cir": ".options DEVICE MINRES=1 gives the RS=0 diode 1 ohm (Xyce V(2a) = ngspice v(2b)); ngspice agrees with the engine",
     "LOAD/load.cir": "Xyce gold is 0.5 mV off ngspice near V4 = 54.7 V; the engine matches ngspice to 33 uV",
