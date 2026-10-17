@@ -1,0 +1,10 @@
+* B4SOI with a body contact (d g s e p): the body tied through 1k to -0.2 V, Id-Vds at two gate biases
+.include lib/b4soi_nmos.inc
+VD d 0 DC 1.0
+VG g 0 DC 0.8
+VE e 0 DC 0
+VP pb 0 DC -0.2
+RP pb p 1k
+M1 d g 0 e p nmos1 w=4u l=0.15u
+.dc VD 0 1.2 0.05 VG 0.6 1.0 0.4
+.end
