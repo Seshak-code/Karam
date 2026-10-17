@@ -157,8 +157,11 @@ def run_engine(args, text, mode, kind, step=0.0, stop=0.0):
     try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env, cwd=args.tmp).stdout  # cwd: bsim4.osdi writes bsim4v5.out there
     except subprocess.TimeoutExpired: return dict(conv=False, err="TIMEOUT", pts=[])
     conv, err, pts, total, branches, nodes, pz, sens = False, "", [], None, [], [], dict(POLE=[], ZERO=[]), {}
+    dnodes, devents = [], []
     for ln in out.splitlines():
-        if ln.startswith("BRANCHES"): branches = ln.split()[1:]
+        if ln.startswith("DNODES"): dnodes = ln.split()[1:]
+        elif ln.startswith("DEVENT"): devents.append((float(ln.split()[1]), int(ln.split()[2]), ln.split()[3]))
+        elif ln.startswith("BRANCHES"): branches = ln.split()[1:]
         elif ln.startswith("NODES"): nodes = ln.split()[1:]
         elif ln.startswith("TOTAL"): total = [float(x) for x in ln.split()[1:]]
         elif ln.startswith(("POLE ", "ZERO ")): pz[ln[:4]].append(complex(*map(float, ln.split()[1:3])))
@@ -168,7 +171,8 @@ def run_engine(args, text, mode, kind, step=0.0, stop=0.0):
         elif ln and (ln[0].isdigit() or ln[0] == "-"):
             try: pts.append([float(x) for x in ln.split()])
             except ValueError: pass
-    return dict(conv=conv, err=err, pts=pts, total=total, branches=branches, nn=len(nodes), pz=pz, sens=sens)
+    return dict(conv=conv, err=err, pts=pts, total=total, branches=branches, nn=len(nodes), pz=pz, sens=sens,
+                nodes=nodes, dnodes=dnodes, devents=devents)
 
 # ---------------------------------------------------------------- ngspice side
 def tran_tmax(text, an):
@@ -188,13 +192,17 @@ def tran_tmax(text, an):
     # ponytail: floor at tstop/1e5 so a ns edge in a ms run stays ~1e5 steps; such a run is checked at that density only.
     return max(min(an[1] / 10, edge), an[2] / 1e5)
 
-def run_ngspice(args, text, an, names, cur=()):
+def run_ngspice(args, text, an, names, cur=(), dn=()):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
     drop = re.compile(r"\.(op|dc|tran|ac|noise|pz|sens|print|plot|four|end|osdi|save|probe|temp|step|meas|measure)\b", re.I)
-    kept, skip = [], False
+    kept, skip, ctrl = [], False, False
     for i, ln in enumerate(text.splitlines()):
+        if re.match(r"\s*\.control\b", ln, re.I): ctrl = True
+        if ctrl:  # the netlist's own .control script is not the circuit
+            ctrl = not re.match(r"\s*\.endc\b", ln, re.I)
+            continue
         if i > 0 and ln.strip()[:1] == "+":
             if not skip: kept.append(ln)
             continue
@@ -204,10 +212,10 @@ def run_ngspice(args, text, an, names, cur=()):
            "tran": "tran {0!r} {1!r} 0 {2!r}{3}".format(an[1], an[2], tran_tmax(text, an), " uic" if an[3] else "") if an[0] == "tran" else "",
            "ac": "ac {1} {2} {3!r} {4!r}".format(*an) if an[0] == "ac" else "", "noise": "", "pz": "", "sens": ""}[an[0]]
     keys = list(names) + [f"i({c})" for c in cur]
-    vecs = " ".join(f"{k[2:-1]}#branch" if k[0] == "i" else f"v({k.lower()})" for k in keys)
+    vecs = " ".join(f"{k[2:-1]}#branch" if k.startswith("i(") else f"v({k.lower()})" for k in keys)
     out = os.path.join(args.tmp, "ng.dat")
     if os.path.exists(out): os.remove(out)
-    ctl = [".control", cmd, f"wrdata {out} {vecs}", "quit", ".endc", ".end"]
+    ctl = [".control", cmd, f"wrdata {out} {vecs}"] + ([f"eprint {' '.join(dn)}"] if dn else []) + ["quit", ".endc", ".end"]
     if an[0] == "sens":  # every element parameter ngspice reports, as "name = value" (ngspice prints the dependence on each)
         ctl = [".control", f"sens {an[1]}", "print all", "quit", ".endc", ".end"]
     if an[0] == "pz":  # ngspice prints "name = re,im" (a lone vector as "all = re,im"): one run per kind, marked
@@ -260,9 +268,24 @@ def run_ngspice(args, text, an, names, cur=()):
     # wrdata layout: (scale, v1, scale, v2, ...); complex (.ac): (scale, re, im) per vector.
     # For .op the "scale" is meaningless.
     xs = [] if an[0] == "op" else [r[0] for r in rows]
+    if dn:  # eprint: "Time or Step", the node names, then rows "<t> <v1> <v2> ..."
+        table = [l.split() for l in p.stdout.splitlines() if re.match(r"^\d\.\d+e[+-]\d+\s", l) and len(l.split()) == len(dn) + 1]
+        dig = {n: transitions((float(t[0]), t[1 + k]) for t in table) for k, n in enumerate(dn)}
+        vals = {n: [r[2 * k + 1] for r in rows] for k, n in enumerate(keys)}
+        vals["__digital__"] = dig
+        return xs, vals
     if an[0] == "ac":
         return xs, {n: [complex(r[3 * k + 1], r[3 * k + 2]) for r in rows] for k, n in enumerate(keys)}
     return xs, {n: [r[2 * k + 1] for r in rows] for k, n in enumerate(keys)}
+
+def transitions(seq):
+    """(t, value) samples -> the changes: the value at the first time, then each new one (the last at a time wins)."""
+    out = []
+    for t, v in seq:
+        if out and out[-1][0] == t: out[-1] = (t, v)
+        else: out.append((t, v))
+        while len(out) > 1 and out[-1][1] == out[-2][1]: out.pop()
+    return out
 
 # ---------------------------------------------------------------- comparison
 def interp(xs, ys, t):
@@ -281,8 +304,9 @@ def unsupported(r):
 def compare(args, text, an, mode, nm, ref):
     """-> (status, worst_abs, worst_rel, note)"""
     xs, vals = ref
+    dig = vals.get("__digital__")  # XSPICE event nodes: {node: [(t, value) changes]}
     # node names, then "i(name)" branch currents; a reference current above 1 kA is a diverged run, not a value
-    names = [n for n in vals if n[0] != "i" or max(abs(v) for v in vals[n]) <= 1e3] if an[0] not in ("noise", "pz", "sens") else []
+    names = [n for n in vals if n != "__digital__" and (not n.startswith("i(") or max(abs(v) for v in vals[n]) <= 1e3)] if an[0] not in ("noise", "pz", "sens") else []
     def ecol(r, n, ac=False):  # engine column of a node or branch current (None: the engine has no such column)
         if n in nm: return 2 * nm[n] - 1 if ac else nm[n]
         b = n[2:-1]
@@ -290,7 +314,7 @@ def compare(args, text, an, mode, nm, ref):
         k = r["branches"].index(b)
         return 1 + 2 * r["nn"] + 2 * k if ac else 1 + r["nn"] + k
     def atol(n, tran=False):
-        return (args.i_tran_atol if tran else args.i_atol) if n[0] == "i" else (args.tran_atol if tran else args.dc_atol)
+        return (args.i_tran_atol if tran else args.i_atol) if n.startswith("i(") else (args.tran_atol if tran else args.dc_atol)
     worst_abs = worst_rel = 0.0
     bad = []
     def judge(label, got, exp, tol, scale=None):
@@ -361,7 +385,7 @@ def compare(args, text, an, mode, nm, ref):
                 e = abs(got - exp)
                 worst_abs = max(worst_abs, e); worst_rel = max(worst_rel, e / max(abs(exp), 1e-3))
                 if not e <= atol(n) + args.dc_rtol * abs(exp):
-                    bad.append(f"f={xs[k]:g} {n if n[0] == 'i' else f'v({n})'}: {got:.6g} vs ngspice {exp:.6g}")
+                    bad.append(f"f={xs[k]:g} {n if n.startswith('i(') else f'v({n})'}: {got:.6g} vs ngspice {exp:.6g}")
     elif an[0] in ("op", "dc"):
         r = run_engine(args, text, mode, "dc")   # .op: one row; .dc: one row per sweep point
         if unsupported(r): return "ENGINE-UNSUPPORTED", 0, 0, r["err"]
@@ -375,7 +399,7 @@ def compare(args, text, an, mode, nm, ref):
             for n in names:
                 c, exp = ecol(r, n), vals[n][k]
                 if c is None: bad.append(f"no engine column for {n}"); continue
-                judge(f"{at}{n if n[0] == 'i' else f'v({n})'}", row[c], exp, atol(n) + args.dc_rtol * abs(exp))
+                judge(f"{at}{n if n.startswith('i(') else f'v({n})'}", row[c], exp, atol(n) + args.dc_rtol * abs(exp))
     else:
         tstep, tstop = an[1], an[2]
         r = run_engine(args, text, mode, "tran", tstep, tstop)
@@ -384,7 +408,9 @@ def compare(args, text, an, mode, nm, ref):
         ts = col(r, 0)
         if ts[-1] < tstop * 0.999: bad.append(f"engine stopped at t={ts[-1]:g} < tstop={tstop:g} ({r['err']})")
         sel = [i for i, t in enumerate(ts) if xs[0] <= t <= xs[-1]]  # reference may start at TSTART
-        dt = tstep / 10  # timing tolerance (see the policy above)
+        # timing tolerance (see the policy above). With XSPICE A devices, tstep: an adc_bridge samples at accepted time
+        # points, so an event it starts (and every analog edge after it) can sit one analog step from ngspice's.
+        dt = tstep if dig is not None else tstep / 10
         def charge(tt, yy):  # cumulative trapezoid integral, as a function of time
             q = [0.0]
             for j in range(1, len(tt)): q.append(q[-1] + 0.5 * (yy[j] + yy[j - 1]) * (tt[j] - tt[j - 1]))
@@ -397,7 +423,7 @@ def compare(args, text, an, mode, nm, ref):
             qe, qr = charge(ts, eng), charge(xs, ref_n)
             swing = max(ref_n) - min(ref_n)
             tol = max(atol(n, True), args.tran_rtol * swing)
-            if n[0] == "i": tol = max(tol, args.i_tran_rtol * swing, 0.02 * max(abs(v) for v in ref_n))
+            if n.startswith("i("): tol = max(tol, args.i_tran_rtol * swing, 0.02 * max(abs(v) for v in ref_n))
             for i in sel:
                 # The reference's range over [t - dt, t + dt]; plus, where it jumps more than tol inside
                 # one cell (a switching edge), that cell's bracket: interpolation would invent a value.
@@ -406,12 +432,31 @@ def compare(args, text, an, mode, nm, ref):
                 k = bisect.bisect_left(xs, ts[i])
                 if 0 < k < len(xs) and abs(ref_n[k] - ref_n[k - 1]) > tol: win += [ref_n[k - 1], ref_n[k]]
                 got = min(max(eng[i], min(win)), max(win))
-                if n[0] == "i" and abs(eng[i] - got) > tol:
+                if n.startswith("i(") and abs(eng[i] - got) > tol:
                     # A switching spike narrower than the reference's steps carries the same charge: forgive the
                     # instant when the mean over its .tran step agrees.
                     a, b = max(ts[i] // tstep * tstep, xs[0]), min((ts[i] // tstep + 1) * tstep, xs[-1])
                     if b - a > 1e-9 * tstep and abs((qe(b) - qe(a)) - (qr(b) - qr(a))) <= tol * (b - a): continue
-                judge(f"t={ts[i]:g} {n if n[0] == 'i' else f'v({n})'}", eng[i], got, tol, max(swing, 1e-3))
+                judge(f"t={ts[i]:g} {n if n.startswith('i(') else f'v({n})'}", eng[i], got, tol, max(swing, 1e-3))
+        if dig is not None:  # the same transitions in the same order, each within dt of ngspice's
+            def settled(seq):
+                # An undetermined state (U, or u strength) held less than dt is a sampling artifact: it appears only
+                # when an analog point lands inside an adc_bridge's threshold band, which each simulator's steps decide.
+                # Within 2 dt of tstop one run's next event may fall after the end: not judged.
+                keep = [e for j, e in enumerate(seq) if e[0] <= tstop - 2 * dt and
+                        not (("U" in e[1] or e[1][1] == "u") and j + 1 < len(seq) and seq[j + 1][0] - e[0] < dt)]
+                return transitions(keep)
+            for k, n in enumerate(r["dnodes"]):
+                got = settled(transitions((t, v) for t, idx, v in r["devents"] if idx == k))
+                exp = dig.get(n)
+                exp = exp and settled(exp)
+                if exp is None: bad.append(f"ngspice has no event node {n}"); continue
+                if [v for _, v in got] != [v for _, v in exp]:
+                    bad.append(f"{n}: {' '.join(f'{v}@{t:.4g}' for t, v in got[:6])} vs ngspice {' '.join(f'{v}@{t:.4g}' for t, v in exp[:6])}")
+                    continue
+                for (te, v), (tr, _) in zip(got, exp):
+                    worst_abs = max(worst_abs, abs(te - tr) / dt * 1e-12)  # (reported in ps-per-step units, not volts)
+                    if abs(te - tr) > dt * (1 + 1e-9): bad.append(f"{n} -> {v} at {te:.6g} vs ngspice {tr:.6g}")
         if not r["conv"] and not bad: bad.append(f"engine reports not converged: {r['err']}")
     return ("FAIL" if bad else "PASS"), worst_abs, worst_rel, "; ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else "")
 
@@ -437,7 +482,7 @@ def main():
     for path in sorted(glob.glob(os.path.join(HERE, "netlists", "*.cir"))):
         name = os.path.basename(path)
         if args.k not in name: continue
-        text = open(path).read()
+        text = re.sub(r"(?ims)^\s*\.control\b.*?^\s*\.endc\b[^\n]*\n?", "", open(path).read())  # a script, not circuit
         an = analysis(text)
         if len(temps(text)) > 1 and an[0] not in ("op", "dc"): an = ("unsupported", ".temp list with a transient/AC/noise run")
         if steps(text) and an[0] not in ("op", "dc"): an = ("unsupported", ".step with a transient/AC/noise run: tests/cli_check.py runs it per step")
@@ -448,7 +493,12 @@ def main():
         if missing:
             print(f"{'SKIPPED':<19} {name} (missing {', '.join(missing)}: datasets/osdi from tests/build_osdi.sh, datasets/pdk see ENGINE_HANDOFF)"); continue
         nm = node_map(text) if an[0] not in ("noise", "pz", "sens") else {}
-        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] not in ("noise", "pz", "sens") else ())
+        dn = ()
+        if re.search(r"^\s*a\S*\s", text, re.M | re.I) and an[0] == "tran":
+            # XSPICE: which A ports are analog depends on the model, so take the engine's own node lists
+            pre = run_engine(args, text, "cpu", "tran", an[1], an[2])
+            nm, dn = {n.lower(): k + 1 for k, n in enumerate(pre["nodes"]) if n != "-"}, tuple(pre["dnodes"])
+        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] not in ("noise", "pz", "sens") else (), dn)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             print(f"{'NGSPICE-ERROR':<19} {name} {e}"); fails += 1; continue
         for mode in args.modes.split(","):

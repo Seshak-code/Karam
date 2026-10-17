@@ -290,6 +290,11 @@ struct SimulationResponseDTO {
     std::vector<std::string> outerNames;  // what WaveformDataPoint::outer holds: outer .dc sources, TEMP
     bool stepped = false;  // the last outerNames are .step values (one plot per step in a raw file)
     std::vector<MeasureResultDTO> measures;
+    // XSPICE event nodes (.tran): their names, and every change of a node's value: time, node index,
+    // ngspice's 12-state text (0s 1r Uz ...). The first entries are the values at t = 0.
+    struct DigitalEvent { double t; int node; std::string value; };
+    std::vector<std::string> digitalNodes;
+    std::vector<DigitalEvent> digitalEvents;
     std::vector<double> timeVector;
     std::unordered_map<int, std::vector<double>> nodeVoltages;
     ExtendedAnalysisResultsDTO extended;

@@ -357,6 +357,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     inSubckt_ = false;
     topInstances_.clear();
     pendingICs_.clear();
+    pendingA_.clear();
     subcktICs_.clear();
     globals_.clear();
     subcktGlobals_.clear();
@@ -375,6 +376,14 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     osdiModels_.clear();
 
     auto lines = preprocessLines(netlistText);
+    // .control ... .endc is ngspice's interactive script, not circuit
+    for (auto it = lines.begin(); it != lines.end();) {
+        const std::string k = toUpper(it->second.substr(0, it->second.find_first_of(" \t")));
+        if (k != ".CONTROL") { ++it; continue; }
+        auto e = it;
+        while (e != lines.end() && toUpper(e->second.substr(0, e->second.find_first_of(" \t"))) != ".ENDC") ++e;
+        it = lines.erase(it, e == lines.end() ? e : std::next(e));
+    }
     if (lines.empty()) {
         result_.success = false;
         result_.errorMessage = "Empty netlist";
@@ -632,6 +641,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 case 'J': parseJFET(tok, blk);        break;
                 case 'S': case 'W': parseSwitch(tok, blk); break;
                 case 'N': parseOsdiDevice(tok, blk);  break;
+                case 'A':
+                    if (inSubckt_) throw std::runtime_error(tok[0] + ": XSPICE A devices inside a .subckt are not supported yet");
+                    parseXspice(line, lineNum);
+                    break;
                 case 'B': parseBehav(line, tok, blk); break;
                 case 'E': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseVCVS(tok, blk); break;
                 case 'G': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseVCCS(tok, blk); break;
@@ -669,6 +682,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         std::cerr << "Warning: .options method=gear (maxord > 1) runs as trapezoidal\n";
     try { resolveControlledSources(result_.netlist.globalBlock); }
     catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
+
+    // XSPICE A devices (their analog ports are top-level nodes, counted below)
+    int aLine = 0;
+    try { resolveXspice(aLine); } catch (const std::exception& e) { return fail(aLine ? aLine : lines.back().first, e.what()); }
 
     // Finalize: compute numGlobalNodes from nodeMap (max index)
     result_.nodeIndex = nodeMap_;
@@ -863,11 +880,24 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         // bsim4va / bsim3_va (OpenVAF, loaded from TREESPICE_OSDI_PATH as bsim4.osdi / bsim3.osdi when needed).
         // Their geometry parameters are model parameters there, so each card plus instance geometry is one
         // OSDI model (shared by equal devices).
-        auto bsimOsdi = [&](const Mosfet& m, const ModelCard& c, bool v3) {
-            const char* module = v3 ? "bsim3_va" : "bsim4va";
+        // family: 3 BSIM3, 4 BSIM4, 10 BSIM-SOI (bsimsoi, B4SOI LEVEL 10/58: terminals d g s e [p [b [t]]])
+        auto bsimOsdi = [&](const Mosfet& m, const ModelCard& c, int family) {
+            const bool v3 = family == 3;
+            const char* module = v3 ? "bsim3_va" : family == 4 ? "bsim4va" : "bsimsoi";
+            const std::string tag = v3 ? "BSIM3" : family == 4 ? "BSIM4" : "BSIM-SOI";
             if (!std::isnan(m.inst.temp) || m.inst.dtemp != 0.0)
-                throw std::runtime_error(m.instanceName + ": TEMP/DTEMP on a BSIM" + (v3 ? "3" : "4") + " device is not supported yet");
-            if (!osdi::findModule(module)) osdi::loadLibrary(v3 ? "bsim3.osdi" : "bsim4.osdi");
+                throw std::runtime_error(m.instanceName + ": TEMP/DTEMP on a " + tag + " device is not supported yet");
+            if (family != 10 && !m.soiNodes.empty())
+                throw std::runtime_error(m.instanceName + ": expected 4 nodes (d g s b) for a " + tag + " model");
+            // ponytail: bsimsoi (4.6) and ngspice's native B4SOI (4.4) agree at DC, but their charges differ: a CS
+            // stage's gate current at 1 MHz is 33 % higher on bsimsoi with the body tied (ngspice loading the same .osdi
+            // agrees with the engine), and a floating body's gain is -1.36 vs -1.11. VERSION and VGSTCVMOD do not
+            // explain it; CAPMOD=3 is suspect. Until it is found, the analyses that see charges refuse. The
+            // netlist's own cards decide, so a request that adds .tran/.ac to a netlist without them is not caught.
+            if (family == 10 && (result_.tranStop > 0.0 || !result_.acSweep.empty() || !result_.noiseSweep.empty() || result_.hasPZ))
+                throw std::runtime_error(m.instanceName + ": BSIM-SOI (LEVEL 10/58) supports .op and .dc only so far (.tran/.ac/.noise/.pz "
+                                         "differ from ngspice's B4SOI charges)");
+            if (!osdi::findModule(module)) osdi::loadLibrary(v3 ? "bsim3.osdi" : family == 4 ? "bsim4.osdi" : "bsimsoi.osdi");
             std::map<std::string, double> p;
             for (const auto& [k, v] : c.params)  // binning bounds select the card; LEVEL names it
                 if (k != "LEVEL" && k != "LMIN" && k != "LMAX" && k != "WMIN" && k != "WMAX" && k != "LINTNOI") p[k] = v;
@@ -892,7 +922,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 }
             }
             std::string key = toUpper(c.name);
-            for (const auto& [k, v] : m.given) {
+            auto given = m.given;  // geometry, then what only the OSDI model knows (BSIM-SOI SOIMOD, RTH0, ...)
+            given.insert(m.osdiParams.begin(), m.osdiParams.end());
+            for (const auto& [k, v] : given) {
                 if (k == "NF" && v == 1.0) continue;
                 p[k] = v;
                 std::ostringstream kv;
@@ -904,7 +936,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             // body draws nothing. An area giving 1e-14 A at this temperature (b4temp TEMPMOD 0) stands in for
             // instances that give AS/PS (AD/PD) as 0, as sky130's subcircuits do, when the gate-sidewall JSWGS is 0.
             // Geometry left to BSIM4's defaults is not covered (its 4.5 and 4.8 defaults differ, BUG_807).
-            if (!v3 && p.count("VERSION") && p["VERSION"] < 4.6 && (!p.count("TEMPMOD") || p["TEMPMOD"] == 0.0)) {
+            if (family == 4 && p.count("VERSION") && p["VERSION"] < 4.6 && (!p.count("TEMPMOD") || p["TEMPMOD"] == 0.0)) {
                 auto get = [&](const char* k, double d) { return p.count(k) ? p[k] : d; };
                 const double Tn = p["TNOM"] + 273.15, T = ambientK_;
                 auto eg = [&](double t) { return get("BG0SUB", 1.16) - get("TBGASUB", 7.02e-4) * t * t / (t + get("TBGBSUB", 1108.0)); };
@@ -931,6 +963,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             o.instanceName = m.instanceName;
             o.modelName = c.name;
             o.nodes = {m.drain, m.gate, m.source, m.body};
+            o.nodes.insert(o.nodes.end(), m.soiNodes.begin(), m.soiNodes.end());
             if (m.extra.mult != 1.0) o.params.push_back({"m", m.extra.mult});
             o.model = model;
             return o;
@@ -1005,11 +1038,16 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         std::vector<Mosfet> level1;
         for (auto& m : blk.mosfets) {
             const ModelCard* c = kind(mosCard(m), m.instanceName, {"NMOS", "PMOS"});
-            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0 || level == 49.0 || level == 8.0) {
-                blk.osdiDevices.push_back(bsimOsdi(m, *c, level == 49.0 || level == 8.0));
+            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0 || level == 49.0 || level == 8.0 ||
+                                                           level == 10.0 || level == 58.0) {
+                blk.osdiDevices.push_back(bsimOsdi(m, *c, level == 49.0 || level == 8.0 ? 3 : level == 10.0 || level == 58.0 ? 10 : 4));
                 continue;
             }
             const int level = (int)c->get("LEVEL", 1.0);
+            if (level >= 55 && level <= 57)
+                throw std::runtime_error("model " + c->name + ": LEVEL " + std::to_string(level) + " (B3SOI) is not supported yet; B4SOI is LEVEL 10/58");
+            if (!m.soiNodes.empty()) throw std::runtime_error(m.instanceName + ": expected 4 nodes (d g s b) for a LEVEL " + std::to_string(level) + " model");
+            if (!m.osdiParams.empty()) throw std::runtime_error(m.instanceName + ": parameter " + m.osdiParams.begin()->first + " is not supported yet");
             const bool hi = level == 2 || level == 3;  // native levels 2 and 3 (mos2*.c, mos3*.c)
             if (level != 1 && !hi) throw std::runtime_error("model " + c->name + ": LEVEL " + std::to_string(level) + " is not supported yet");
             if (m.extra.nf != 1) throw std::runtime_error(m.instanceName + ": NF is not supported yet (level " + std::to_string(level) + ")");
@@ -1554,19 +1592,25 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.gate   = nodeIndex(tok[2]);
     m.source = nodeIndex(tok[3]);
     m.body   = nodeIndex(tok[4]);
-    m.modelName = tok[5];
-    const std::string mu = toUpper(tok[5]);  // a .model card, or a binned family NAME.0, NAME.1, ...
-    const auto bin = modelNames_.lower_bound(mu + ".");
-    if (!modelNames_.count(mu) && (bin == modelNames_.end() || bin->compare(0, mu.size() + 1, mu + ".") != 0))
+    auto isModel = [&](const std::string& t) {  // a .model card, or a binned family NAME.0, NAME.1, ...
+        const std::string mu = toUpper(t);
+        const auto bin = modelNames_.lower_bound(mu + ".");
+        return modelNames_.count(mu) || (bin != modelNames_.end() && bin->compare(0, mu.size() + 1, mu + ".") == 0);
+    };
+    size_t mi = 5;  // the model name: after 4 nodes, or after up to 3 more (BSIM-SOI P, B, T)
+    while (mi < 8 && mi + 1 < tok.size() && !isModel(tok[mi])) ++mi;
+    if (!isModel(tok[mi]))
         throw std::runtime_error(tok[0] + ": expected 4 nodes (d g s b), then a model name; '" + tok[5] +
                                  "' is not a .model card");
+    for (size_t k = 5; k < mi; ++k) m.soiNodes.push_back(nodeIndex(tok[k]));
+    m.modelName = tok[mi];
     m.w = m.l = 100e-6;  // SPICE DEFW / DEFL (not scaled)
 
     // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS act through CJ/CJSW;
     // NRD/NRS only through RSH, which the model check rejects. SA/SB/SD and NF
     // reach BSIM4 (level 54); level 1 rejects NF != 1 when its card is resolved.
     // .option scale multiplies the lengths (areas by scale^2), as in ngspice.
-    for (size_t i = 6; i < tok.size(); ++i) {
+    for (size_t i = mi + 1; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (upper == "OFF") throw std::runtime_error(tok[0] + ": OFF is not supported yet");
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
@@ -1585,7 +1629,7 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
         else if (upper == "NF")  m.extra.nf = (int)std::lround(parseValue(tok[++i]));
         else if (upper == "TEMP" || upper == "DTEMP") { (upper == "TEMP" ? m.inst.temp : m.inst.dtemp) = parseValue(tok[++i]); continue; }
         else if (upper == "M" || upper == "MULT") m.extra.mult = parseValue(tok[++i]);
-        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
+        else { m.osdiParams[upper] = parseValue(tok[++i]); continue; }  // checked where the model is known
         if (upper != "M" && upper != "MULT") {  // as written (scaled): a BSIM4 device gets exactly these
             const std::map<std::string, double> v = {{"W", m.w}, {"L", m.l}, {"AD", m.geo.ad}, {"AS", m.geo.as},
                 {"PD", m.geo.pd}, {"PS", m.geo.ps}, {"NRD", m.geo.nrd}, {"NRS", m.geo.nrs}, {"SA", m.geo.sa},
@@ -1745,7 +1789,8 @@ void SPICEParser::parseModelCard(const std::vector<std::string>& tok) {
     // Parse optional parameters (key=value pairs flattened by tokenizer)
     for (size_t i = 3; i + 1 < tok.size(); i += 2) {
         std::string key = toUpper(tok[i]);
-        double val = parseValue(tok[i + 1]);
+        const std::string word = toUpper(tok[i + 1]);  // XSPICE booleans (inertial_delay=false)
+        double val = word == "TRUE" ? 1.0 : word == "FALSE" ? 0.0 : parseValue(tok[i + 1]);
         card.params[key] = val;
 
         // Extract well-known fields
@@ -1994,3 +2039,156 @@ void SPICEParser::parseParam(const std::vector<std::string>& tok) {
 }
 
 } // namespace acutesim
+
+namespace acutesim {
+
+// A<name> <ports> <model>: a port is a node, NULL, ~node (an inverted digital input), or a [ ... ] vector;
+// %d / %v before a port name its type (the model decides it anyway).
+void SPICEParser::parseXspice(const std::string& line, int lineNum) {
+    std::string spaced;
+    for (char c : line) spaced += c == '[' || c == ']' ? std::string(" ") + c + " " : std::string(1, c);
+    std::istringstream ss(spaced);
+    std::vector<std::string> w;
+    for (std::string t; ss >> t;) w.push_back(t);
+    if (w.size() < 3) throw std::runtime_error(w[0] + ": expected ports, then a model name");
+    PendingA a{w[0], w.back(), {}, lineNum};
+    for (size_t i = 1; i + 1 < w.size(); ++i) {
+        if (w[i][0] == '%') {
+            if (w[i] != "%d" && w[i] != "%v") throw std::runtime_error(a.name + ": port type " + w[i] + " is not supported yet");
+            continue;
+        }
+        if (w[i] == "]") throw std::runtime_error(a.name + ": ']' without '['");
+        if (w[i] != "[") { a.groups.push_back({w[i]}); continue; }
+        std::vector<std::string> g;
+        for (++i; i + 1 < w.size() && w[i] != "]"; ++i)
+            if (w[i][0] != '%') g.push_back(w[i]);
+        if (i + 1 >= w.size()) throw std::runtime_error(a.name + ": '[' without ']'");
+        a.groups.push_back(g);
+    }
+    pendingA_.push_back(a);
+}
+
+// The A devices against their .model cards: ngspice 47's d_buffer ... d_dff, adc_bridge and dac_bridge
+// (parameters and defaults probed; see physics/xspice.h). A dac_bridge output becomes a voltage source.
+void SPICEParser::resolveXspice(int& at) {
+    if (pendingA_.empty()) return;
+    using xspice::Kind;
+    static const std::map<std::string, Kind> kinds = {
+        {"D_BUFFER", Kind::BUF}, {"D_INVERTER", Kind::INV}, {"D_AND", Kind::AND}, {"D_NAND", Kind::NAND},
+        {"D_OR", Kind::OR}, {"D_NOR", Kind::NOR}, {"D_XOR", Kind::XOR}, {"D_XNOR", Kind::XNOR},
+        {"D_TRISTATE", Kind::TRI}, {"D_PULLUP", Kind::PULLUP}, {"D_PULLDOWN", Kind::PULLDOWN}, {"D_DFF", Kind::DFF},
+        {"ADC_BRIDGE", Kind::ADC}, {"DAC_BRIDGE", Kind::DAC}};
+    auto net = std::make_shared<xspice::Net>();
+    std::map<std::string, int> dnode;  // upper-case name -> digital node
+    auto digital = [&](const std::string& n, const std::string& inst, bool nullOk, bool invOk) -> xspice::Port {
+        if (toUpper(n) == "NULL") {
+            if (!nullOk) throw std::runtime_error(inst + ": this port cannot be NULL");
+            return {};
+        }
+        const bool inv = n[0] == '~';
+        if (inv && !invOk) throw std::runtime_error(inst + ": an inverted (~) output is not supported yet");
+        const std::string name = inv ? n.substr(1) : n, key = toUpper(name);
+        if (nodeMap_.count(key)) throw std::runtime_error(inst + ": node " + name + " is analog; a digital port needs an event node");
+        auto [it, fresh] = dnode.emplace(key, (int)net->nodes.size());
+        if (fresh) {
+            std::string low = name;
+            for (auto& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            net->nodes.push_back(low);
+        }
+        return {it->second, inv};
+    };
+    for (const auto& a : pendingA_) {
+        at = a.line;
+        const auto mc = modelCards_.find(toUpper(a.model));
+        if (mc == modelCards_.end()) throw std::runtime_error(a.name + ": no .model card " + a.model);
+        const ModelCard* c = &mc->second;
+        const auto k = kinds.find(c->type);
+        if (k == kinds.end()) throw std::runtime_error(a.name + ": XSPICE model type " + c->type + " is not supported yet");
+        xspice::Inst x;
+        x.name = a.name;
+        x.kind = k->second;
+        auto single = [&](size_t g) {
+            if (g >= a.groups.size() || a.groups[g].size() != 1) throw std::runtime_error(a.name + ": expected a single port at position " + std::to_string(g + 1));
+            return a.groups[g][0];
+        };
+        auto need = [&](size_t n) {
+            if (a.groups.size() != n) throw std::runtime_error(a.name + ": " + c->type + " takes " + std::to_string(n) + " ports, got " + std::to_string(a.groups.size()));
+        };
+        std::set<std::string> allowed;
+        switch (x.kind) {
+        case Kind::BUF: case Kind::INV:
+            need(2);
+            x.in = {digital(single(0), a.name, false, true)};
+            x.out = {digital(single(1), a.name, false, false)};
+            allowed = {"RISE_DELAY", "FALL_DELAY", "INPUT_LOAD", "INERTIAL_DELAY"};
+            break;
+        case Kind::AND: case Kind::NAND: case Kind::OR: case Kind::NOR: case Kind::XOR: case Kind::XNOR:
+            need(2);
+            for (const auto& n : a.groups[0]) x.in.push_back(digital(n, a.name, false, true));
+            if (x.in.empty()) throw std::runtime_error(a.name + ": no inputs");
+            x.out = {digital(single(1), a.name, false, false)};
+            allowed = {"RISE_DELAY", "FALL_DELAY", "INPUT_LOAD", "INERTIAL_DELAY"};
+            break;
+        case Kind::TRI:
+            need(3);
+            x.in = {digital(single(0), a.name, false, true), digital(single(1), a.name, false, true)};
+            x.out = {digital(single(2), a.name, false, false)};
+            allowed = {"DELAY", "INPUT_LOAD", "ENABLE_LOAD"};
+            break;
+        case Kind::PULLUP: case Kind::PULLDOWN:
+            need(1);
+            x.out = {digital(single(0), a.name, false, false)};
+            allowed = {"LOAD"};
+            break;
+        case Kind::DFF:
+            need(6);
+            x.in = {digital(single(0), a.name, false, true), digital(single(1), a.name, false, true),
+                    digital(single(2), a.name, true, true), digital(single(3), a.name, true, true)};
+            x.out = {digital(single(4), a.name, true, false), digital(single(5), a.name, true, false)};
+            allowed = {"CLK_DELAY", "SET_DELAY", "RESET_DELAY", "IC", "RISE_DELAY", "FALL_DELAY", "DATA_LOAD", "CLK_LOAD", "SET_LOAD", "RESET_LOAD"};
+            break;
+        case Kind::ADC: case Kind::DAC: {
+            need(2);
+            const bool adc = x.kind == Kind::ADC;
+            const auto& an = a.groups[adc ? 0 : 1];
+            const auto& dn = a.groups[adc ? 1 : 0];
+            if (an.size() != dn.size() || an.empty()) throw std::runtime_error(a.name + ": the analog and digital port vectors differ in size");
+            for (size_t i = 0; i < an.size(); ++i) {
+                if (dnode.count(toUpper(an[i]))) throw std::runtime_error(a.name + ": node " + an[i] + " is digital; this port is analog");
+                x.analog.push_back(nodeIndex(an[i]));
+                (adc ? x.out : x.in).push_back(digital(dn[i], a.name, false, !adc));
+                if (!adc) {  // the output: an ideal source to ground, ramped by the simulation (ngspice: a#branch)
+                    VoltageSource v{};
+                    v.name = toUpper(a.name) + "#" + std::to_string(i);
+                    v.nodePositive = x.analog.back();
+                    v.nodeNegative = 0;
+                    x.vsrc.push_back((int)result_.netlist.globalBlock.voltageSources.size());
+                    result_.netlist.globalBlock.voltageSources.push_back(v);
+                }
+            }
+            allowed = adc ? std::set<std::string>{"IN_LOW", "IN_HIGH", "RISE_DELAY", "FALL_DELAY", "IN_LOAD", "FAMILY"}
+                          : std::set<std::string>{"OUT_LOW", "OUT_HIGH", "OUT_UNDEF", "T_RISE", "T_FALL", "INPUT_LOAD", "FAMILY"};
+            break;
+        }
+        }
+        for (const auto& [key, v] : c->params)
+            if (!allowed.count(key)) throw std::runtime_error("model " + c->name + ": parameter " + key + " is not a " + c->type + " parameter");
+        if (c->get("INERTIAL_DELAY", 0.0) != 0.0) throw std::runtime_error("model " + c->name + ": inertial_delay is not supported yet");
+        const double d = c->get("DELAY", 1e-9);  // d_tristate
+        x.rise = x.kind == Kind::TRI ? d : c->get("RISE_DELAY", 1e-9);
+        x.fall = x.kind == Kind::TRI ? d : c->get("FALL_DELAY", 1e-9);
+        x.clk = c->get("CLK_DELAY", 1e-9); x.set = c->get("SET_DELAY", 1e-9); x.reset = c->get("RESET_DELAY", 1e-9);
+        const double ic = c->get("IC", 0.0);
+        x.ic = ic == 1.0 ? xspice::L1 : ic == 0.0 ? xspice::L0 : xspice::LU;
+        x.lo = c->get("IN_LOW", 0.1); x.hi = c->get("IN_HIGH", 0.9);
+        x.vlo = c->get("OUT_LOW", 0.0); x.vhi = c->get("OUT_HIGH", 1.0); x.vun = c->get("OUT_UNDEF", 0.5);
+        x.trise = c->get("T_RISE", 1e-9); x.tfall = c->get("T_FALL", 1e-9);
+        if (!(x.hi > x.lo)) throw std::runtime_error("model " + c->name + ": in_high must be > in_low");
+        if (x.kind == Kind::DAC && !(x.trise > 0.0 && x.tfall > 0.0 && x.vhi != x.vlo))
+            throw std::runtime_error("model " + c->name + ": needs t_rise, t_fall > 0 and out_high != out_low");
+        net->insts.push_back(std::move(x));
+    }
+    result_.netlist.digital = net;
+}
+
+}  // namespace acutesim

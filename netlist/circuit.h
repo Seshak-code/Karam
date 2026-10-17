@@ -9,6 +9,7 @@
 #include <set>
 #include <cassert>
 #include <iostream>
+#include "../physics/xspice.h"
 #include "../physics/physics_constants.h"
 #include "graph_canonical.h"
 #include "numparam.h"
@@ -604,7 +605,9 @@ struct Mosfet {
     int drain;                        // D terminal
     int gate;                         // G terminal
     int source;                       // S terminal
-    int body;                         // B (Bulk/Substrate) terminal
+    int body;                         // B (Bulk/Substrate) terminal; E (substrate) of a BSIM-SOI device
+    std::vector<int> soiNodes;        // BSIM-SOI P, B, T after E (M d g s e [p [b [t]]]), LEVEL 10/58 only
+    std::map<std::string, double> osdiParams;  // instance parameters only an OSDI model takes (BSIM-SOI SOIMOD, RTH0, ...)
     
     // Standard SPICE / PDK Parameters
     std::string modelName;                // .model reference (e.g., "nfet_01v8")
@@ -1220,6 +1223,7 @@ class TensorNetlist {
 public:
     std::map<std::string, TensorBlock> blockDefinitions; // Library of blocks
     TensorBlock globalBlock;                             // Top-level components
+    std::shared_ptr<const xspice::Net> digital;          // XSPICE A devices and their event nodes (top level), or null
     
     // State Storage (Per-instance)
     BlockState globalState;

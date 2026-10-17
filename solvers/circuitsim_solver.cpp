@@ -727,6 +727,18 @@ void CircuitSim::tranCorners(const TensorNetlist &netlist) {
   };
   addLines(netlist.globalState);
   for (const auto &st : netlist.instanceStates) addLines(st);
+  if (xsim_) corners.push_back([this](double x) { return xsim_->next(x); });  // digital events
+}
+
+bool CircuitSim::settleDigital(TensorNetlist &netlist, const std::vector<double> &x) {
+  auto v = [&](int n) { return n > 0 && n <= (int)x.size() ? x[n - 1] : 0.0; };
+  const bool changed = xsim_->adcChanged(v) || xsim_->log().empty();
+  for (const auto &[vs, val] : xsim_->settle(v)) {
+    auto &src = netlist.globalBlock.voltageSources[vs];
+    src.type.clear();
+    src.voltage_V = val;
+  }
+  return changed;
 }
 
 std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool uic, double stop) {
@@ -736,11 +748,18 @@ std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool
   applyOptions(netlist.environment);
   setIntegrationMethod(tranMethod_);
   forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev = w.s->init; });
+  xsim_.reset();
+  adcPrev_.clear();
+  if (netlist.digital) {
+    xsim_ = std::make_unique<xspice::Sim>(netlist.digital);
+    lteController_.setTRTOL(std::min(netlist.environment.trtol, 1.0));  // ngspice: "Reducing trtol to 1 for xspice 'A' devices"
+  }
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
   if (uic) {
     for (const auto &[n, v] : netlist.nodeICs)
       if (n > 0 && n <= netlist.numGlobalNodes) x0[n - 1] = v;
+    if (xsim_) settleDigital(netlist, x0);
   } else {
     // DC bias. SPICE3 forces .ic nodes during it through 1e10 S to the value
     // (Norton: 1e-10 ohm to ground plus v*1e10 A in). UIC skips it, which an
@@ -753,11 +772,20 @@ std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool
         forced.addCurrentSource(0, n, v * 1e10);
       }
     }
-    SolverStep dc = solveDC(netlist.nodeICs.empty() ? netlist : forced);
-    if (!dc.stats.converged)
-      return "DC bias failed." + (dc.stats.error_detail.empty() ? "" : " " + dc.stats.error_detail);
-    x0 = lastSolution_;
-    x0.resize(nTot, 0.0);
+    // With A devices the operating point alternates digital settles and analog solves until the
+    // adc_bridges agree (ngspice: "operating point analog/event alternations")
+    for (int pass = 0;; ++pass) {
+      SolverStep dc = solveDC(netlist.nodeICs.empty() ? netlist : forced);
+      if (!dc.stats.converged)
+        return "DC bias failed." + (dc.stats.error_detail.empty() ? "" : " " + dc.stats.error_detail);
+      x0 = lastSolution_;
+      x0.resize(nTot, 0.0);
+      if (!xsim_ || !settleDigital(netlist, x0)) break;
+      if (!netlist.nodeICs.empty())
+        for (size_t i = 0; i < netlist.globalBlock.voltageSources.size(); ++i)
+          forced.globalBlock.voltageSources[i].voltage_V = netlist.globalBlock.voltageSources[i].voltage_V;
+      if (pass == 20) return "DC bias failed: the digital and analog parts do not agree after 20 alternations.";
+    }
   }
   arbiterInitialized = false;  // this run's cold start (the DC bias may itself have run a transient OP)
   lteHold_ = 0;
@@ -795,6 +823,25 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
     const bool endClip = stop - t < h;
     double hTry = std::min(h, stop - t);
     const double intended = hTry;  // before clipping to a corner (ngspice's CKTsaveDelta)
+    std::vector<double> vAtT;  // the solution at t, before this step replaces it
+    if (xsim_) vAtT.assign(lastSolution_.begin(), lastSolution_.begin() + std::min<size_t>(lastSolution_.size(), netlist.numGlobalNodes));
+    if (xsim_ && !adcPrev_.empty() && t > adcPrevT_) {
+      // An adc_bridge reads its input at accepted points: aim the step just past a threshold its input is heading
+      // for (linear extrapolation, 5 % over so curvature cannot stall it short of the crossing). Without this a
+      // 0.1 ns step crossed a 20 mV band late and a ring oscillator's loop added the lateness up.
+      for (const auto &x : xsim_->net().insts) {
+        if (x.kind != xspice::Kind::ADC) continue;
+        for (int n : x.analog) {
+          if (n <= 0 || n > (int)lastSolution_.size() || n > (int)adcPrev_.size()) continue;
+          const double v = lastSolution_[n - 1], slope = (v - adcPrev_[n - 1]) / (t - adcPrevT_);
+          for (double thr : {x.lo, x.hi})
+            if ((thr - v) * slope > 0.0) {
+              const double dtc = (thr - v) / slope * 1.05;
+              if (dtc < hTry && dtc > step * 1e-6) hTry = dtc;
+            }
+        }
+      }
+    }
     bool toCorner = false;
     for (const auto &next : corners)
       if (next(t + endTol) - t <= hTry) { hTry = next(t + endTol) - t; toCorner = true; }
@@ -834,6 +881,7 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
       return msg.str();
     }
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
+    if (xsim_) { adcPrev_ = std::move(vAtT); adcPrevT_ = t; }
     t = s.time;
     ++accepted;
     if (onPoint && !onPoint(s)) return "Cancelled.";
@@ -846,6 +894,22 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
     // the exact response. The clipped step itself can be femtoseconds, and 0.1 of it made
     // Newton fail on roundoff (an inverter's PWL input, Xyce tranInverterBinning).
     if (lteHold_ > 0) --lteHold_;
+    if (xsim_) {  // the digital events up to t, the adc_bridges at t; a dac_bridge ramp starts at its event
+      auto v = [&](int n) { return n > 0 && n <= (int)s.nodeVoltages.size() ? s.nodeVoltages[n - 1] : 0.0; };
+      const auto ramps = xsim_->advance(t, endTol, v);
+      for (const auto &r : ramps) {
+        auto &src = netlist.globalBlock.voltageSources[r.vsrc];
+        const double now = waveformValue(src, src.voltage_V, r.t);
+        if (now == r.target) continue;
+        const double dur = std::abs(r.target - now) / (r.target > now ? r.riseSlope : r.fallSlope);
+        src.type = "PWL";
+        src.pwl_t = {r.t, r.t + dur};
+        src.pwl_v = {now, r.target};
+        src.pwl_td = 0.0;
+        src.pwl_r = -1.0;
+      }
+      if (!ramps.empty()) tranCorners(netlist);
+    }
     if (landedOnCorner) {
       lteHold_ = 3;
       double gap = std::numeric_limits<double>::infinity();

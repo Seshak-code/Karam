@@ -73,6 +73,12 @@ int main(int argc, char** argv) {
     std::printf("\nBRANCHES");
     for (const auto& n : r.branchNames) std::printf(" %s", n.c_str());
     std::printf("\n");
+    if (!r.digitalNodes.empty()) {  // XSPICE event nodes: "DNODES n1 n2 ...", then "DEVENT <t> <node index> <value>"
+        std::printf("DNODES");
+        for (const auto& n : r.digitalNodes) std::printf(" %s", n.c_str());
+        std::printf("\n");
+        for (const auto& e : r.digitalEvents) std::printf("DEVENT %.12g %d %s\n", e.t, e.node, e.value.c_str());
+    }
     const std::vector<double>* shown = nullptr;
     for (const auto& p : r.waveformPoints) {
         if (!p.outer.empty() && (!shown || *shown != p.outer)) {

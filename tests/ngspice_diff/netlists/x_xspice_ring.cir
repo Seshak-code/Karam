@@ -1,0 +1,27 @@
+* XSPICE Reference 3: Mixed-Signal Closed-Loop Ring Oscillator
+* Run for one full cycle: an adc_bridge samples at accepted time points, so each crossing differs slightly
+* from ngspice's and the loop adds the differences up (ngspice's own phase depends on its steps the same way)
+* Digital inverter
+a_inv d_in d_out inv_mod
+.model inv_mod d_inverter(rise_delay=1n fall_delay=1n)
+
+* DAC bridge driving analog RC filter
+a_dac [d_out] [v_dac] dac_mod
+.model dac_mod dac_bridge(out_low=0 out_high=3.3 t_rise=0.5n t_fall=0.5n)
+
+* Analog RC filter
+R1 v_dac v_mid 1k
+C1 v_mid 0 10p
+
+* ADC bridge sensing v_mid with tight threshold
+a_adc [v_mid] [d_in] adc_mod
+.model adc_mod adc_bridge(in_low=1.64 in_high=1.66 rise_delay=0.1n fall_delay=0.1n)
+
+.ic v(v_mid)=0
+.tran 0.1n 12n uic
+.control
+run
+print v(v_dac) v(v_mid)
+eprint d_in d_out
+.endc
+.end

@@ -135,7 +135,7 @@ static std::string parseRequest(const SimulationRequestDTO& req, double tempC, S
 // every temperature-dependent value is resolved by the parser. A .temp list is for .op/.dc (listOk) only,
 // a .step list for the analyses that run it (stepOk).
 static bool deserialiseRequest(const SimulationRequestDTO& req, SPICEParseResult& out,
-                               SimulationResponseDTO& failure, bool listOk = false, bool stepOk = false) {
+                               SimulationResponseDTO& failure, bool listOk = false, bool stepOk = false, bool digitalOk = false) {
     // ponytail: 27 is the DTO's default, so a corner asking for 27 C cannot override a netlist .temp
     if (const std::string e = parseRequest(req, req.corner.temperature != 27.0 ? req.corner.temperature : NAN, out); !e.empty()) {
         failure.errorDetail = e;
@@ -147,6 +147,10 @@ static bool deserialiseRequest(const SimulationRequestDTO& req, SPICEParseResult
     }
     if (!stepOk && !out.steps.empty() && req.stepValues.empty()) {
         failure.errorDetail = ".step is not supported with this analysis yet";
+        return false;
+    }
+    if (!digitalOk && out.netlist.digital) {
+        failure.errorDetail = "XSPICE A devices are supported in .tran only so far";
         return false;
     }
     return true;
@@ -502,7 +506,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
                                                             ResultChunkCallback streamCb) {
     SPICEParseResult parsed;
     SimulationResponseDTO failure;
-    if (!deserialiseRequest(req, parsed, failure, false, true)) return failure;
+    if (!deserialiseRequest(req, parsed, failure, false, true, true)) return failure;
     if (!parsed.steps.empty() && req.stepValues.empty())
         return runSteps(req, parsed.steps, [&](const SimulationRequestDTO& q) { return dispatch_tran_internal(q, cb, streamCb); });
     TensorNetlist& netlist = parsed.netlist;
@@ -536,6 +540,10 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     result.scaleName = "time";
     nameColumns(result, parsed, sim);
     result.backend = backendOf(sim, precision_);
+    if (const auto* d = sim.digital()) {
+        result.digitalNodes = d->net().nodes;
+        for (const auto& c : d->log()) result.digitalEvents.push_back({c.t, c.node, xspice::text(c.v)});
+    }
     return result;
 }
 
@@ -547,7 +555,7 @@ class TransientImpl final : public TransientHandle {
 public:
     TransientImpl(const SimulationRequestDTO& req, PrecisionMode prec) {
         SimulationResponseDTO failure;
-        if (!deserialiseRequest(req, parsed_, failure)) { err_ = failure.errorDetail; return; }
+        if (!deserialiseRequest(req, parsed_, failure, false, false, true)) { err_ = failure.errorDetail; return; }
         sim_.execMode = selectExecMode(prec);
         const double step = req.transient.stepSizeS > 0 ? req.transient.stepSizeS : parsed_.tranStep;
         err_ = sim_.beginTransient(parsed_.netlist, step, parsed_.tranUIC || req.transient.uic);

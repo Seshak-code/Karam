@@ -1,0 +1,25 @@
+* XSPICE logic: unequal rise/fall delays through U, NAND/NOR/XNOR, tristate strengths onto a pulldown,
+* d_dff set/reset/clock delays plus its rise/fall delays and ic=1. Inputs: fast PWL edges through adc_bridges.
+va a_a 0 pwl(0 0 1n 0 1.01n 3 2n 3 2.01n 1.5 3n 1.5 3.01n 0 4n 0 4.01n 1.5 5n 1.5 5.01n 3 5.1n 3 5.11n 0 6n 0 6.01n 3)
+vb b_a 0 pwl(0 0 2n 0 2.01n 3 4n 3 4.01n 1.5 5n 1.5 5.01n 0 5.1n 0 5.11n 3 7n 3 7.01n 0)
+vc c_a 0 pwl(0 3 3n 3 3.01n 1.5 4n 1.5 4.01n 0 5n 0 5.01n 3 6n 3 6.01n 0 7n 0 7.01n 3)
+vs s_a 0 pwl(0 0 8n 0 8.01n 3 9n 3 9.01n 0)
+vr r_a 0 pwl(0 0 8.5n 0 8.51n 3 9.5n 3 9.51n 0)
+a_adc [a_a b_a c_a s_a r_a] [a b c s r] adc
+.model adc adc_bridge(in_low=1 in_high=2 rise_delay=1p fall_delay=1p)
+a_inv a yinv inv
+.model inv d_inverter(rise_delay=0.2n fall_delay=0.3n)
+a_nand [a b] ynand nand2
+.model nand2 d_nand(rise_delay=0.2n fall_delay=0.3n)
+a_nor [a b] ynor nor2
+.model nor2 d_nor(rise_delay=0.25n fall_delay=0.15n)
+a_xnor [a b c] yxnor xnor3
+.model xnor3 d_xnor(rise_delay=0.2n fall_delay=0.3n)
+a_tri a c bus tri
+.model tri d_tristate(delay=0.5n)
+a_pd bus pd
+.model pd d_pulldown
+a_dff a b s r q qb dff
+.model dff d_dff(clk_delay=0.2n rise_delay=0.1n fall_delay=0.4n set_delay=0.5n reset_delay=0.7n ic=1)
+.tran 0.05n 11n
+.end
