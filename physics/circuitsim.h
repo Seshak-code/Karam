@@ -470,6 +470,7 @@ public:
     gshunt_ = e.rshunt > 0.0 ? 1.0 / e.rshunt : 0.0;
     itl1_ = e.itl1; itl2_ = e.itl2; itl4_ = e.itl4;
     lteController_.setTRTOL(e.trtol);
+    lteController_.setChargeTol(e.reltol, e.abstol, e.chgtol);
     lteTolerance_ = 1e-4 * e.reltol / 1e-3;  // the engine's LTE bound scales with RELTOL (default unchanged)
     lteController_.setTolerance(lteTolerance_);
     // ngspice: order 1 is backward Euler for either method; trapezoidal is order 2 at most
@@ -614,6 +615,8 @@ public:
           if (next) {  // shift the voltage history (next may alias st)
               std::copy(st->v[1], st->v[1] + 5, next->v[2]);
               std::copy(st->v[0], st->v[0] + 5, next->v[1]);
+              std::copy(st->qh[0], st->qh[0] + 5, next->qh[1]);
+              std::copy(st->q, st->q + 5, next->qh[0]);
           }
       const bool trap = integrator->getType() == IntegrationType::TRAPEZOIDAL;
       for (int k = 0; k < 5; ++k) {
@@ -1027,6 +1030,8 @@ public:
       if (next) {  // shift the voltage history (next may alias st)
         std::copy(st->v[1], st->v[1] + 5, next->v[2]);
         std::copy(st->v[0], st->v[0] + 5, next->v[1]);
+        std::copy(st->qh[0], st->qh[0] + 5, next->qh[1]);
+        std::copy(st->q, st->q + 5, next->qh[0]);
       }
     const bool trap = integrator->getType() == IntegrationType::TRAPEZOIDAL;
     for (int k = 0; k < K; ++k) {

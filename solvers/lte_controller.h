@@ -44,7 +44,7 @@ struct LTEResult {
     int worstElementIndex;       // index of element with largest LTE
     bool worstIsCapacitor;       // true = capacitor, false = inductor
     bool requiresRejection;      // true if LTE > tolerance (timestep too large)
-    bool deviceRejects;          // ... by a diode / BJT branch, which the post-corner hold does not cover
+    bool chargeRejects;          // ... by a charge branch (ngspice's criterion), which a source kink does not fake
     double safetyFactor;         // actual ratio tol/maxLTE (< 1 means reject)
 };
 
@@ -73,10 +73,11 @@ public:
         const std::vector<double>& v_curr,
         double dt,
         IntegrationType method,
-        // Extra charge branches the netlist scan cannot see (diode/BJT charges on
-        // internal nodes): extra(visit) calls visit(v_now, {v[t-1], v[t-2], v[t-3]}, C) with the
-        // branch's capacitance (< 0: unknown, the voltage error counts in full).
-        const std::function<void(const std::function<void(double, const std::array<double, 3>&, double)>&)>& extra = nullptr) const
+        // Extra branches the netlist scan cannot see: extra(voltage, charge) calls voltage(v_now, {v[t-1..t-3]})
+        // for a branch judged on voltage (OSDI local nodes) and charge(q_now, {q[t-1..t-3]}, i[t-1]) for a
+        // device charge branch (diode / BJT / MOS1), judged as ngspice's CKTterr does.
+        const std::function<void(const std::function<void(double, const std::array<double, 3>&)>&,
+                                 const std::function<void(double, const std::array<double, 3>&, double)>&)>& extra = nullptr) const
     {
         LTEResult result{};
         result.maxLTE = 0.0;
@@ -84,7 +85,7 @@ public:
         result.worstElementIndex = -1;
         result.worstIsCapacitor = true;
         result.requiresRejection = false;
-        result.deviceRejects = false;
+        result.chargeRejects = false;
         result.safetyFactor = 1.0;
 
         if (dt <= 0.0) return result;
@@ -104,8 +105,9 @@ public:
         const double t2 = t1 - stepHistory_[0];
         const double t3 = (stepHistory_.size() > 1) ? t2 - stepHistory_[1] : t2;
 
-        // y0 = value now, h[0..2] = previous accepted values (most recent first)
-        auto lteOf = [&](double y0, const auto& h) -> double {
+        // dt^order * |divided difference of order+1| of y0 and the previous accepted values h[0..2]
+        // (most recent first): the truncation error before its method constant.
+        auto diffTerm = [&](double y0, const auto& h) -> double {
             if (std::size(h) < needSteps + 1) return 0.0;
             double d01 = (y0 - h[0]) / (t0 - t1);
             double d12 = (h[0] - h[1]) / (t1 - t2);
@@ -114,8 +116,24 @@ public:
             double d23 = (h[1] - h[2]) / (t2 - t3);
             double d123 = (d12 - d23) / (t1 - t3);
             double d0123 = (d012 - d123) / (t0 - t3);
-            double coeff = (method == IntegrationType::GEAR_2) ? (4.0 / 3.0) : 0.5;
-            return coeff * dt * dt * dt * std::abs(d0123);
+            return dt * dt * dt * std::abs(d0123);
+        };
+        auto lteOf = [&](double y0, const auto& h) -> double {
+            return diffTerm(y0, h) * (firstOrder ? 1.0 : method == IntegrationType::GEAR_2 ? 4.0 / 3.0 : 0.5);
+        };
+        const double effective_tol = trtol_ * tolerance_;
+        auto flagCharge = [&](double lte_v) { result.chargeRejects |= lte_v > effective_tol; return lte_v; };
+        // ngspice CKTterr on a charge branch: the error of q against tol = max(volttol, chargetol), both
+        // currents; its constants (0.5 for order 1, 1/12 trapezoidal, 2/9 Gear 2) are ngspice's.
+        // Scaled to the voltage bound's units so one threshold (effective_tol) judges both.
+        auto chargeLTE = [&](double q0, const std::array<double, 3>& qh, double iPrev) -> double {
+            const double iNow = firstOrder ? (q0 - qh[0]) / dt : 2.0 * (q0 - qh[0]) / dt - iPrev;
+            const double tol = std::max(abstol_ + reltol_ * std::max(std::abs(iNow), std::abs(iPrev)),
+                                        reltol_ * std::max(std::max(std::abs(q0), std::abs(qh[0])), chgtol_) / dt);
+            const double factor = firstOrder ? 0.5 : method == IntegrationType::GEAR_2 ? 0.2222222222 : 1.0 / 12.0;
+            const double order = firstOrder ? 1.0 : 2.0;
+            const double err = std::max(abstol_, factor * diffTerm(q0, qh) / std::pow(dt, order + 1.0)) * std::pow(dt, order);
+            return flagCharge(err / (trtol_ * tol) * effective_tol);
         };
 
         auto getV = [&](int nodeIdx) -> double {
@@ -130,8 +148,11 @@ public:
         auto scan = [&](const TensorBlock& blk, const BlockState& st, auto mapNode) {
             for (size_t i = 0; i < blk.capacitors.size() && i < st.capacitorState.size(); ++i) {
                 const auto& cap = blk.capacitors[i];
-                double lte_v = lteOf(getV(mapNode(cap.nodePlate1)) - getV(mapNode(cap.nodePlate2)),
-                                     st.capacitorState[i].v);
+                const auto& hv = st.capacitorState[i].v;
+                if (hv.size() < 3 || st.capacitorState[i].i.empty()) continue;
+                const double C = cap.capacitance_farads;
+                const double lte_v = chargeLTE(C * (getV(mapNode(cap.nodePlate1)) - getV(mapNode(cap.nodePlate2))),
+                                               {C * hv[0], C * hv[1], C * hv[2]}, st.capacitorState[i].i[0]);
                 if (lte_v > result.maxLTE) {
                     result.maxLTE = lte_v;
                     result.worstElementIndex = static_cast<int>(i);
@@ -148,23 +169,6 @@ public:
                     result.worstIsCapacitor = false;
                 }
             }
-            for (size_t i = 0; i < blk.mosfets.size() && i < st.mosfetState.size(); ++i) {
-                const auto& m = blk.mosfets[i];
-                const auto p = mos1Params(m);
-                if (!p.caps) continue;  // no charge, no history
-                const auto& vh = st.mosfetState[i].v;
-                const auto br = mos1_branches(getV(mapNode(m.drain)), getV(mapNode(m.gate)),
-                                              getV(mapNode(m.source)), getV(mapNode(m.body)), p.polarity);
-                for (int k = 0; k < 5; ++k) {
-                    const double hist[3] = {vh[0][k], vh[1][k], vh[2][k]};
-                    const double lte_v = lteOf(br[k], hist);
-                    if (lte_v > result.maxLTE) {
-                        result.maxLTE = lte_v;
-                        result.worstElementIndex = static_cast<int>(i);
-                        result.worstIsCapacitor = true;
-                    }
-                }
-            }
         };
         scan(netlist.globalBlock, netlist.globalState, [](int n) { return n; });
         for (size_t k = 0; k < netlist.instances.size() && k < netlist.instanceStates.size(); ++k) {
@@ -175,21 +179,18 @@ public:
                 return (n <= 0 || n > (int)inst.nodeMapping.size()) ? 0 : inst.nodeMapping[n - 1];
             });
         }
-        if (extra)
-            extra([&](double y0, const std::array<double, 3>& hist, double cap) {
-                // ngspice truncates on charge with a floor (CHGTOL): a branch whose charge error at the
-                // voltage tolerance stays under it cannot limit the step. A comparator's fF junction
-                // capacitances, switching volts in a step, otherwise rejected it down to femtoseconds.
-                const double lte_v = lteOf(y0, hist) * (cap >= 0.0 ? std::min(1.0, cap * trtol_ * tolerance_ / CHGTOL) : 1.0);
-                result.deviceRejects |= cap >= 0.0 && lte_v > trtol_ * tolerance_;
+        if (extra) {
+            auto note = [&](double lte_v) {
                 if (lte_v > result.maxLTE) {
                     result.maxLTE = lte_v;
                     result.worstElementIndex = -1;
                     result.worstIsCapacitor = true;
                 }
-            });
+            };
+            extra([&](double y0, const std::array<double, 3>& hist) { note(lteOf(y0, hist)); },
+                  [&](double q0, const std::array<double, 3>& qh, double iPrev) { note(chargeLTE(q0, qh, iPrev)); });
+        }
         // Compute safety factor and timestep suggestion
-        double effective_tol = trtol_ * tolerance_;
         if (result.maxLTE > 0.0) {
             result.safetyFactor = effective_tol / result.maxLTE;
             result.requiresRejection = (result.safetyFactor < 1.0);
@@ -246,10 +247,11 @@ public:
     // Configuration
     void setTolerance(double tol) { tolerance_ = tol; }
     void setTRTOL(double trtol) { trtol_ = trtol; }
+    void setChargeTol(double reltol, double abstol, double chgtol) { reltol_ = reltol; abstol_ = abstol; chgtol_ = chgtol; }
     double getTolerance() const { return tolerance_; }
 
 private:
-    static constexpr double CHGTOL = 1e-14;  // C
+    double reltol_ = 1e-3, abstol_ = 1e-12, chgtol_ = 1e-14;  // .options reltol / abstol / chgtol (charge LTE)
     double tolerance_;     // absolute LTE tolerance (default 1e-4)
     double trtol_;         // SPICE TRTOL multiplier (default 7.0)
 

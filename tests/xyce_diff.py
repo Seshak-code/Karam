@@ -63,11 +63,18 @@ DIALECT = {
     "ABM_LOG/log.cir": "Xyce log() is log10 (gold V(3) = 2 for 100); ngspice and the engine: natural log",
     "Certification_Tests/BUG_254/atanh_tanh.cir": "atanh(tanh(100)) = atanh(1): Xyce clamps, ngspice prints -inf (so does the engine's Newton fail)",
     "Certification_Tests/BUG_133/": "gold is Xyce's sparse output times; ngspice and the engine agree (v(3) = 1, 2, 3 at 0.500035, .075, .125 ms)",
+    "SANDLER25/": "LM111 window detector: v(10) edges match ngspice to 26 ns (8.0022700 vs 8.0022919 ms, 8.2508518 vs "
+                  "8.2508262 ms); the gold's 8.251 ms sample sits on the 10 V -> 0 fall (engine 0.12 V, ngspice 0.07 V, Xyce 0.34 V)",
     "SANDLER21/sandler21.cir": "555 timer: output edges match ngspice to 0.1 us (1.0817 ms, 2.0816 ms, ...); a pointwise "
                                "compare at its near-vertical switching edges measures that offset, not the model",
 }
 
 # Cases the engine cannot do yet (a missing feature or a convergence limit), not a dialect: ngspice solves them.
+# Cases Xyce itself leaves out of normal testing
+EXCLUDED = {
+    "RLC_LADDER/rc_simple_xyce.cir": "performance test (its README: excluded from normal testing): 3000-stage RC, .tran 0.1u 1 = 1e7 steps",
+}
+
 OPEN = {
     "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card: ngspice runs its BSIM4v5, the engine "
                   "BSIM4 4.8 (OSDI); v(1) 0.737 V vs ngspice 0.556 V, and ngspice with version=4.8 gives 0.739 V",
@@ -104,6 +111,7 @@ def case(path, opts):
         if rel.startswith(key): return rel, "XYCE-DIALECT", why
     for key, why in OPEN.items():
         if rel.startswith(key): return rel, "ENGINE-LIMIT", why
+    if rel in EXCLUDED: return rel, "SKIPPED", EXCLUDED[rel]
     text = open(path, errors="ignore").read()
     full = expand(text, os.path.dirname(path))
     g = os.path.join(XYCE, "OutputData", rel + ".prn")

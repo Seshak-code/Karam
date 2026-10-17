@@ -666,6 +666,7 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     *s = {};
     for (auto &vh : s->v) std::copy(c.v, c.v + 5, vh);
     std::copy(c.q, c.q + 5, s->q);
+    for (auto &qh : s->qh) std::copy(c.q, c.q + 5, qh);
     std::copy(c.half, c.half + 3, s->half);
   });
   // Diode / BJT charges at x, zero current
@@ -678,6 +679,7 @@ void CircuitSim::seedReactiveHistory(TensorNetlist &netlist, const std::vector<d
     *j.st = {};
     for (auto &vh : j.st->v) std::copy(v, v + K, vh);
     std::copy(q, q + K, j.st->q);
+    for (auto &qh : j.st->qh) std::copy(q, q + K, qh);
   });
   // OSDI charges at x, zero current
   forEachOsdi(netlist, [&](const OsdiRef &r) {
@@ -1430,28 +1432,31 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       // If LTE exceeds tolerance, reject the step and retry with smaller dt.
       auto lteResult = lteController_.estimateLTE(
           netlist, nrEstimate, actualTimeStep, integrator->getType(),
-          [&](const std::function<void(double, const std::array<double, 3> &, double)> &visit) {
-            // diode / BJT charge branches, internal nodes included (as the MOS branches)
+          [&](const auto &voltage, const auto &charge) {
             auto getV = [&](int n) { return n > 0 && n <= (int)nrEstimate.size() ? nrEstimate[n - 1] : 0.0; };
+            // diode / BJT charges, internal nodes included
             forEachJunction(netlist, [&](const Junction &j) {
               if (!j.st || !junctionHasCharge(j)) return;
               std::array<double, 7> x{};
               for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
               double v[5], q[5];
               const int K = junctionCharges(j, x, v, q);
-              for (int k = 0; k < K; ++k) {
-                const double dv = std::abs(v[k] - j.st->v[0][k]);
-                visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]}, dv > 1e-9 ? std::abs(q[k] - j.st->q[k]) / dv : 0.0);
-              }
+              for (int k = 0; k < K; ++k) charge(q[k], {j.st->q[k], j.st->qh[0][k], j.st->qh[1][k]}, j.st->i[k]);
+            });
+            forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n, const BlockState::DeviceCharge *st) {
+              const auto p = mos1Params(m, gmin_);
+              if (!st || !p.caps) return;
+              const auto c = mos1_charges(getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3]), p, st->v[0], st->q, st->half);
+              for (int k = 0; k < 5; ++k) charge(c.q[k], {st->q[k], st->qh[0][k], st->qh[1][k]}, st->i[k]);
             });
             // OSDI devices: their local node voltages
             forEachOsdi(netlist, [&](const OsdiRef &r) {
               const auto &h = r.in->vHist;
-              for (size_t k = 0; k < r.n.size(); ++k) visit(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]}, -1.0);
+              for (size_t k = 0; k < r.n.size(); ++k) voltage(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]});
             });
           });
 
-      if (lteResult.requiresRejection && (lteHold_ == 0 || lteResult.deviceRejects)) {
+      if (lteResult.requiresRejection && (lteHold_ == 0 || lteResult.chargeRejects)) {
         // LTE too large — timestep was too aggressive
         actualTimeStep = lteResult.suggestedDt;
         attempt++;

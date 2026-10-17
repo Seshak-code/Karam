@@ -412,6 +412,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                         else if (k == "ABSTOL") env.abstol = positive(k, v);
                         else if (k == "VNTOL") env.vntol = positive(k, v);
                         else if (k == "TRTOL") env.trtol = positive(k, v);
+                        else if (k == "CHGTOL") env.chgtol = positive(k, v);
                         else if (k == "GMIN") { if (v < 0.0) throw std::runtime_error(".options gmin must be >= 0"); env.gmin = v; }
                         else if (k == "RSHUNT") env.rshunt = positive(k, v);
                         else if (k == "ITL1") env.itl1 = (int)positive(k, v);
@@ -420,7 +421,6 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                         else if (k == "MAXORD") env.maxord = (int)positive(k, v);
                         else if (k != "SCALE") std::cerr << "Warning: .options " << k << " is ignored\n";
                     }
-                    // ponytail: chgtol has no counterpart in the engine's LTE (an absolute bound scaled by RELTOL and TRTOL): warned, ignored
                 }
                 else if (keyword == ".TEMP") {  // a list repeats .op/.dc per temperature (ngspice takes one)
                     if (tok.size() < 2) throw std::runtime_error(".temp needs a temperature");

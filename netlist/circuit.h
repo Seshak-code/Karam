@@ -555,7 +555,7 @@ struct SimulationEnvironment {
     bool gmin_stepping = true;         // .options gminsteps=0 (ngspice): DC goes straight to source stepping
 
     // .options the solver honours (ngspice names and defaults). itl4 0: the engine's own transient limit (50).
-    double reltol = 1e-3, abstol = 1e-12, vntol = 1e-6, trtol = 7.0, gmin = 1e-12, rshunt = 0.0;
+    double reltol = 1e-3, abstol = 1e-12, vntol = 1e-6, trtol = 7.0, chgtol = 1e-14, gmin = 1e-12, rshunt = 0.0;
     int itl1 = 100, itl2 = 50, itl4 = 0, maxord = 2;
     bool gear = false;                 // .options method=gear
     
@@ -1296,6 +1296,7 @@ struct BlockState {
     struct DeviceCharge {
         double v[3][5] = {};  // branch voltages, last three accepted steps (v[0] latest; LTE)
         double q[5] = {}, i[5] = {};
+        double qh[2][5] = {};  // charges of the two steps before q (LTE: ngspice CKTterr differences the charge)
         double half[3] = {};  // MOSFET Meyer half-capacitances gs, gd, gb (ngspice averages two)
         // Diode / BJT junction limiting (ngspice state0): the limited junction
         // voltages of the last Newton iteration (diode vd; BJT vbe, vbc).
