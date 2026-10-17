@@ -60,6 +60,13 @@ struct SPICEParseResult {
     std::string   noiseSweep;
     int           noiseOut = 0, noiseRef = 0, noisePoints = 0;
     double        noiseStart = 0.0, noiseStop = 0.0;
+    // .pz in+ in- out+ out- cur|vol pol|zer|pz
+    bool          hasPZ = false, pzVolt = false, pzPoles = false, pzZeros = false;
+    int           pzNode[4] = {0, 0, 0, 0};
+    // .sens v(out[,ref]) | i(vsrc): DC sensitivity of one output
+    bool          hasSens = false;
+    std::string   sensSource;        // i(vsrc): the source name, else empty
+    int           sensOut = 0, sensRef = 0;
     std::string   acSweep;           // .ac dec|oct|lin n fstart fstop
     int           acPoints = 0;
     double        acStart = 0.0, acStop = 0.0;
@@ -152,6 +159,8 @@ private:
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
     struct PendingIC { std::string node; double value; int line; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
+    std::string pzNames_[4];                       // .pz node names, resolved likewise
+    std::string sensOut_, sensRef_;                // .sens v() node names, resolved likewise
     std::string noiseOut_, noiseRef_;              // .noise node names, resolved likewise
     std::set<std::string> globals_;                // .global node names
     std::map<std::string, std::map<int, std::string>> subcktGlobals_;  // subckt -> local index -> name

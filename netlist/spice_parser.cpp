@@ -283,6 +283,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     pendingICs_.clear();
     globals_.clear();
     subcktGlobals_.clear();
+    for (auto& n : pzNames_) n.clear();
+    sensOut_.clear();
+    sensRef_.clear();
     noiseOut_.clear();
     noiseRef_.clear();
     subcktChildren_.clear();
@@ -423,6 +426,28 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                     result_.noiseStart  = parseValue(tok[sw + 2]);
                     result_.noiseStop   = parseValue(tok[sw + 3]);
                 }
+                else if (keyword == ".SENS") {
+                    // .sens v(out[,ref]) | i(vsrc)   (AC sensitivity, .sens ... ac dec n f1 f2, is not supported yet)
+                    const std::string kind = tok.size() > 2 ? toUpper(tok[1]) : "";
+                    const size_t want = kind == "V" && tok.size() > 3 && toUpper(tok[3]) != "V" && toUpper(tok[3]) != "I" && toUpper(tok[3]) != "AC" ? 4 : 3;
+                    if (kind != "V" && kind != "I") throw std::runtime_error(".sens expects v(out[,ref]) or i(vsrc)");
+                    if (tok.size() > want && toUpper(tok[want]) == "AC") throw std::runtime_error(".sens ... ac (AC sensitivity) is not supported yet");
+                    if (tok.size() != want) throw std::runtime_error(".sens supports a single v(out[,ref]) or i(vsrc) output");
+                    result_.hasSens = true;
+                    if (kind == "I") result_.sensSource = toUpper(tok[2]);
+                    else { sensOut_ = toUpper(tok[2]); sensRef_ = want == 4 ? toUpper(tok[3]) : "0"; }
+                }
+                else if (keyword == ".PZ") {
+                    // .pz in+ in- out+ out- cur|vol pol|zer|pz
+                    const std::string io = tok.size() == 7 ? toUpper(tok[5]) : "", what = tok.size() == 7 ? toUpper(tok[6]) : "";
+                    if ((io != "CUR" && io != "VOL") || (what != "POL" && what != "ZER" && what != "PZ"))
+                        throw std::runtime_error(".pz expects in+ in- out+ out- cur|vol pol|zer|pz");
+                    for (int k = 0; k < 4; ++k) pzNames_[k] = toUpper(tok[k + 1]);
+                    result_.hasPZ = true;
+                    result_.pzVolt = io == "VOL";
+                    result_.pzPoles = what != "ZER";
+                    result_.pzZeros = what != "POL";
+                }
                 else if (keyword == ".AC") {
                     // .ac dec|oct|lin n fstart fstop
                     const std::string sw = tok.size() == 5 ? toUpper(tok[1]) : "";
@@ -547,6 +572,25 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         if (result_.noiseOut <= 0 || result_.noiseRef < 0)
             return fail(lines.back().first, ".noise names an unknown output node");
     }
+
+    if (!sensOut_.empty()) {
+        auto node = [&](const std::string& nm) {
+            if (nm == "0" || nm == "GND") return 0;
+            auto it = nodeMap_.find(nm);
+            return it == nodeMap_.end() ? -1 : it->second;
+        };
+        result_.sensOut = node(sensOut_);
+        result_.sensRef = node(sensRef_);
+        if (result_.sensOut < 0 || result_.sensRef < 0) return fail(lines.back().first, ".sens names an unknown output node");
+    }
+    if (result_.hasPZ)
+        for (int k = 0; k < 4; ++k) {
+            const std::string& nm = pzNames_[k];
+            auto it = nodeMap_.find(nm);
+            if (nm == "0" || nm == "GND") result_.pzNode[k] = 0;
+            else if (it == nodeMap_.end()) return fail(lines.back().first, ".pz names an unknown node '" + nm + "'");
+            else result_.pzNode[k] = it->second;
+        }
 
     // .ic may name a node defined later in the file
     for (const auto& ic : pendingICs_) {

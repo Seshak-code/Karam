@@ -565,6 +565,66 @@ SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
     return r;
 }
 
+// ── Poles and zeros ───────────────────────────────────────────────────────
+SimulationResponseDTO SessionImpl::runPoleZero(const SimulationRequestDTO& req,
+                                                const EngineCallbacks& /*cb*/) {
+    status_.store(JobStatus::Running);
+    SimulationResponseDTO r;
+    r.jobId        = jobId_;
+    r.analysisType = AnalysisTypeDTO::POLE_ZERO;
+    SPICEParseResult parsed;
+    if (deserialiseRequest(req, parsed, r)) {
+        CircuitSim sim;
+        sim.execMode = selectExecMode(precision_);
+        if (!parsed.hasPZ)
+            r.errorDetail = "Pole-zero needs .pz in+ in- out+ out- cur|vol pol|zer|pz.";
+        else if (SolverStep dc = sim.solveDC(parsed.netlist); !dc.stats.converged)
+            r.errorDetail = "DC operating point failed before pole-zero analysis: " + dc.stats.error_detail;
+        else {
+            const int* n = parsed.pzNode;
+            auto pz = sim.solvePoleZero(parsed.netlist, n[0], n[1], n[2], n[3], parsed.pzVolt, parsed.pzPoles, parsed.pzZeros);
+            r.errorDetail = pz.error;
+            r.converged   = pz.error.empty();
+            r.extended.hasPZ = r.converged;
+            for (auto p : pz.poles) { r.extended.pz.poleRe.push_back(p.real()); r.extended.pz.poleIm.push_back(p.imag()); }
+            for (auto z : pz.zeros) { r.extended.pz.zeroRe.push_back(z.real()); r.extended.pz.zeroIm.push_back(z.imag()); }
+        }
+        r.backend = backendOf(sim, precision_);
+    }
+    r.success = r.converged;
+    status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);
+    return r;
+}
+
+// ── DC sensitivity ────────────────────────────────────────────────────────
+SimulationResponseDTO SessionImpl::runSens(const SimulationRequestDTO& req,
+                                            const EngineCallbacks& /*cb*/) {
+    status_.store(JobStatus::Running);
+    SimulationResponseDTO r;
+    r.jobId        = jobId_;
+    r.analysisType = AnalysisTypeDTO::SENSITIVITY;
+    SPICEParseResult parsed;
+    if (deserialiseRequest(req, parsed, r)) {
+        CircuitSim sim;
+        sim.execMode = selectExecMode(precision_);
+        if (!parsed.hasSens)
+            r.errorDetail = "Sensitivity needs .sens v(out[,ref]) or .sens i(vsrc).";
+        else if (SolverStep dc = sim.solveDC(parsed.netlist); !dc.stats.converged)
+            r.errorDetail = "DC operating point failed before sensitivity analysis: " + dc.stats.error_detail;
+        else {
+            auto sn = sim.solveSens(parsed.netlist, parsed.sensOut, parsed.sensRef, parsed.sensSource);
+            r.errorDetail = sn.error;
+            r.converged   = sn.error.empty();
+            r.extended.hasSens = r.converged;
+            r.extended.sens = {std::move(sn.names), std::move(sn.values), std::move(sn.unsupported)};
+        }
+        r.backend = backendOf(sim, precision_);
+    }
+    r.success = r.converged;
+    status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);
+    return r;
+}
+
 // ============================================================================
 // EngineImpl
 // ============================================================================

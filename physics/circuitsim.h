@@ -1176,6 +1176,25 @@ public:
   NoiseResult solveNoise(TensorNetlist &netlist, const std::vector<double> &freqs,
                          int outNode, int refNode, const std::string &inputSource);
 
+  // Poles and zeros of the transfer function from (inP, inN) to v(outP) - v(outN) at the last solveDC()
+  // operating point (ngspice .pz): poles are the roots of det(G + sC) with the input open (`volt` false) or
+  // the input nodes shorted by an ideal voltage source (`volt`); zeros those of the system matrix bordered by
+  // the input column and the output row. Nodes are global (0 = ground). `error` is set on failure.
+  struct PoleZeroResult { std::vector<std::complex<double>> poles, zeros; std::string error; };
+  PoleZeroResult solvePoleZero(TensorNetlist &netlist, int inP, int inN, int outP, int outN, bool volt,
+                               bool wantPoles, bool wantZeros);
+
+  // DC sensitivity of v(outNode) - v(refNode), or of i(outSource) when outSource is set, to every element value
+  // at the last solveDC() operating point (ngspice .sens), by the adjoint method on the final Jacobian: one
+  // solve J^T l = d(out)/dx, then dOut/dp = l . (-dF/dp) per parameter. Names are ngspice's vectors: r1 (d/dR),
+  // r1_m and r1_scale, v1, i1 (d/dI), i1_m. Parameters of other devices are listed in `unsupported`, never as 0.
+  struct SensResult {
+    std::vector<std::string> names, unsupported;
+    std::vector<double> values;
+    std::string error;
+  };
+  SensResult solveSens(TensorNetlist &netlist, int outNode, int refNode, const std::string &outSource);
+
   // .ac frequencies as ngspice steps them: dec/oct multiply by 10^(1/n) / 2^(1/n)
   // up to fstop (+1e-3 of a step, ngspice's reltol slack); lin gives n points;
   // log (the GUI's sweep) gives n log-spaced points from f1 to f2.
@@ -2090,44 +2109,29 @@ public:
   }
 
   // Phase 2.5: Differentiable Physics
-  enum class ComponentType { RESISTOR, CAPACITOR, INDUCTOR, DIODE, MOSFET, BJT, JFET };
+  enum class ComponentType { RESISTOR, CAPACITOR, INDUCTOR, DIODE, MOSFET, BJT, JFET, VSOURCE, ISOURCE };
 
-  /**
-   * calculateSensitivity
-   * Computes the gradient of node voltages with respect to a specific component parameter (dV/dp).
-   * Solves: J * (dV/dp) = - (dF/dp)
-   */
-  std::vector<double> calculateSensitivity(TensorNetlist &netlist, 
-                                           ComponentType type, 
-                                           int index, 
-                                           const std::string& paramName, 
-                                           const std::vector<double>& v_converged) {
-      if (v_converged.empty()) return {};
-
-      // 1. Re-build Jacobian (J) at convergence point
-      // We assume standard stamping (double params) gives us the correct J = dF/dV
-      scheduler.schedule(netlist);
-      matrixBuilder.clear();
-      const int nTot = systemSize(netlist);  // nodes + branch currents
-      matrixBuilder.setDimensions(nTot, nTot);
-      rhsVector.assign(nTot, 0.0);
-      std::vector<double> x_converged = v_converged;
-      if ((int)lastSolution_.size() == nTot) x_converged = lastSolution_;  // with branch currents
-      x_converged.resize(nTot, 0.0);
-      limitJunctions_ = false;  // linearise at the converged point itself
-      stampAllElements(netlist, 0.0, x_converged, 0.0); // h=0, time=0 for DC sensitivity
-      limitJunctions_ = true;
-      // (no node gmin: the Jacobian of the converged OP has only junction GMIN)
-      Csr_matrix J = matrixBuilder.createCsr(); /* Explicitly J */
-      
-      // 2. Build RHS vector b = - dF/dp
-      // This vector is zero everywhere except at the nodes of the target component
+  // b = -dF/dp (size nTot) of one instance parameter at the converged point, F the DC residual (node KCL
+  // "current leaving", then the branch equations). Empty if the parameter is not implemented.
+  std::vector<double> sensRhs(TensorNetlist &netlist, ComponentType type, int index, const std::string& paramName,
+                              const std::vector<double>& v_converged, int nTot) {
       std::vector<double> b_sens(nTot, 0.0);
       
       auto getV = [&](int n) { return (n>0 && n<=(int)v_converged.size()) ? v_converged[n-1] : 0.0; };
 
       try {
-          if (type == ComponentType::RESISTOR) {
+          if (type == ComponentType::VSOURCE) {  // F_branch = v+ - v- - V
+              if (index < 0 || index >= (int)netlist.globalBlock.voltageSources.size()) return {};
+              int total = 0;
+              b_sens[branchSlots(netlist, total)[0].vs + index] = 1.0;
+          }
+          else if (type == ComponentType::ISOURCE) {  // the source current leaves n+ and enters n-
+              if (index < 0 || index >= (int)netlist.globalBlock.currentSources.size()) return {};
+              const auto& i = netlist.globalBlock.currentSources[index];
+              if (i.nodePositive > 0) b_sens[i.nodePositive - 1] -= 1.0;
+              if (i.nodeNegative > 0) b_sens[i.nodeNegative - 1] += 1.0;
+          }
+          else if (type == ComponentType::RESISTOR) {
               if (index < 0 || index >= (int)netlist.globalBlock.resistors.size()) return {};
               const auto& r = netlist.globalBlock.resistors[index];
               
@@ -2208,6 +2212,40 @@ public:
       } catch(...) {
           return {};
       }
+      return b_sens;
+  }
+
+  /**
+   * calculateSensitivity
+   * Computes the gradient of node voltages with respect to a specific component parameter (dV/dp).
+   * Solves: J * (dV/dp) = - (dF/dp)
+   */
+  std::vector<double> calculateSensitivity(TensorNetlist &netlist, 
+                                           ComponentType type, 
+                                           int index, 
+                                           const std::string& paramName, 
+                                           const std::vector<double>& v_converged) {
+      if (v_converged.empty()) return {};
+
+      // 1. Re-build Jacobian (J) at convergence point
+      // We assume standard stamping (double params) gives us the correct J = dF/dV
+      scheduler.schedule(netlist);
+      matrixBuilder.clear();
+      const int nTot = systemSize(netlist);  // nodes + branch currents
+      matrixBuilder.setDimensions(nTot, nTot);
+      rhsVector.assign(nTot, 0.0);
+      std::vector<double> x_converged = v_converged;
+      if ((int)lastSolution_.size() == nTot) x_converged = lastSolution_;  // with branch currents
+      x_converged.resize(nTot, 0.0);
+      limitJunctions_ = false;  // linearise at the converged point itself
+      stampAllElements(netlist, 0.0, x_converged, 0.0); // h=0, time=0 for DC sensitivity
+      limitJunctions_ = true;
+      // (no node gmin: the Jacobian of the converged OP has only junction GMIN)
+      Csr_matrix J = matrixBuilder.createCsr(); /* Explicitly J */
+      
+      // 2. RHS vector b = - dF/dp
+      std::vector<double> b_sens = sensRhs(netlist, type, index, paramName, v_converged, nTot);
+      if (b_sens.empty()) return {};
 
       // 3. Solve J * x = b
       // J is nonsymmetric (PCG assumed symmetry); solve exactly, return node rows
