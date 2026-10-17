@@ -430,12 +430,31 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                     result_.dcStop   = parseValue(tok[3]);
                     result_.dcStep   = parseValue(tok[4]);
                 }
+                else if (keyword == ".PRINT" || keyword == ".SAVE" || keyword == ".PROBE") {
+                    OutputRequest out{keyword == ".PRINT" ? 'p' : 's', "", {}};
+                    int depth = 0;  // split at top-level blanks: v(a, b)*2 is one expression
+                    std::string cur;
+                    for (size_t i = keyword.size(); i <= line.size(); ++i) {
+                        const char c = i < line.size() ? line[i] : ' ';
+                        depth += (c == '(') - (c == ')');
+                        if (std::isspace(static_cast<unsigned char>(c)) && depth <= 0) {
+                            if (!cur.empty()) out.specs.push_back(cur);
+                            cur.clear();
+                        } else cur += c;
+                    }
+                    if (!out.specs.empty() && std::set<std::string>{"TRAN", "AC", "DC", "OP"}.count(toUpper(out.specs[0]))) {
+                        out.analysis = out.specs[0];
+                        for (auto& c : out.analysis) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        out.specs.erase(out.specs.begin());
+                    }
+                    if (out.specs.empty()) throw std::runtime_error(tok[0] + " needs at least one output");
+                    if (!inSubckt_) result_.outputs.push_back(std::move(out));
+                }
                 else if (keyword == ".END") break;
                 // Output-only (.four only prints a Fourier table) and first-pass cards; anything else changes the
                 // circuit or analysis (.step, .temp, .nodeset, ...) and used to be
                 // ignored silently.
-                else if (keyword != ".GLOBAL" && keyword != ".PRINT" && keyword != ".PLOT" &&
-                         keyword != ".SAVE" && keyword != ".PROBE" && keyword != ".MEAS" &&
+                else if (keyword != ".GLOBAL" && keyword != ".PLOT" && keyword != ".MEAS" &&
                          keyword != ".MEASURE" &&
                          keyword != ".WIDTH" && keyword != ".TITLE" && keyword != ".FOUR")
                     throw std::runtime_error(tok[0] + " is not supported yet");

@@ -26,6 +26,10 @@
 
 namespace acutesim {
 
+// .print / .save / .probe: kind 'p' (print) or 's' (save, probe); analysis "" (any), tran, ac, dc or op;
+// specs are the output expressions as written ("v(a,b)*2", "vdb(out)", "i(v1)"), "all" included.
+struct OutputRequest { char kind; std::string analysis; std::vector<std::string> specs; };
+
 // Diagnostics from a parse run.
 struct SPICEParseResult {
     TensorNetlist netlist;
@@ -33,6 +37,7 @@ struct SPICEParseResult {
     bool          success = true;
     std::string   errorMessage;
     int           errorLine = -1;
+    std::vector<OutputRequest> outputs;
 
     // Informational
     int           linesProcessed = 0;

@@ -74,6 +74,7 @@ static void nameColumns(SimulationResponseDTO& r, const SPICEParseResult& parsed
             for (auto& c : r.nodeNames[idx - 1]) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
     r.branchNames = sim.branchNames(parsed.netlist);
+    for (const auto& o : parsed.outputs) r.outputRequests.push_back({o.kind, o.analysis, o.specs});
 }
 
 // ── Helper: select CircuitSim ExecutionMode ────────────────────────────────
@@ -161,6 +162,7 @@ static SimulationResponseDTO dcSweep(CircuitSim& sim, TensorNetlist& netlist, co
     r.analysisType = AnalysisTypeDTO::DC;
     std::string name = sw.sweepVariable;
     for (auto& ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    r.scaleName = name[0] == 'I' ? "i-sweep" : "v-sweep";
     double* value = nullptr;
     for (auto& v : netlist.globalBlock.voltageSources)
         if (v.name == name) { value = &v.voltage_V; v.type.clear(); }  // DC value only
@@ -260,6 +262,7 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
     const auto X = sim.solveAC(netlist, freqs);
     r.converged    = X.size() == freqs.size();
     r.analysisType = AnalysisTypeDTO::AC;
+    r.scaleName    = "frequency";
     for (size_t k = 0; k < X.size(); ++k) {
         WaveformDataPoint pt{freqs[k], {}, {}, {}};
         for (int i = 0; i < netlist.numGlobalNodes; ++i) {
@@ -298,8 +301,8 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     if (!deserialiseRequest(req, parsed, failure)) return failure;
     TensorNetlist& netlist = parsed.netlist;
     const bool uic = parsed.tranUIC || req.transient.uic;
-    const double  stopTime = req.transient.stopTimeS;
-    const double  dt       = req.transient.stepSizeS;
+    const double  stopTime = req.transient.stopTimeS > 0 ? req.transient.stopTimeS : parsed.tranStop;  // else the netlist's .tran
+    const double  dt       = req.transient.stepSizeS > 0 ? req.transient.stepSizeS : parsed.tranStep;
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
@@ -324,6 +327,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
 
     result.iterations = static_cast<int>(stepIdx);
     result.analysisType = AnalysisTypeDTO::TRANSIENT;
+    result.scaleName = "time";
     nameColumns(result, parsed, sim);
     return result;
 }

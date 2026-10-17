@@ -126,6 +126,7 @@ target_sources(acutesim_engine_objects PRIVATE
     # === Infrastructure ===
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/output.cpp
 
     # === Math ===
     ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp

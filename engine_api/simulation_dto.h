@@ -102,7 +102,7 @@ struct SimulationSourceDTO {
 };
 
 struct TransientConfigDTO {
-    double stopTimeS = 1e-6;
+    double stopTimeS = 1e-6;   // 0 (either): the netlist's .tran
     double stepSizeS = 1e-9;
     double maxStepS  = 1e-8;
     bool   uic       = false;   // start from .ic / IC= values, skip the DC bias
@@ -220,6 +220,13 @@ struct ConvergenceTelemetryDTO {
     bool converged = false;
 };
 
+// A netlist .print (kind 'p') or .save/.probe (kind 's') card; analysis "" applies to every analysis.
+struct OutputRequestDTO {
+    char kind = 'p';
+    std::string analysis;
+    std::vector<std::string> specs;  // as written: "v(a,b)*2", "vdb(out)", "i(v1)", "all"
+};
+
 struct SimulationResponseDTO {
     JobID       jobId;
     int32_t     runIndex = -1;  
@@ -240,6 +247,8 @@ struct SimulationResponseDTO {
     // Column names, lower case as ngspice prints them: nodeNames[i] is nodeVoltages[i] ("" if unnamed);
     // branchNames[i] is branchCurrents[i] (the current into the + terminal of v1, l1, e1, h1, b1).
     std::vector<std::string> nodeNames, branchNames;
+    std::string scaleName;  // what WaveformDataPoint::timeS is: "time", "frequency", "v-sweep", "i-sweep", "" (.op)
+    std::vector<OutputRequestDTO> outputRequests;
     std::vector<double> timeVector;
     std::unordered_map<int, std::vector<double>> nodeVoltages;
     ExtendedAnalysisResultsDTO extended;
