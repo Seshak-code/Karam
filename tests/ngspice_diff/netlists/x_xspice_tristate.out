@@ -1,0 +1,88 @@
+
+Note: No compatibility mode selected!
+
+
+Circuit: * xspice reference 4: tristate bus with pullup and driver contention
+
+Reducing trtol to 1 for xspice 'A' devices
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using SPARSE 1.3 as Direct Linear Solver
+
+Initial Transient Solution
+--------------------------
+
+Node                                   Voltage
+----                                   -------
+in_a_src                                     0
+en_a_src                                     3
+in_b_src                                     3
+en_b_src                                     0
+ven_b#branch                                 0
+vin_b#branch                                 0
+ven_a#branch                                 0
+vin_a#branch                                 0
+
+
+No. of Data Rows : 174
+
+**** Results Data ****
+
+Time or Step
+in_a
+en_a
+in_b
+en_b
+bus
+
+
+0.000000000e+00    0s    1s    1s    0s    0s
+1.064000000e-09    Us    1s    Us    0s    0s
+1.100000000e-09    1s    1s    0s    0s    0s
+1.564000000e-09    1s    1s    0s    0s    Us
+1.600000000e-09    1s    1s    0s    0s    1s
+3.065000000e-09    1s    Us    0s    0s    1s
+3.100000000e-09    1s    0s    0s    0s    1s
+3.565000000e-09    1s    0s    0s    0s    Uu
+3.600000000e-09    1s    0s    0s    0s    1r
+5.165000000e-09    Us    0s    Us    0s    1r
+5.200000000e-09    0s    0s    1s    0s    1r
+5.665000000e-09    0s    0s    1s    0s    1r
+5.700000000e-09    0s    0s    1s    0s    1r
+6.065000000e-09    0s    0s    1s    Us    1r
+6.100000000e-09    0s    0s    1s    1s    1r
+6.565000000e-09    0s    0s    1s    1s    1u
+6.600000000e-09    0s    0s    1s    1s    1s
+7.165000000e-09    0s    Us    1s    1s    1s
+7.200000000e-09    0s    1s    1s    1s    1s
+7.665000000e-09    0s    1s    1s    1s    Us
+7.700000000e-09    0s    1s    1s    1s    Us
+9.065000000e-09    Us    1s    Us    1s    Us
+9.100000000e-09    1s    1s    0s    1s    Us
+9.565000000e-09    1s    1s    0s    1s    Us
+9.600000000e-09    1s    1s    0s    1s    Us
+1.016500000e-08    1s    1s    0s    Us    Us
+1.020000000e-08    1s    1s    0s    0s    Us
+1.066500000e-08    1s    1s    0s    0s    Us
+1.070000000e-08    1s    1s    0s    0s    1s
+1.106500000e-08    1s    Us    0s    0s    1s
+1.110000000e-08    1s    0s    0s    0s    1s
+1.156500000e-08    1s    0s    0s    0s    Uu
+1.160000000e-08    1s    0s    0s    0s    1r
+
+
+
+**** Messages ****
+
+
+**** Statistics ****
+
+Operating point analog/event alternations:  2
+Operating point load calls:                 17
+Operating point event passes:               4
+Transient analysis load calls:              736
+Transient analysis timestep backups:        0
+
+
+Note: Simulation executed from .control section 
+

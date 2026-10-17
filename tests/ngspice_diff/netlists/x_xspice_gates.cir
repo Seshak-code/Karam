@@ -1,0 +1,34 @@
+* XSPICE Reference 1: Gate Chain (Inverter -> NAND -> NOR -> XOR -> Buffer)
+vin in_a 0 pulse(0 3 0 0.1n 0.1n 2n 4n)
+
+a_adc [in_a] [d_in] adc_mod
+.model adc_mod adc_bridge(in_low=1.0 in_high=2.0)
+
+a_inv d_in d_1 d_inv_mod
+.model d_inv_mod d_inverter(rise_delay=0.2n fall_delay=0.2n)
+
+a_pu d_hi d_pullup_mod
+.model d_pullup_mod d_pullup
+
+a_nand [d_1 d_hi] d_2 d_nand_mod
+.model d_nand_mod d_nand(rise_delay=0.3n fall_delay=0.3n)
+
+a_nor [d_2 d_in] d_3 d_nor_mod
+.model d_nor_mod d_nor(rise_delay=0.2n fall_delay=0.2n)
+
+a_xor [d_3 d_hi] d_4 d_xor_mod
+.model d_xor_mod d_xor(rise_delay=0.2n fall_delay=0.2n)
+
+a_buf d_4 d_out d_buf_mod
+.model d_buf_mod d_buffer(rise_delay=0.1n fall_delay=0.1n)
+
+a_dac [d_out] [out_a] dac_mod
+.model dac_mod dac_bridge(out_low=0 out_high=3.3 t_rise=0.2n t_fall=0.2n)
+
+.tran 0.05n 8n
+.control
+run
+print v(in_a) v(out_a)
+eprint d_in d_1 d_2 d_3 d_4 d_out
+.endc
+.end
