@@ -27,3 +27,23 @@ perl -0pe 's/(if \(!BSIM4wk1Given\)\s*BSIM4wk1 = 0\.0;\s*)if \(!BSIM4wk1Given\)\
 # IHP SG13G2's own PSP103 (module psp103va), when its PDK files are in datasets/pdk/ihp
 ihp="$out/../pdk/ihp/ihp-sg13g2/libs.tech/verilog-a/psp103/psp103.va"
 [ -f "$ihp" ] && "$OPENVAF" "$ihp" -o "$out/psp103.osdi"
+# bsim3.va (Cogenda's port of BSIM3v3.3) differs from ngspice's b3*.c in five places; the patched copy matches
+# the native model at 27, -40 and 125 C (DC, AC, noise, PMOS) to 1e-3:
+#  - TNOM defaults to 25 C where ngspice uses 27;
+#  - XPART defaults to 1.0 for version > 3.031 where b3set.c uses 0.0 (the 40/60 charge partition);
+#  - the overlap charges qgdo / qgso use the bias-dependent local_cgdo / local_cgso in place of the CGDO / CGSO
+#    parameters (b3ld.c), double counting CGDL / CGSL;
+#  - Leff / Weff drop XL / XW (b3temp.c: L + XL - 2 dL), and the dL power laws use the drawn L, W;
+#  - the channel thermal noise (NOIMOD 1, 3) uses hand-written Gm / Gds / Gmb whose "not calculated" terms are
+#    zero (it came out 0.75 x native amplitude); ddx() of Ids gives the exact derivatives.
+perl -0pe 's/`define DEFAULT_TNOM 25\b/`define DEFAULT_TNOM 27/ or die "bsim3.va: TNOM patch no longer applies\n";
+           s/BSIM3xpart=1\.0;/BSIM3xpart=0.0;/ or die "bsim3.va: XPART patch no longer applies\n";
+           s/(qgdo = [^;]*;)/($x=$1) =~ s{local_cgdo}{BSIM3cgdo}g; $x/ge;
+           s/(qgso = [^;]*;)/($x=$1) =~ s{local_cgso}{BSIM3cgso}g; $x/ge;
+           s/Lnew = l;\s*Wnew = w;\s*Ldrn = Lnew-xl;\s*Wdrn = Wnew-xw;/Lnew = l + xl;\n        Wnew = w + xw;\n        Ldrn = l;\n        Wdrn = w;/ or die "bsim3.va: XL patch no longer applies\n";
+           s/pow\(Lnew, (BSIM3L[lw]n|BSIM3Wln)\)/pow(Ldrn, $1)/g;
+           s/pow\(Wnew, (BSIM3Lwn|BSIM3Wwn)\)/pow(Wdrn, $1)/g;
+           s/dbeta_dVg = CoxWovL \* dueff_dVg.*?Gm = Gm \* dVgsteff_dVg;\s*Gmb = Gmb \* dVbseff_dVb;/Gm = BSIM3type * ddx(Ids, V(g));\n                Gds = abs(ddx(Ids, V(di)));\n                Gmb = BSIM3type * ddx(Ids, V(b));/s or die "bsim3.va: noise patch no longer applies\n";
+           s/8 \* `P_K \* T \* \(Gm \+ Gds \+ Gmb\) \/ 3/8 * `P_K * T * abs(Gm + Gds + Gmb) \/ 3/ or die "bsim3.va: noise sign patch no longer applies\n"' \
+  "$OPENVAF_DIR/integration_tests/BSIM3/bsim3.va" > "$tmp/bsim3.va"
+"$OPENVAF" "$tmp/bsim3.va" -o "$out/bsim3.osdi"

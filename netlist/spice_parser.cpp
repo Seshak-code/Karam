@@ -594,7 +594,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             const ModelCard* c;
             try { c = mosCard(m); } catch (const std::exception&) { continue; }  // resolveBlock reports it
             if (c->type != "NMOS" && c->type != "PMOS") continue;
-            if (const double lv = c->get("LEVEL", 1.0); lv == 54.0 || lv == 14.0) continue;
+            if (const double lv = c->get("LEVEL", 1.0); lv == 54.0 || lv == 14.0 || lv == 49.0 || lv == 8.0) continue;  // BSIM4 / BSIM3 (OSDI) keep RD, RS inside
             auto add = [&](int Mosfet::* term, const char* tag, double rd, double rs_, double nrx) {
                 const double r = rd > 0.0 ? rd : rs_ > 0.0 ? rs_ * (nrx > 0.0 ? nrx : 1.0) : 0.0;
                 if (r <= 0.0) return;
@@ -660,7 +660,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     // A parameter the engine does not model is an error, never silently dropped.
     // 0 is accepted for any key (SPICE: off / infinite), AF only without KF.
     // ponytail: a 0 that is not "off" (e.g. TNOM=0) is still accepted.
-    auto supported = [&](const ModelCard* c, std::initializer_list<const char*> used) {
+    auto supported = [&](const ModelCard* c, const std::vector<const char*>& used) {
         for (const auto& [k, v] : c->params) {
             bool ok = v == 0.0 || (k == "LEVEL" && v == 1.0) || (k == "AF" && c->get("KF", 0.0) == 0.0);
             for (const char* u : used) ok = ok || k == u;
@@ -685,14 +685,15 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                                  std::string(*types.begin()) + "/" + *(types.begin() + 1) + " model");
     };
     auto resolveBlock = [&](TensorBlock& blk) {
-        // BSIM4 cards (LEVEL=54 or 14, ngspice's native BSIM4) run on the OSDI BSIM4
-        // (bsim4va from OpenVAF, loaded from TREESPICE_OSDI_PATH as bsim4.osdi when
-        // needed). Its geometry parameters are model parameters there, so each card
-        // plus instance geometry is one OSDI model (shared by equal devices).
-        auto bsim4 = [&](const Mosfet& m, const ModelCard& c) {
+        // BSIM4 (LEVEL=54 or 14) and BSIM3 (LEVEL=49 or 8) cards, ngspice's native models, run on the OSDI
+        // bsim4va / bsim3_va (OpenVAF, loaded from TREESPICE_OSDI_PATH as bsim4.osdi / bsim3.osdi when needed).
+        // Their geometry parameters are model parameters there, so each card plus instance geometry is one
+        // OSDI model (shared by equal devices).
+        auto bsimOsdi = [&](const Mosfet& m, const ModelCard& c, bool v3) {
+            const char* module = v3 ? "bsim3_va" : "bsim4va";
             if (!std::isnan(m.inst.temp) || m.inst.dtemp != 0.0)
-                throw std::runtime_error(m.instanceName + ": TEMP/DTEMP on a BSIM4 device is not supported yet");
-            if (!osdi::findModule("bsim4va")) osdi::loadLibrary("bsim4.osdi");
+                throw std::runtime_error(m.instanceName + ": TEMP/DTEMP on a BSIM" + (v3 ? "3" : "4") + " device is not supported yet");
+            if (!osdi::findModule(module)) osdi::loadLibrary(v3 ? "bsim3.osdi" : "bsim4.osdi");
             std::map<std::string, double> p;
             for (const auto& [k, v] : c.params)  // binning bounds select the card; LEVEL names it
                 if (k != "LEVEL" && k != "LMIN" && k != "LMAX" && k != "WMIN" && k != "WMAX" && k != "LINTNOI") p[k] = v;
@@ -700,6 +701,22 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             // bsim4va and dropped; only flicker noise is affected.
             p["TYPE"] = c.type == "PMOS" ? -1.0 : 1.0;
             if (!p.count("TNOM")) p["TNOM"] = tnomC_;  // ngspice: the model's TNOM defaults to .options tnom
+            if (v3) {
+                for (const char* g : {"AGIDL", "LAGIDL", "WAGIDL", "PAGIDL"})  // bsim3_va's GIDL differs from b3ld.c (3.5e-8 A vs 9e-11 A at Vd 3 V, Vg 0)
+                    if (p.count(g) && p[g] != 0.0) throw std::runtime_error("model " + c.name + ": parameter " + g + " is not supported yet (BSIM3)");
+                if (p.count("NQSMOD") && p["NQSMOD"] != 0.0)  // bsim3_va's charge-deficit NQS differs from b3ld.c in AC (0.4 vs 0.3 imaginary at 1 GHz)
+                    throw std::runtime_error("model " + c.name + ": NQSMOD is not supported yet (BSIM3)");
+                if (p.count("VERSION") && p["VERSION"] < 3.2) throw std::runtime_error("model " + c.name + ": BSIM3 VERSION below 3.2 is not supported yet");
+                if (p.count("NPEAK")) { p["NCH"] = p["NPEAK"]; p.erase("NPEAK"); }  // ngspice's name for the peak channel doping
+                // b3temp.c with ACM = 0: S/D resistance is RSH * squares (NRD / NRS default 1); RD, RS, RDC, RSC are
+                // ACM > 0 inputs. bsim3_va's ACM = 0 uses RD + RDC and ignores RSH, so hand it the product.
+                if (!p.count("ACM") || p["ACM"] == 0.0) {
+                    auto sq = [&](const char* k) { const auto it = m.given.find(k); return it != m.given.end() ? it->second : 1.0; };
+                    const double rsh = p.count("RSH") ? p["RSH"] : 0.0;
+                    p["NRD"] = sq("NRD"); p["NRS"] = sq("NRS");  // the VA's S/D thermal noise needs squares > 0
+                    p["RD"] = rsh * p["NRD"]; p["RS"] = rsh * p["NRS"]; p["RDC"] = 0.0; p["RSC"] = 0.0;
+                }
+            }
             std::string key = toUpper(c.name);
             for (const auto& [k, v] : m.given) {
                 if (k == "NF" && v == 1.0) continue;
@@ -709,7 +726,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 key += kv.str();
             }
             auto& model = osdiModels_[key];
-            if (!model) model = std::make_shared<osdi::Model>(osdi::findModule("bsim4va"), c.name, p);
+            if (!model) model = std::make_shared<osdi::Model>(osdi::findModule(module), c.name, p);
             OsdiDevice o;
             o.instanceName = m.instanceName;
             o.modelName = c.name;
@@ -788,23 +805,37 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         std::vector<Mosfet> level1;
         for (auto& m : blk.mosfets) {
             const ModelCard* c = kind(mosCard(m), m.instanceName, {"NMOS", "PMOS"});
-            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0) {
-                blk.osdiDevices.push_back(bsim4(m, *c));
+            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0 || level == 49.0 || level == 8.0) {
+                blk.osdiDevices.push_back(bsimOsdi(m, *c, level == 49.0 || level == 8.0));
                 continue;
             }
-            if (m.extra.nf != 1) throw std::runtime_error(m.instanceName + ": NF is not supported yet (level 1)");
+            const int level = (int)c->get("LEVEL", 1.0);
+            const bool hi = level == 2 || level == 3;  // native levels 2 and 3 (mos2*.c, mos3*.c)
+            if (level != 1 && !hi) throw std::runtime_error("model " + c->name + ": LEVEL " + std::to_string(level) + " is not supported yet");
+            if (m.extra.nf != 1) throw std::runtime_error(m.instanceName + ": NF is not supported yet (level " + std::to_string(level) + ")");
             // RD, RS and RSH became series resistors in mosSeries(); JSSW is no MOS1 parameter in ngspice
             // (it warns and ignores it), so it stays an error rather than a silently dropped one.
+            if (hi) {  // ponytail: KF / AF (level 2/3 flicker uses Leff^2, not W L), DELVTO, UTRA stay explicit errors
+                std::vector<const char*> used = {"LEVEL", "KP", "VTO", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO",
+                              "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC", "RD", "RS", "RSH", "JS", "NSUB", "NSS",
+                              "TPG", "NFS", "DELTA", "XJ", "VMAX", "TNOM"};
+                for (const char* x : level == 2 ? std::vector<const char*>{"LAMBDA", "UCRIT", "UEXP", "NEFF"}
+                                                : std::vector<const char*>{"ETA", "THETA", "KAPPA", "XL", "WD", "XW"}) used.push_back(x);
+                supported(c, used);
+            } else
             supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
                           "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC",
                           "RD", "RS", "RSH", "JS", "NSUB", "KF", "AF", "TNOM"});
             bounded(c, {"KP", "LAMBDA", "GAMMA", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO", "CGBO",
-                        "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW", "RD", "RS", "RSH", "JS", "NSUB", "KF"},
-                    {"PHI"});
+                        "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW", "RD", "RS", "RSH", "JS", "NSUB", "KF",
+                        "NFS", "NSS", "DELTA", "XJ", "UCRIT", "UEXP", "VMAX", "ETA", "THETA", "KAPPA"},
+                    {"PHI", "NEFF"});
+            if (hi && c->params.count("TOX") && !(c->params.at("TOX") > 0.0)) throw std::runtime_error("model " + c->name + ": TOX must be > 0");
             auto& k = m.card;
             k.resolved = true;
             k.pmos = c->type == "PMOS";
-            k.tox = c->get("TOX", 0.0);
+            k.level = hi ? level : 1;
+            k.tox = c->get("TOX", hi ? 1e-7 : 0.0);  // mos2set / mos3set: 100 nm unless given
             // No KP with TOX: KP = UO[cm^2/Vs] * COX (ngspice mos1temp)
             k.kp = c->get("KP", k.tox > 0.0 ? c->get("UO", c->get("U0", 600.0)) * 1e-4 * 3.9 * 8.854214871e-12 / k.tox
                                             : 2e-5);
@@ -812,46 +843,59 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             k.phi = c->get("PHI", 0.6); k.is = c->get("IS", 1e-14); k.ld = c->get("LD", 0.0);
             k.js = c->get("JS", 0.0); k.kf = c->get("KF", 0.0); k.af = c->get("AF", 1.0);
             if (k.kf != 0.0 && !(k.tox > 0.0)) throw std::runtime_error("model " + c->name + ": KF needs TOX (flicker noise divides by the oxide capacitance)");
+            const double Tn = c->get("TNOM", tnomC_) + 273.15, T = instK(m.inst);
+            if (hi) {
+                k.mu = c->get("UO", c->get("U0", 600.0)) * 1e-4;
+                k.nfs = c->get("NFS", 0.0); k.delta = c->get("DELTA", 0.0); k.xj = c->get("XJ", 0.0); k.vmax = c->get("VMAX", 0.0);
+                k.ucrit = c->get("UCRIT", 1e4); k.uexp = c->get("UEXP", 0.0); k.neff = c->get("NEFF", 1.0);
+                k.eta = c->get("ETA", 0.0); k.theta = c->get("THETA", 0.0); k.kappa = c->get("KAPPA", 0.2);
+                k.xl = c->get("XL", 0.0); k.wd = c->get("WD", 0.0); k.xw = c->get("XW", 0.0);
+            }
             if (c->params.count("NSUB")) {
                 // ngspice mos1temp at TNOM = 27 C: PHI, GAMMA and VTO from the substrate doping unless given
-                // (aluminium-free n+ gate, NSS = 0)
-                const double Tn = c->get("TNOM", tnomC_) + 273.15, nsub = c->get("NSUB", 0.0) * 1e6, vt = devtemp::vt(Tn), type = k.pmos ? -1.0 : 1.0;
-                if (!(k.tox > 0.0) || !(nsub > 1.45e16))
+                // (aluminium-free n+ gate, NSS = 0). Levels 2 and 3 add TPG and NSS.
+                const double nsub = c->get("NSUB", 0.0) * 1e6, vt = devtemp::vt(Tn), type = k.pmos ? -1.0 : 1.0;
+                const double eg = devtemp::egfet(Tn), ni = 1.45e16;
+                if (!(k.tox > 0.0) || !(nsub > ni))
                     throw std::runtime_error("model " + c->name + ": NSUB needs TOX and NSUB > 1.45e10 cm^-3 (ni)");
-                const double cox = 3.9 * 8.854214871e-12 / k.tox, eg = devtemp::egfet(Tn);
-                if (!c->params.count("PHI")) k.phi = std::max(0.1, 2.0 * vt * std::log(nsub / 1.45e16));
+                const double cox = 3.9 * 8.854214871e-12 / k.tox;
+                if (!c->params.count("PHI")) k.phi = std::max(0.1, 2.0 * vt * std::log(nsub / ni));
                 if (!c->params.count("GAMMA"))
                     k.gamma = std::sqrt(2.0 * 11.7 * 8.854214871e-12 * PhysicsConstants::Q_ELECTRON * nsub) / cox;
                 if (!c->params.count("VTO")) {
-                    const double fermis = type * 0.5 * k.phi, fermig = type * 0.5 * eg;
-                    const double wkfngs = (3.25 + 0.5 * eg - fermig) - (3.25 + 0.5 * eg + fermis);
-                    k.vto = wkfngs + type * (k.gamma * std::sqrt(k.phi) + k.phi);
+                    const double tpg = c->get("TPG", 1.0), fermis = type * 0.5 * k.phi, fermig = type * tpg * 0.5 * eg;
+                    const double wkfngs = (tpg != 0.0 ? 3.25 + 0.5 * eg - fermig : 3.2) - (3.25 + 0.5 * eg + fermis);
+                    k.vto = wkfngs - c->get("NSS", 0.0) * 1e4 * PhysicsConstants::Q_ELECTRON / cox + type * (k.gamma * std::sqrt(k.phi) + k.phi);
                 }
+                if (hi) { k.nsub = nsub; k.xd = std::sqrt(2.0 * 11.7 * 8.854214871e-12 / (PhysicsConstants::Q_ELECTRON * nsub)); k.alpha = k.xd * k.xd; }
             }
             k.cgso = c->get("CGSO", 0.0); k.cgdo = c->get("CGDO", 0.0); k.cgbo = c->get("CGBO", 0.0);
             k.cbd = c->get("CBD", 0.0); k.cbs = c->get("CBS", 0.0); k.cj = c->get("CJ", 0.0);
-            k.cjsw = c->get("CJSW", 0.0); k.mj = c->get("MJ", 0.5); k.mjsw = c->get("MJSW", 0.5);
+            k.cjsw = c->get("CJSW", 0.0); k.mj = c->get("MJ", 0.5); k.mjsw = c->get("MJSW", hi ? 0.33 : 0.5);  // mos2set / mos3set grade the sidewall 0.33, mos1set 0.5
             k.pb = c->get("PB", 0.8); k.fc = c->get("FC", 0.5);
-            if (!(m.l - 2.0 * k.ld > 0.0))
-                throw std::runtime_error(m.instanceName + ": L - 2*LD must be > 0");
+            if (!(m.l - 2.0 * k.ld + k.xl > 0.0 && m.w - 2.0 * k.wd + k.xw > 0.0))
+                throw std::runtime_error(m.instanceName + ": effective L (L - 2*LD + XL) and W (W - 2*WD + XW) must be > 0");
             if (!(k.mj < 1.0 && k.mjsw < 1.0 && k.pb > 0.0 && k.fc < 1.0))
                 throw std::runtime_error("model " + c->name + ": needs MJ, MJSW < 1, PB > 0, FC < 1");
             // mos1temp: KP/T^1.5, PHI, VTO (via the flat-band voltage), IS and the junctions at the instance temperature
-            const double Tn = c->get("TNOM", tnomC_) + 273.15, T = instK(m.inst);
-            if (T != Tn) {
+            {
                 using namespace devtemp;
                 const double ratio = T / Tn, eg = egfet(T), eg1 = egfet(Tn), sgn = k.pmos ? -1.0 : 1.0;
-                const double phio = (k.phi - pbfact(Tn)) / (Tn / REFTEMP), tphi = T / REFTEMP * phio + pbfact(T);
-                const double tvbi = k.vto - sgn * k.gamma * std::sqrt(k.phi) + 0.5 * (eg1 - eg) + sgn * 0.5 * (tphi - k.phi);
-                k.kp /= ratio * std::sqrt(ratio);
-                k.vto = tvbi + sgn * k.gamma * std::sqrt(tphi);
-                k.phi = tphi;
-                k.is *= std::exp(-eg / vt(T) + eg1 / vt(Tn));
-                k.js *= std::exp(-eg / vt(T) + eg1 / vt(Tn));
-                double pbSide = k.pb;  // the same tBulkPot as k.pb gets; only the sidewall's grading differs
-                const double side = junctionAt(pbSide, k.mjsw, Tn, T);
-                const double bot = junctionAt(k.pb, k.mj, Tn, T);
-                k.cbd *= bot; k.cbs *= bot; k.cj *= bot; k.cjsw *= side;
+                k.vbi = k.vto - sgn * k.gamma * std::sqrt(k.phi);
+                if (T != Tn) {
+                    const double phio = (k.phi - pbfact(Tn)) / (Tn / REFTEMP), tphi = T / REFTEMP * phio + pbfact(T);
+                    k.vbi += 0.5 * (eg1 - eg) + sgn * 0.5 * (tphi - k.phi);
+                    k.vto = k.vbi + sgn * k.gamma * std::sqrt(tphi);
+                    k.phi = tphi;
+                    k.kp /= ratio * std::sqrt(ratio);
+                    if (level == 3) k.mu /= ratio * std::sqrt(ratio);
+                    k.is *= std::exp(-eg / vt(T) + eg1 / vt(Tn));
+                    k.js *= std::exp(-eg / vt(T) + eg1 / vt(Tn));
+                    double pbSide = k.pb;  // the same tBulkPot as k.pb gets; only the sidewall's grading differs
+                    const double side = junctionAt(pbSide, k.mjsw, Tn, T);
+                    const double bot = junctionAt(k.pb, k.mj, Tn, T);
+                    k.cbd *= bot; k.cbs *= bot; k.cj *= bot; k.cjsw *= side;
+                }
             }
             k.vt = devtemp::vt(T);
             level1.push_back(m);
