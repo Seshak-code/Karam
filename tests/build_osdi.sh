@@ -7,16 +7,20 @@
 set -eu
 : "${OPENVAF_DIR:?set OPENVAF_DIR to an OpenVAF(-reloaded) checkout}"
 OPENVAF="${OPENVAF:-$OPENVAF_DIR/target/release/openvaf-r}"
-out="$(cd "$(dirname "$0")/.." && pwd)/datasets/osdi"
+out="${OSDI_OUT:-$(cd "$(dirname "$0")/.." && pwd)/datasets/osdi}"
 mkdir -p "$out"
 # bsim4.va (Cogenda's port) differs from ngspice's b4set.c in three defaults: wk2 and wgamma1 are
 # never set to 0 (the "wk1 = 0" line is duplicated where wk2 belongs), so a card that gives k2 or
 # gamma1 without its W term bins against the -12345789 "not given" marker (QA3 BUG-1: 3-5x Id on
-# most sky130 bins); and TNOM defaults to 25 C where ngspice uses 27 (BUG-2). Patched copy:
+# most sky130 bins); and TNOM defaults to 25 C where ngspice uses 27 (BUG-2). It also defines
+# __XYCE_VAMS__, whose I(a,b) <+ V(a,b)*g gate and body resistor branches OpenVAF compiles next to
+# the else-branch's V(b,bi) <+ 0 collapses: rbodymod=1 had no effect (forward body current 4x
+# native ngspice at Vb = 0.9 V); the V <+ I/g form matches native to 0.1 %. Patched copy:
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 perl -0pe 's/(if \(!BSIM4wk1Given\)\s*BSIM4wk1 = 0\.0;\s*)if \(!BSIM4wk1Given\)\s*BSIM4wk1 = 0\.0;/$1if (!BSIM4wk2Given) BSIM4wk2 = 0.0;\n            if (!BSIM4wgamma1Given) BSIM4wgamma1 = 0.0;/ or die "bsim4.va: wk2 default patch no longer applies\n";
-           s/`define DEFAULT_TNOM 25\b/`define DEFAULT_TNOM 27/ or die "bsim4.va: TNOM patch no longer applies\n"' \
+           s/`define DEFAULT_TNOM 25\b/`define DEFAULT_TNOM 27/ or die "bsim4.va: TNOM patch no longer applies\n";
+           s/^`define __XYCE_VAMS__[^\n]*$//m or die "bsim4.va: __XYCE_VAMS__ patch no longer applies\n"' \
   "$OPENVAF_DIR/integration_tests/BSIM4/bsim4.va" > "$tmp/bsim4.va"
 "$OPENVAF" "$tmp/bsim4.va" -o "$out/bsim4.osdi"
 "$OPENVAF" "$OPENVAF_DIR/integration_tests/BSIMCMG/bsimcmg.va" -o "$out/bsimcmg.osdi"
