@@ -164,7 +164,202 @@ struct Mos1Params {
     P mj = 0.5, mjsw = 0.5, pb = 0.8, fc = 0.5;
     P isats = -1.0;     // source junction saturation current; < 0: same as the drain's (isat)
     P gmin = PhysicsConstants::JUNCTION_GMIN;  // bulk junction GMIN
+    // Levels 2 and 3 (ngspice mos2load / mos3load); phi, pb and vt are the instance-temperature values,
+    // beta, cox and the oxide capacitance include M, Weff and Leff.
+    int level = 1;
+    P vbi = 0.0;        // tVbi as on the card (PMOS negative-side convention: polarity * vbi in the type domain)
+    P leff = 1e-6, weff = 1e-6, coxf = 3.45e-4;  // Leff, Weff, oxide capacitance per area
+    P mu = 0.0;         // low-field surface mobility [m^2/Vs] (level 2: the card's, level 3: at temperature)
+    P nfs = 0.0, nsub = 0.0, xd = 0.0, xj = 0.0, ld = 0.0, delta = 0.0;  // NFS [1/cm^2], NSUB given, depletion width coefficient
+    P ucrit = 1e4, uexp = 0.0, vmax = 0.0, neff = 1.0;                    // level 2
+    P eta = 0.0, theta = 0.0, kappa = 0.2, alpha = 0.0;                   // level 3
 };
+
+
+// Channel of levels 2 and 3 in the type domain, source/drain already exchanged (lvgs, lvbs, lvds >= 0 as
+// ngspice mos2load / mos3load): drain current without the junctions, and the von / vdsat the Meyer
+// capacitances use. Only the values are ported; the Jacobian comes from Dual.
+template <typename T> struct MosChannel { T id, von, vdsat; };
+
+constexpr double EPSSIL = 11.7 * 8.854214871e-12;
+
+template <typename T, typename P>
+inline MosChannel<T> mos2_channel(T lvgs, T lvbs, T lvds, const Mos1Params<P>& p)
+{
+    using std::sqrt; using std::exp; using std::log; using std::atan; using std::cos; using std::fabs;
+    auto mx = [](T a, double b) { return a > b ? a : T(b); };
+    const P sphi = sqrt(p.phi), sphi3 = p.phi * sphi, L = p.leff;
+    const bool nfs = p.nfs != P(0.0) && p.cox != P(0.0);
+    const T phiMinVbs = p.phi - lvbs;
+    T sarg, dsrgdb, barg, dbrgdb;
+    if (lvbs <= P(0.0)) { sarg = sqrt(phiMinVbs); dsrgdb = -0.5 / sarg; }
+    else { sarg = sphi / (1.0 + 0.5 * lvbs / p.phi); dsrgdb = -0.5 * sarg * (sarg / sphi3); }
+    if (lvbs - lvds <= P(0.0)) { barg = sqrt(phiMinVbs + lvds); dbrgdb = -0.5 / barg; }
+    else { barg = sphi / (1.0 + 0.5 * (lvbs - lvds) / p.phi); dbrgdb = -0.5 * barg * (barg / sphi3); }
+    const P factor = 0.25 * M_PI * p.delta * EPSSIL / (p.coxf * p.weff), eta = 1.0 + factor;  // ngspice 47: the oxide capacitance here has no M
+    const T vbin = p.polarity * p.vbi + factor * phiMinVbs;
+    T gamasd = p.gamma, dgddvb = 0.0;
+    if (p.gamma > P(0.0) || p.nsub > P(0.0)) {
+        T argss = 0.0, argsd = 0.0, dbargs = 0.0, dbargd = 0.0, args = 1.0, argd = 1.0;
+        if (p.xj > P(0.0)) {
+            const P tmp = 2.0 / p.xj;
+            args = sqrt(1.0 + p.xd * sarg * tmp); argd = sqrt(1.0 + p.xd * barg * tmp);
+            argss = 0.5 * p.xj / L * (args - 1.0); argsd = 0.5 * p.xj / L * (argd - 1.0);
+            dbargs = 0.5 / L * (p.xd * dsrgdb) / args; dbargd = 0.5 / L * (p.xd * dbrgdb) / argd;
+        }
+        gamasd = p.gamma * (1.0 - argss - argsd);
+        dgddvb = -p.gamma * (dbargs + dbargd);
+    }
+    T von = vbin + gamasd * sarg, vdsat = 0.0, argg = 0.0;
+    if (nfs) {
+        const T cdonco = -(gamasd * dsrgdb + dgddvb * sarg) + factor;
+        const T xn = 1.0 + PhysicsConstants::Q_ELECTRON * p.nfs * 1e4 / p.coxf + cdonco;
+        const T tmp = p.vt * xn;
+        von = von + tmp; argg = 1.0 / tmp;
+    } else if (lvgs <= vbin) return {T(0.0), von, T(0.0)};
+    const T vgst = lvgs - von;
+    const T sarg3 = sarg * sarg * sarg, body0 = barg * barg * barg - sarg3;
+    // effective mobility (UCRIT / UEXP)
+    T ufact = 1.0;
+    const P tcr = p.ucrit * 100.0 * EPSSIL / p.coxf;
+    if (p.cox > P(0.0) && vgst > tcr) ufact = exp(p.uexp * log(tcr / vgst));
+    const T ueff = p.mu * ufact;
+    // saturation voltage, Grove-Frohman
+    const T vgsx = nfs && von > lvgs ? von : lvgs;
+    const T gammad = gamasd / eta;
+    if (gammad > P(0.0)) {
+        const T gammd2 = gammad * gammad, argv = (vgsx - vbin) / eta + phiMinVbs;
+        if (argv > P(0.0)) vdsat = mx((vgsx - vbin) / eta + gammd2 * (1.0 - sqrt(1.0 + 4.0 * argv / gammd2)) / 2.0, 0.0);
+    } else vdsat = mx((vgsx - vbin) / eta, 0.0);
+    if (p.vmax > P(0.0)) {  // Baum's velocity saturation: the quartic's smallest valid root
+        const T gammd2 = gammad * gammad, v1 = (vgsx - vbin) / eta + phiMinVbs, v2 = phiMinVbs;
+        const T xv = p.vmax * L / ueff, a1 = gammad / 0.75, b1 = -2.0 * (v1 + xv), c1 = -2.0 * gammad * xv;
+        const T d1 = 2.0 * v1 * (v2 + xv) - v2 * v2 - 4.0 / 3.0 * gammad * sarg3;
+        const T a = -b1, b = a1 * c1 - 4.0 * d1, c = -d1 * (a1 * a1 - 4.0 * b1) - c1 * c1;
+        const T r = -a * a / 3.0 + b, s = 2.0 * a * a * a / 27.0 - a * b / 3.0 + c;
+        const T p4 = s * s / 4.0 + r * r * r / 27.0, p0 = p4 < 0.0 ? -p4 : p4, p2 = sqrt(p0);
+        T y3;
+        if (p4 < 0.0) {
+            const T ro = exp(log(sqrt(s * s / 4.0 + p0)) / 3.0), fi = atan(-2.0 * p2 / s);
+            y3 = 2.0 * ro * cos(fi / 3.0) - a / 3.0;
+        } else {
+            const T t3 = -s / 2.0 + p2, t4 = -s / 2.0 - p2;
+            y3 = exp(log(t3 < 0.0 ? -t3 : t3) / 3.0) + exp(log(t4 < 0.0 ? -t4 : t4) / 3.0) - a / 3.0;
+        }
+        const T a3 = sqrt(a1 * a1 / 4.0 - b1 + y3), b3 = sqrt(y3 * y3 / 4.0 - d1);
+        static const double sig1[4] = {1.0, -1.0, 1.0, -1.0}, sig2[4] = {1.0, 1.0, -1.0, -1.0};
+        T x4[8]; int iknt = 0, jknt = 0;
+        for (int i = 0; i < 4; ++i) {
+            const T aa = a1 / 2.0 + sig1[i] * a3, bb = y3 / 2.0 + sig2[i] * b3, delta4 = aa * aa / 4.0 - bb;
+            if (delta4 < 0.0) continue;
+            const T tmp = sqrt(delta4);
+            x4[iknt++] = -aa / 2.0 + tmp;
+            x4[iknt++] = -aa / 2.0 - tmp;
+        }
+        T xvalid = 0.0;
+        for (int j = 0; j < iknt; ++j) {
+            const T x = x4[j];
+            if (x <= 0.0) continue;
+            const T poly = x * x * x * x + a1 * x * x * x + b1 * x * x + c1 * x + d1;
+            if ((poly < 0.0 ? -poly : poly) > 1.0e-6) continue;
+            if (++jknt <= 1 || !(x > xvalid)) xvalid = x;
+        }
+        if (jknt > 0) vdsat = xvalid * xvalid - phiMinVbs;
+    }
+    // channel-length modulation
+    T xlamda = p.lambda, bsarg = 0.0, bodys = 0.0;
+    if (lvds != P(0.0)) {
+        if (lvbs - vdsat <= P(0.0)) bsarg = sqrt(vdsat + phiMinVbs);
+        else bsarg = sphi / (1.0 + 0.5 * (lvbs - vdsat) / p.phi);
+        bodys = bsarg * bsarg * bsarg - sarg3;
+        if (p.nsub != P(0.0) && !(xlamda > P(0.0))) {
+            if (p.vmax <= P(0.0)) {
+                const T argv = (lvds - vdsat) / 4.0, sargv = sqrt(1.0 + argv * argv);
+                xlamda = p.xd / (L * lvds) * sqrt(argv + sargv);
+            } else {
+                const T xdv = p.xd / sqrt(p.neff), xlv = p.vmax * xdv / (2.0 * ueff);
+                const T argv = mx(lvds - vdsat, 0.0);
+                xlamda = xdv / (L * lvds) * (sqrt(xlv * xlv + argv) - xlv);
+            }
+        }
+    }
+    P xwb = p.xd * sqrt(p.pb);
+    const P xld = L - xwb;
+    T clfact = 1.0 - xlamda * lvds;
+    T xleff = L * clfact;
+    const T deltal = xlamda * lvds * L;
+    if (p.nsub == P(0.0)) xwb = 0.25e-6;
+    if (xleff < xwb) { xleff = xwb / (1.0 + (deltal - xld) / xwb); clfact = xleff / L; }
+    const T beta1 = p.beta * ufact / clfact;
+    T cdrain = 0.0;
+    if (nfs && !(lvgs > von)) {  // subthreshold
+        if (vdsat > P(0.0)) {
+            const T vdson = vdsat < lvds ? vdsat : lvds, body = lvds > vdsat ? bodys : body0;
+            cdrain = beta1 * ((von - vbin - eta * vdson * 0.5) * vdson - gamasd * body / 1.5) * exp(argg * (lvgs - von));
+        }
+    } else if (lvds <= vdsat) cdrain = beta1 * ((lvgs - vbin - eta * lvds / 2.0) * lvds - gamasd * body0 / 1.5);
+    else cdrain = beta1 * ((lvgs - vbin - eta * vdsat / 2.0) * vdsat - gamasd * bodys / 1.5);
+    return {cdrain, von, vdsat};
+}
+
+template <typename T, typename P>
+inline MosChannel<T> mos3_channel(T lvgs, T lvbs, T lvds, const Mos1Params<P>& p)
+{
+    using std::sqrt; using std::exp;
+    auto mx = [](T a, T b) { return a > b ? a : b; };
+    const P L = p.leff, W = p.weff, narrow = p.delta * 0.5 * M_PI * EPSSIL / p.coxf, vt = p.vt;
+    const P eta = p.eta * 8.15e-22 / (p.coxf * L * L * L);
+    T phibs, sqphbs, dsqdvb;
+    if (lvbs <= P(0.0)) { phibs = p.phi - lvbs; sqphbs = sqrt(phibs); dsqdvb = -0.5 / sqphbs; }
+    else {
+        const P sqphis = sqrt(p.phi), sqphs3 = p.phi * sqphis;
+        sqphbs = sqphis / (1.0 + lvbs / (p.phi + p.phi)); phibs = sqphbs * sqphbs; dsqdvb = -phibs / (sqphs3 + sqphs3);
+    }
+    T fshort = 1.0;
+    if (p.xj != P(0.0) && p.xd != P(0.0)) {
+        const P xjonxl = p.xj / L, djonxj = p.ld / p.xj;
+        const T wponxj = p.xd * sqphbs / p.xj, argc = wponxj / (1.0 + wponxj);
+        const T arga = 0.0631353 + 0.8013292 * wponxj - 0.01110777 * wponxj * wponxj + djonxj;
+        fshort = 1.0 - xjonxl * (arga * sqrt(1.0 - argc * argc) - djonxj);
+    }
+    const T gammas = p.gamma * fshort, fbodys = 0.5 * gammas / (sqphbs + sqphbs), fbody = fbodys + narrow / W;
+    const T onfbdy = 1.0 / (1.0 + fbody), qbonco = gammas * sqphbs + narrow * phibs / W;
+    const T vth = p.polarity * p.vbi - eta * lvds + qbonco;
+    T von = vth, xn = 1.0;
+    if (p.nfs != P(0.0)) {
+        xn = 1.0 + PhysicsConstants::Q_ELECTRON * p.nfs * 1e4 / p.coxf + qbonco / (phibs + phibs);
+        von = vth + vt * xn;
+    } else if (lvgs <= von) return {T(0.0), von, T(0.0)};
+    const T vgsx = mx(lvgs, von), onfg = 1.0 + p.theta * (vgsx - vth), fgate = 1.0 / onfg;
+    const T us = p.mu * fgate;
+    T vdsat = (vgsx - vth) * onfbdy, onvdsc = 0.0;
+    if (p.vmax > P(0.0)) {
+        const T vdsc = L * p.vmax / us, arga = (vgsx - vth) * onfbdy;
+        onvdsc = 1.0 / vdsc;
+        vdsat = arga + vdsc - sqrt(arga * arga + vdsc * vdsc);
+    }
+    const T vdsx = vdsat < lvds ? vdsat : lvds;
+    if (!(vdsat > P(0.0))) return {T(0.0), von, vdsat};  // ngspice also returns 0 at vds = 0 but gives it a slope there; kept smooth instead
+    T cdrain = p.beta * fgate * ((vgsx - vth - 0.5 * (1.0 + fbody) * vdsx) * vdsx), fdrain = 1.0;
+    if (p.vmax > P(0.0)) { fdrain = 1.0 / (1.0 + vdsx * onvdsc); cdrain = fdrain * cdrain; }
+    T delxl = 0.0;
+    bool lengthMod = p.alpha != P(0.0);  // without NSUB delxl = 0 (and sqrt(0) would poison the Dual)
+    if (lengthMod && lvds <= vdsat) {
+        if (p.vmax > P(0.0)) lengthMod = false;
+        else { T a = lvds / vdsat; a = a * a; delxl = sqrt(p.kappa * p.alpha * vdsat / 8.0) * a * a; }
+    } else if (lengthMod && p.vmax <= P(0.0)) delxl = sqrt(p.kappa * p.alpha * (lvds - vdsat + vdsat / 8.0));
+    else if (lengthMod) {
+        const T gdsat = mx(T(1.0e-12), cdrain * (1.0 - fdrain) * onvdsc), emax = p.kappa * cdrain / L / gdsat;
+        const T arga = 0.5 * emax * p.alpha, argb = sqrt(arga * arga + p.kappa * p.alpha * (lvds - vdsat));
+        delxl = argb - arga;
+    }
+    if (lengthMod) {
+        if (delxl > 0.5 * L) delxl = L - L * L / (4.0 * delxl);
+        cdrain = cdrain / (1.0 - delxl / L);
+    }
+    if (lvgs < von) cdrain = cdrain * exp((lvgs - von) / (xn * vt));
+    return {cdrain, von, vdsat};
+}
 
 // Threshold (type domain) at bulk bias vbx: VBS in normal mode, VBD reversed.
 template <typename T, typename P>
@@ -194,7 +389,9 @@ inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>
     const T vgst = (normal ? vgs : vgd) - mos1_von(normal ? vbs : vbd, p);
     const T vdsm = normal ? vds : -vds;         // |Vds|
     T cdrain(0.0);
-    if (vgst > P(0.0)) {
+    if (p.level == 2) cdrain = mos2_channel(normal ? vgs : vgd, normal ? vbs : vbd, vdsm, p).id;
+    else if (p.level == 3) cdrain = mos3_channel(normal ? vgs : vgd, normal ? vbs : vbd, vdsm, p).id;
+    else if (vgst > P(0.0)) {
         const T betap = p.beta * (1.0 + p.lambda * vdsm);
         cdrain = vgst <= vdsm ? 0.5 * betap * vgst * vgst                // saturation
                               : betap * vdsm * (vgst - 0.5 * vdsm);      // linear
@@ -258,9 +455,14 @@ inline Mos1Charges<T> mos1_charges(T vd, T vg, T vs, T vb, const Mos1Params<doub
     for (int k = 0; k < 5; ++k) c.v[k] = br[k];
     const T vgs = br[0], vgd = br[1], vbd = br[3], vbs = br[4];
     const bool normal = vgs >= vgd;  // vds >= 0
-    const T von = mos1_von(normal ? vbs : vbd, p);
+    T von = mos1_von(normal ? vbs : vbd, p);
     T vdsat = (normal ? vgs : vgd) - von;
     if (vdsat < 0.0) vdsat = T(0.0);
+    if (p.level != 1) {
+        const T vdsm = normal ? vgs - vgd : vgd - vgs, lg = normal ? vgs : vgd, lb = normal ? vbs : vbd;
+        const auto ch = p.level == 2 ? mos2_channel(lg, lb, vdsm, p) : mos3_channel(lg, lb, vdsm, p);
+        von = ch.von; vdsat = ch.vdsat;
+    }
     const auto h = normal ? mos1_meyer(vgs, vgd, von, vdsat, p.phi, p.cox)
                           : mos1_meyer(vgd, vgs, von, vdsat, p.phi, p.cox);
     c.half[0] = normal ? h[0] : h[1];

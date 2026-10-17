@@ -63,6 +63,12 @@ DIALECT = {
     "ABM_LOG/log.cir": "Xyce log() is log10 (gold V(3) = 2 for 100); ngspice and the engine: natural log",
     "Certification_Tests/BUG_254/atanh_tanh.cir": "atanh(tanh(100)) = atanh(1): Xyce clamps, ngspice prints -inf (so does the engine's Newton fail)",
     "Certification_Tests/BUG_133/": "gold is Xyce's sparse output times; ngspice and the engine agree (v(3) = 1, 2, 3 at 0.500035, .075, .125 ms)",
+    "CircuitSim90/MOS2/hussamp.cir": "Xyce's MOS level 2 differs from ngspice's: the engine follows ngspice to 1.4 mV over the run, "
+                                     "the gold is 44 mV off both",
+    "Certification_Tests/ISSUE_634/hussamp.cir": "the same MOS level 2 circuit: the engine follows ngspice to 1.4 mV",
+    "CircuitSim90/MOS3/rich3.cir": "Xyce's MOS level 3 at 125 C: the engine follows ngspice to 1 mV (both start at v(51) = 0, the gold does not)",
+    "XDM/HSPICE/MODELS/correct_instance_parameters.cir": "default-card level 3 PMOS: the engine follows ngspice to 0.3 mV over the sweep "
+                                                         "(v(3) 0.53612 vs 0.53613 at VG = 0.7), the gold reads 0.5394",
     "SANDLER21/sandler21.cir": "555 timer: output edges match ngspice to 0.1 us (1.0817 ms, 2.0816 ms, ...); a pointwise "
                                "compare at its near-vertical switching edges measures that offset, not the model",
 }
@@ -74,8 +80,9 @@ EXCLUDED = {
 }
 
 OPEN = {
-    "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card: ngspice runs its BSIM4v5, the engine "
-                  "BSIM4 4.8 (OSDI); v(1) 0.737 V vs ngspice 0.556 V, and ngspice with version=4.8 gives 0.739 V",
+    "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card, PMOS body forward-biased, no AD/AS/PD/PS: "
+                  "ngspice's BSIM4v5 derives the default junction geometry differently from 4.8 (bsim4va); v(1) 0.737 V vs ngspice "
+                  "0.556 V, and ngspice with version=4.8 gives 0.739 V. Explicit zero geometry (sky130) is matched: x_bsim4_v45_zero_geo",
 }
 
 def gold(prn):

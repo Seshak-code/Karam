@@ -81,7 +81,7 @@ def cards(text):
     return out
 
 # OSDI libraries (.osdi <file>): compiled Verilog-A models, git-ignored; build them with tests/build_osdi.sh
-OSDI_DIR = os.path.join(ROOT, "datasets", "osdi")
+OSDI_DIR = os.environ.get("TREESPICE_OSDI_PATH") or os.path.join(ROOT, "datasets", "osdi")
 os.environ.setdefault("TREESPICE_OSDI_PATH", OSDI_DIR)
 def osdi_libs(text): return re.findall(r"^\s*\.osdi\s+(\S+)", text, re.I | re.M)
 

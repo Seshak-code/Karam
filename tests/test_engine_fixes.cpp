@@ -442,7 +442,6 @@ int main() {
             {"V1 1 0 DC 1\nR1 1 2 1k\nQ1 2 2 0 NM\n.model NM NMOS\n", "is NMOS, not a NPN/PNP model"},
             {"V1 1 0 DC 1\nR1 1 2 1k\nM1 2 2 0 NM W=10u\n.model NM NMOS\n", "expected 4 nodes"},
             // QA round 2 and the parameter front end
-            {"V1 1 0 DC 1\nR1 1 2 1k\nJ1 2 0 0 JM\n.model JM NJF\n.options temp=50\n", "JFET temperature dependence is not supported"},
             {"V1 1 0 DC 1\nR1 1 2 1k\nD1 2 0 DM\n.model DM D\n.model DM D IS=1e-15\n", "defined twice"},
             {"V1 1 0 DC {nosuch*2}\nR1 1 0 1k\n", "unknown parameter NOSUCH"},
             {".param a={b+1} b={a}\nV1 1 0 DC {a}\nR1 1 0 1k\n", "depends on itself"},

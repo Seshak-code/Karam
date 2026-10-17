@@ -722,6 +722,10 @@ struct Mosfet {
         double js = 0.0;                                    // bulk junction saturation current density [A/m^2]
         double kf = 0.0, af = 1.0;                          // flicker noise (AF is the frequency exponent in ngspice mos1noise)
         double vt = PhysicsConstants::V_THERMAL_NOM;        // bulk junctions' kT/q at the instance temperature
+        // Levels 2 and 3 (0: level 1); vbi is tVbi, mu the surface mobility [m^2/Vs] the level's equations use
+        int level = 1;
+        double vbi = 0.0, mu = 0.0, nfs = 0.0, nsub = 0.0, xd = 0.0, xj = 0.0, delta = 0.0, wd = 0.0, xl = 0.0, xw = 0.0;
+        double ucrit = 1e4, uexp = 0.0, vmax = 0.0, neff = 1.0, eta = 0.0, theta = 0.0, kappa = 0.2, alpha = 0.0;
     } card;
     InstTemp inst;  // card is held at the instance temperature (resolved by the parser)
 

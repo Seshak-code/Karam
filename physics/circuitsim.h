@@ -2249,6 +2249,7 @@ public:
 
               // dI/dp of the same mos1_currents() the solve used: Vth (VTO), W, L
               const Mos1Params<double> p = mos1Params(m, gmin_);
+              if (p.level != 1) return {};  // ponytail: levels 2/3 have no parameter sensitivity
               Mos1Params<Dual<double>> pd{p.polarity, p.beta, p.vto, p.lambda, p.gamma, p.phi, p.isat, p.vt};
               const double leff = m.l - 2.0 * m.card.ld;
               if (paramName == "Vth") pd.vto.grad = 1.0;

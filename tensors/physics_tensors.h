@@ -28,7 +28,7 @@ inline Mos1Params<double> mos1Params(const Mosfet& m, double gmin = PhysicsConst
     const bool pmos = c.resolved ? c.pmos
                                  : m.modelName.find("PMOS") != std::string::npos || m.modelName.find("pmos") != std::string::npos;
     p.polarity = pmos ? -1.0 : 1.0;
-    const double M = m.extra.mult, leff = m.l - 2.0 * c.ld;
+    const double M = m.extra.mult, leff = m.l - 2.0 * c.ld + c.xl, weff = m.w - 2.0 * c.wd + c.xw;
     if (!c.resolved) {
         p.vto = pmos ? -0.7 : 0.7;
         p.lambda = 0.02;
@@ -37,15 +37,21 @@ inline Mos1Params<double> mos1Params(const Mosfet& m, double gmin = PhysicsConst
         return p;
     }
     p.vto = c.vto; p.lambda = c.lambda; p.gamma = c.gamma; p.phi = c.phi;
-    p.beta = c.kp * m.w / leff * M;
+    p.beta = c.kp * weff / leff * M;
     p.isat = c.is * M; p.vt = c.vt;
     if (c.js > 0.0 && m.geo.ad > 0.0 && m.geo.as > 0.0) { p.isat = c.js * m.geo.ad * M; p.isats = c.js * m.geo.as * M; }  // ngspice mos1temp
-    p.cox = c.tox > 0.0 ? 3.9 * 8.854214871e-12 / c.tox * m.w * leff * M : 0.0;
-    p.cgso = c.cgso * m.w * M; p.cgdo = c.cgdo * m.w * M; p.cgbo = c.cgbo * leff * M;
+    p.cox = c.tox > 0.0 ? 3.9 * 8.854214871e-12 / c.tox * weff * leff * M : 0.0;
+    p.cgso = c.cgso * weff * M; p.cgdo = c.cgdo * weff * M; p.cgbo = c.cgbo * leff * M;
     // CBD/CBS win over CJ * area (ngspice mos1temp)
     p.czbd = (c.cbd > 0.0 ? c.cbd : c.cj * m.geo.ad) * M; p.czbdsw = c.cjsw * m.geo.pd * M;
     p.czbs = (c.cbs > 0.0 ? c.cbs : c.cj * m.geo.as) * M; p.czbssw = c.cjsw * m.geo.ps * M;
     p.mj = c.mj; p.mjsw = c.mjsw; p.pb = c.pb; p.fc = c.fc;
+    if (c.level > 1) {
+        p.level = c.level; p.vbi = c.vbi; p.leff = leff; p.weff = weff; p.coxf = 3.9 * 8.854214871e-12 / c.tox; p.mu = c.mu;
+        p.nfs = c.nfs; p.nsub = c.nsub; p.xd = c.xd; p.xj = c.xj; p.ld = c.ld; p.delta = c.delta;
+        p.ucrit = c.ucrit; p.uexp = c.uexp; p.vmax = c.vmax; p.neff = c.neff;
+        p.eta = c.eta; p.theta = c.theta; p.kappa = c.kappa; p.alpha = c.alpha;
+    }
     p.caps = p.cox > 0.0 || p.cgso > 0.0 || p.cgdo > 0.0 || p.cgbo > 0.0 ||
              p.czbd > 0.0 || p.czbdsw > 0.0 || p.czbs > 0.0 || p.czbssw > 0.0;
     return p;
