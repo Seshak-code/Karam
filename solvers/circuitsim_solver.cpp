@@ -850,8 +850,8 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   forEachJunction(netlist, [&](const Junction &j) {
     if (!junctionHasCharge(j)) return;
     auto V = [&](int k) { return j.n[k] > 0 ? lastSolution_[j.n[k] - 1] : 0.0; };
-    const int *from = j.d ? diodeFrom : bjtFrom, *to = j.d ? diodeTo : bjtTo;
-    const double type = j.q ? (j.q->isNPN ? 1.0 : -1.0) : 1.0;
+    const int *from = j.d ? diodeFrom : j.f ? jfetFrom : bjtFrom, *to = j.d ? diodeTo : j.f ? jfetTo : bjtTo;
+    const double type = j.q ? (j.q->isNPN ? 1.0 : -1.0) : j.f ? jfetType(*j.f) : 1.0;
     for (int u = 0; u < j.terms; ++u) {
       if (j.n[u] <= 0) continue;
       bool seen = false;
@@ -972,15 +972,11 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
       const double gm = mos1_currents(Dual<double>(V(d)), Dual<double>(V(g), 1.0), Dual<double>(V(s)),
                                       Dual<double>(V(b)), mos1Params(m)).d.grad;
       gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
-    }
-    for (const auto &j : blk.jfets) {
-      const int d = sl.map(j.drain), g = sl.map(j.gate), s = sl.map(j.source);
-      const double sign = j.isNChannel ? 1.0 : -1.0;
-      JFETParams<double> p;
-      p.Beta = j.beta; p.Vto = j.Vto; p.Lambda = j.lambda;
-      const double gm = jfet_ids(Dual<double>(sign * (V(g) - V(s)), 1.0),
-                                 Dual<double>(sign * (V(d) - V(s)), 0.0), p).grad;
-      gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
+      if (m.card.kf != 0.0) {  // flicker (ngspice mos1noise, as probed): 1e-3 KF |Id| / (Cox W Leff M f^AF)
+        const auto p = mos1Params(m);
+        const double id = std::abs(mos1_currents(V(d), V(g), V(s), V(b), p).d);
+        gens.push_back({d, s, 0.0, [k = 1e-3 * m.card.kf * id / p.cox, af = m.card.af](double f) { return k / std::pow(f, af); }});
+      }
     }
   }
   // Diodes / BJTs (ngspice dionoise, bjtnoise): series-resistance thermal noise,
@@ -994,6 +990,19 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
       gens.push_back({j.n[2], j.n[1], q2 * std::abs(id)});
       if (j.d->card.kf != 0.0)  // flicker: KF |Id|^AF / f
         gens.push_back({j.n[2], j.n[1], 0.0, [kf = j.d->card.kf, af = j.d->card.af, id = std::abs(id)](double f) {
+                          return kf * std::pow(std::max(id, 1e-38), af) / f; }});
+      return;
+    }
+    if (j.f) {  // ngspice jfetnoi: channel 8kT gm/3 and flicker KF |Id|^AF / f between D and S (RD, RS are resistors)
+      const auto m = jfetModel(*j.f, tempK);
+      const double t = m.type;
+      auto eval = [&](double dv) {  // dv: vgs and vgd move together, i.e. vds is fixed (gm)
+        return jfet_eval(Dual<double>(t * (V(j.n[1]) - V(j.n[2])), dv), Dual<double>(t * (V(j.n[1]) - V(j.n[0])), dv), m);
+      };
+      const auto e = eval(0.0);
+      gens.push_back({j.n[0], j.n[2], kT4 * (2.0 / 3.0) * std::abs(eval(1.0).id.grad)});
+      if (j.f->card.kf != 0.0)
+        gens.push_back({j.n[0], j.n[2], 0.0, [kf = j.f->card.kf, af = j.f->card.af, id = std::abs(e.id.val)](double f) {
                           return kf * std::pow(std::max(id, 1e-38), af) / f; }});
       return;
     }

@@ -112,7 +112,8 @@ struct Capacitor {
     double width_m = 0.0;
     double length_m = 0.0;
     double m = 1.0;               // Multiplier
-    
+    double tc1 = NAN, tc2 = NAN;  // instance TC1/TC2 (NaN: the model's); act through a model TNOM only
+
     double tolerance_percent = 0.0;
     std::string expression;         // Symbolic override for capacitance
 
@@ -679,6 +680,8 @@ struct Mosfet {
         double cgso = 0.0, cgdo = 0.0, cgbo = 0.0;          // overlap [F/m]
         double cbd = 0.0, cbs = 0.0, cj = 0.0, cjsw = 0.0;  // bulk junctions [F, F/m^2, F/m]
         double mj = 0.5, mjsw = 0.33, pb = 0.8, fc = 0.5;
+        double js = 0.0;                                    // bulk junction saturation current density [A/m^2]
+        double kf = 0.0, af = 1.0;                          // flicker noise (AF is the frequency exponent in ngspice mos1noise)
     } card;
 
     // Noise Parameters
@@ -760,8 +763,15 @@ struct JFET {
     double beta = 1e-4;                   // Transconductance parameter [A/V^2]
     double Vto = -2.0;                    // Pinch-off voltage [V] (negative for N-ch)
     double lambda = 0.01;                 // Channel-length modulation [1/V]
-    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM; // For gate-source diode (optional)
-    
+    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM; // gate junctions: Vt (N applied below)
+
+    // ngspice level 1 .model values beyond BETA/VTO/LAMBDA, resolved by the parser; area = AREA * M
+    // (scales BETA, IS, CGS, CGD; RD and RS become parser-added series resistors)
+    struct Card {
+        double is = 1e-14, n = 1.0, b = 1.0, cgs = 0.0, cgd = 0.0, pb = 1.0, fc = 0.5, kf = 0.0, af = 1.0;
+    } card;
+    double area = 1.0;
+
     double temperature_K = 300.15;
 };
 
@@ -1249,7 +1259,7 @@ struct BlockState {
     std::vector<History> capacitorState;
     std::vector<History> inductorState;
     std::vector<History> powerRailState;
-    std::vector<DeviceCharge> mosfetState, diodeState, bjtState;
+    std::vector<DeviceCharge> mosfetState, diodeState, bjtState, jfetState;
     std::vector<char> swOn, swPrev;  // per Switch: the state the last stamp used / the last accepted one
     std::vector<std::shared_ptr<osdi::Instance>> osdiState;  // per OsdiDevice (TensorNetlist::instantiateOsdi)
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
@@ -1272,6 +1282,7 @@ struct BlockState {
         mosfetState.resize(block.mosfets.size());
         diodeState.resize(block.diodes.size());
         bjtState.resize(block.bjts.size());
+        jfetState.resize(block.jfets.size());
         osdiState.resize(block.osdiDevices.size());
         busProbeState.resize(block.busProbes.size());
     }

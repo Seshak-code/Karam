@@ -38,6 +38,7 @@ inline Mos1Params<double> mos1Params(const Mosfet& m) {
     p.vto = c.vto; p.lambda = c.lambda; p.gamma = c.gamma; p.phi = c.phi;
     p.beta = c.kp * m.w / leff * M;
     p.isat = c.is * M;
+    if (c.js > 0.0 && m.geo.ad > 0.0 && m.geo.as > 0.0) { p.isat = c.js * m.geo.ad * M; p.isats = c.js * m.geo.as * M; }  // ngspice mos1temp
     p.cox = c.tox > 0.0 ? 3.9 * 8.854214871e-12 / c.tox * m.w * leff * M : 0.0;
     p.cgso = c.cgso * m.w * M; p.cgdo = c.cgdo * m.w * M; p.cgbo = c.cgbo * leff * M;
     // CBD/CBS win over CJ * area (ngspice mos1temp)
@@ -76,6 +77,18 @@ inline DiodeModel<double> diodeModel(const Diode& d, double tempK = 300.15) {
     p.ikf = c.ikf * d.area; p.ikr = c.ikr * d.area;
     p.breakdown = c.bvGiven;
     if (p.breakdown) p.xbv = diode_breakdown_xbv(c.bv, c.ibv * d.area, p.is, p.vte);
+    return p;
+}
+
+inline JfetModel<double> jfetModel(const JFET& j, double tempK = 300.15) {
+    const auto& c = j.card;
+    double vt = j.thermalVoltage_V_T_V, is = c.is;
+    if (tempK != 300.15) junctionAtTemp(tempK, vt, is);
+    JfetModel<double> p;
+    p.type = j.isNChannel ? 1.0 : -1.0;
+    p.beta = j.beta * j.area; p.vto = j.Vto; p.lambda = j.lambda; p.b = c.b;
+    p.is = is * j.area; p.vt = c.n * vt;
+    p.cgs = c.cgs * j.area; p.cgd = c.cgd * j.area; p.pb = c.pb; p.fc = c.fc;
     return p;
 }
 

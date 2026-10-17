@@ -161,6 +161,7 @@ struct Mos1Params {
     P czbd = 0.0, czbdsw = 0.0;              // bulk-drain zero-bias bottom, sidewall
     P czbs = 0.0, czbssw = 0.0;              // bulk-source
     P mj = 0.5, mjsw = 0.5, pb = 0.8, fc = 0.5;
+    P isats = -1.0;     // source junction saturation current; < 0: same as the drain's (isat)
 };
 
 // Threshold (type domain) at bulk bias vbx: VBS in normal mode, VBD reversed.
@@ -183,9 +184,9 @@ inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>
     const P type = p.polarity;
     const T vgs = type * (vg - vs), vds = type * (vd - vs), vbs = type * (vb - vs);
     const T vbd = vbs - vds, vgd = vgs - vds;
-    const DiodeParams<P> junction = {p.isat, P(1.0), p.vt};
-    const T cbs = diode_model_pair(vbs, junction).first;
-    const T cbd = diode_model_pair(vbd, junction).first;
+    const DiodeParams<P> jd = {p.isat, P(1.0), p.vt}, js = {p.isats < P(0.0) ? p.isat : p.isats, P(1.0), p.vt};
+    const T cbs = diode_model_pair(vbs, js).first;
+    const T cbd = diode_model_pair(vbd, jd).first;
 
     const bool normal = vds >= P(0.0);          // mode: the higher terminal is the drain
     const T vgst = (normal ? vgs : vgd) - mos1_von(normal ? vbs : vbd, p);
@@ -426,48 +427,51 @@ inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
 }
 
 // ============================================================================
-// JFET (SHICHMAN-HODGES) PHYSICS
+// JFET (ngspice level 1: Shichman-Hodges with B, gate junctions, depletion charges)
 // ============================================================================
 
-template <typename T>
-struct JFETParams 
-{
-    T Beta;   // Transconductance parameter [A/V^2]
-    T Vto;    // Threshold Voltage [V] (Negative for N-Channel)
-    T Lambda; // Channel Length Modulation [1/V]
-    T Is;     // Gate Junction Saturation Current [A]
-    T N;      // Gate Junction Emission Coefficient
-    T Vt;     // Thermal Voltage [V]
+// Parameters resolved (AREA applied; RD / RS are series resistors added by the parser).
+template <typename P>
+struct JfetModel {
+    P type = 1.0;                                      // +1 NJF, -1 PJF
+    P beta = 1e-4, vto = -2.0, lambda = 0.0, b = 1.0;  // BETA*AREA, VTO, LAMBDA, B
+    P is = 1e-14, vt = PhysicsConstants::V_THERMAL_NOM; // IS*AREA, N*Vt (gate junctions)
+    P cgs = 0.0, cgd = 0.0, pb = 1.0, fc = 0.5;        // CGS*AREA, CGD*AREA, PB, FC
 };
 
-/**
- * jfet_ids
- * Computes Drain-Source current for JFET.
- * Assumes N-Channel. For P-Channel, flip voltage signs before calling.
- */
+// Drain current of the normal mode (vds >= 0) at overdrive vgst (ngspice jfetload).
 template <typename T, typename P>
-inline T jfet_ids(T vgs, T vds, const JFETParams<P>& p) 
+inline T jfet_channel(T vgst, T vds, const JfetModel<P>& p)
 {
-    // 1. Gate Leakage (Diode) - Simplified
-    // Typically small, ignored in simple models, but physically exists.
-    // Here we focus on Channel Current.
-
-    T vds_sat = vgs - p.Vto;
-    T beta = p.Beta; // area scaled by caller if needed
-    
-    // N-Channel: Vto is negative. Vgs usually negative.
-    // Cutoff: Vgs <= Vto
-    
-    if (vgs <= p.Vto) return 0.0;
-    
-    if (vds <= vds_sat) {
-        // Linear Region
-        return beta * vds * (T(2.0) * (vgs - p.Vto) - vds) * (T(1.0) + p.Lambda * vds);
-    } else {
-        // Saturation Region
-        T vov = vgs - p.Vto;
-        return beta * vov * vov * (T(1.0) + p.Lambda * vds);
+    if (vgst <= P(0.0)) return T(0.0);
+    const T betap = p.beta * (1.0 + p.lambda * vds);
+    const P bfac = (1.0 - p.b) / (p.pb - p.vto);
+    if (vgst >= vds) {  // linear
+        const T apart = 2.0 * p.b + 3.0 * bfac * (vgst - vds);
+        return betap * (vds * (vds * (bfac * vds - p.b) + vgst * apart));
     }
+    return betap * (vgst * vgst * (p.b + bfac * vgst));  // saturation
+}
+
+// Currents in the type domain at gate junction voltages vgs, vgd: channel D->S, gate junctions G->S and
+// G->D (each with GMIN, as every junction). The inverse mode (vds < 0) mirrors the normal one.
+template <typename T> struct JfetEval { T id, igs, igd; };
+template <typename T, typename P>
+inline JfetEval<T> jfet_eval(T vgs, T vgd, const JfetModel<P>& p)
+{
+    const T vds = vgs - vgd;
+    JfetEval<T> r;
+    r.igs = spice_junction(vgs, p.is, p.vt) + PhysicsConstants::JUNCTION_GMIN * vgs;
+    r.igd = spice_junction(vgd, p.is, p.vt) + PhysicsConstants::JUNCTION_GMIN * vgd;
+    r.id = vds >= P(0.0) ? jfet_channel(vgs - p.vto, vds, p) : -jfet_channel(vgd - p.vto, -vds, p);
+    return r;
+}
+
+// Depletion charges of the gate-source and gate-drain junctions (grading 0.5).
+template <typename T, typename P>
+inline std::array<T, 2> jfet_charges(T vgs, T vgd, const JfetModel<P>& p)
+{
+    return {depletion_charge(vgs, p.cgs, P(0.5), p.pb, p.fc), depletion_charge(vgd, p.cgd, P(0.5), p.pb, p.fc)};
 }
 
 // ============================================================================

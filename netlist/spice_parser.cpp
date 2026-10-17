@@ -520,6 +520,89 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         result_.netlist.nodeICs.push_back({it->second, ic.value});
     }
 
+    auto card = [&](const std::string& model) -> const ModelCard* {
+        auto it = modelCards_.find(toUpper(model));
+        if (it == modelCards_.end()) throw std::runtime_error("model '" + model + "' is not defined");
+        return &it->second;
+    };
+    // A MOSFET's card: its own, or the bin of a family NAME.0, NAME.1, ... whose
+    // [LMIN, LMAX] x [WMIN, WMAX] holds the device's L and W. ngspice's rule (probed
+    // on ngspice 45): edges inclusive within 1e-9 m, total W (not W/NF), and on a
+    // shared edge the card defined last wins (its model list is newest-first).
+    auto mosCard = [&](const Mosfet& m) -> const ModelCard* {
+        const std::string name = toUpper(m.modelName);
+        if (modelCards_.count(name)) return card(m.modelName);
+        constexpr double eps = 1e-9;
+        const ModelCard* best = nullptr;
+        int bestLine = -1;
+        for (auto it = modelCards_.lower_bound(name + "."); it != modelCards_.end() &&
+             it->first.compare(0, name.size() + 1, name + ".") == 0; ++it) {
+            const ModelCard& c = it->second;
+            const int line = cardLine_[".MODEL/" + it->first];
+            if (line >= bestLine &&
+                c.get("LMIN", 0.0) - eps <= m.l && m.l <= c.get("LMAX", INFINITY) + eps &&
+                c.get("WMIN", 0.0) - eps <= m.w && m.w <= c.get("WMAX", INFINITY) + eps) { best = &c; bestLine = line; }
+        }
+        if (best) return best;
+        std::ostringstream why;
+        why << m.instanceName << ": no bin of model " << m.modelName << " covers L=" << m.l << " W=" << m.w;
+        throw std::runtime_error(why.str());
+    };
+    // RD / RS (or RSH * NRD / NRS) of a level 1 MOSFET are series resistors to internal nodes, added here
+    // before the X cards expand (a .subckt body gets local nodes, the top level global ones). ngspice
+    // gives RD precedence over RSH, and M parallel devices divide the resistance.
+    auto mosSeries = [&](TensorBlock& blk, bool top) {
+        const size_t n = blk.mosfets.size();
+        for (size_t k = 0; k < n; ++k) {
+            Mosfet& m = blk.mosfets[k];
+            const ModelCard* c;
+            try { c = mosCard(m); } catch (const std::exception&) { continue; }  // resolveBlock reports it
+            if (c->type != "NMOS" && c->type != "PMOS") continue;
+            if (const double lv = c->get("LEVEL", 1.0); lv == 54.0 || lv == 14.0) continue;
+            auto add = [&](int Mosfet::* term, const char* tag, double rd, double rs_, double nrx) {
+                const double r = rd > 0.0 ? rd : rs_ > 0.0 ? rs_ * (nrx > 0.0 ? nrx : 1.0) : 0.0;
+                if (r <= 0.0) return;
+                const int inner = top ? std::max(nextNode_++, result_.netlist.numGlobalNodes + 1) : ++blk.numInternalNodes;
+                if (top) result_.netlist.numGlobalNodes = std::max(result_.netlist.numGlobalNodes, inner);
+                Resistor res;
+                res.name = std::string(tag) + "#" + m.instanceName;
+                res.nodeTerminal1 = m.*term;
+                res.nodeTerminal2 = inner;
+                res.resistance_ohms = r / m.extra.mult;
+                blk.resistors.push_back(res);
+                m.*term = inner;
+            };
+            add(&Mosfet::drain, "RD", c->get("RD", 0.0), c->get("RSH", 0.0), m.geo.nrd);
+            add(&Mosfet::source, "RS", c->get("RS", 0.0), c->get("RSH", 0.0), m.geo.nrs);
+        }
+    };
+    // The same for a JFET's RD and RS (conductance scales with AREA)
+    auto jfetSeries = [&](TensorBlock& blk, bool top) {
+        for (JFET& j : blk.jfets) {
+            const auto it = modelCards_.find(toUpper(j.modelName));
+            if (it == modelCards_.end()) continue;  // resolveBlock reports it
+            auto add = [&](int JFET::* term, const char* tag, double r) {
+                if (r <= 0.0) return;
+                const int inner = top ? std::max(nextNode_++, result_.netlist.numGlobalNodes + 1) : ++blk.numInternalNodes;
+                if (top) result_.netlist.numGlobalNodes = std::max(result_.netlist.numGlobalNodes, inner);
+                Resistor res;
+                res.name = std::string(tag) + "#" + j.instanceName;
+                res.nodeTerminal1 = j.*term;
+                res.nodeTerminal2 = inner;
+                res.resistance_ohms = r / j.area;
+                blk.resistors.push_back(res);
+                j.*term = inner;
+            };
+            add(&JFET::drain, "RD", it->second.get("RD", 0.0));
+            add(&JFET::source, "RS", it->second.get("RS", 0.0));
+        }
+    };
+    try {
+        mosSeries(result_.netlist.globalBlock, true);
+        jfetSeries(result_.netlist.globalBlock, true);
+        for (auto& [name, blk] : result_.netlist.blockDefinitions) { mosSeries(blk, false); jfetSeries(blk, false); }
+    } catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
+
     // Expand X cards (recursively) now that every .subckt is defined
     for (const auto& pi : topInstances_) {
         try { expandInstance(pi, pi.nodes, 0); }
@@ -531,11 +614,6 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     // A card's missing parameters take SPICE defaults; a device with no card
     // keeps the engine defaults. PULSE TR/TF of 0 take TSTEP, as in SPICE.
     // An undefined model is an error (it used to fall back to engine defaults silently)
-    auto card = [&](const std::string& model) -> const ModelCard* {
-        auto it = modelCards_.find(toUpper(model));
-        if (it == modelCards_.end()) throw std::runtime_error("model '" + model + "' is not defined");
-        return &it->second;
-    };
     // A parameter the engine does not model is an error, never silently dropped.
     // 0 is accepted for any key (SPICE: off / infinite), AF only without KF.
     // ponytail: a 0 that is not "off" (e.g. TNOM=0) is still accepted.
@@ -564,29 +642,6 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                                  std::string(*types.begin()) + "/" + *(types.begin() + 1) + " model");
     };
     auto resolveBlock = [&](TensorBlock& blk) {
-        // A MOSFET's card: its own, or the bin of a family NAME.0, NAME.1, ... whose
-        // [LMIN, LMAX] x [WMIN, WMAX] holds the device's L and W. ngspice's rule (probed
-        // on ngspice 45): edges inclusive within 1e-9 m, total W (not W/NF), and on a
-        // shared edge the card defined last wins (its model list is newest-first).
-        auto mosCard = [&](const Mosfet& m) -> const ModelCard* {
-            const std::string name = toUpper(m.modelName);
-            if (modelCards_.count(name)) return card(m.modelName);
-            constexpr double eps = 1e-9;
-            const ModelCard* best = nullptr;
-            int bestLine = -1;
-            for (auto it = modelCards_.lower_bound(name + "."); it != modelCards_.end() &&
-                 it->first.compare(0, name.size() + 1, name + ".") == 0; ++it) {
-                const ModelCard& c = it->second;
-                const int line = cardLine_[".MODEL/" + it->first];
-                if (line >= bestLine &&
-                    c.get("LMIN", 0.0) - eps <= m.l && m.l <= c.get("LMAX", INFINITY) + eps &&
-                    c.get("WMIN", 0.0) - eps <= m.w && m.w <= c.get("WMAX", INFINITY) + eps) { best = &c; bestLine = line; }
-            }
-            if (best) return best;
-            std::ostringstream why;
-            why << m.instanceName << ": no bin of model " << m.modelName << " covers L=" << m.l << " W=" << m.w;
-            throw std::runtime_error(why.str());
-        };
         // BSIM4 cards (LEVEL=54 or 14, ngspice's native BSIM4) run on the OSDI BSIM4
         // (bsim4va from OpenVAF, loaded from TREESPICE_OSDI_PATH as bsim4.osdi when
         // needed). Its geometry parameters are model parameters there, so each card
@@ -673,7 +728,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                     cap.capacitance_farads = c->params.count("CAP") ? c->get("CAP", 0.0)
                                                                     : c->get("CJ", 0.0) * w * l + 2.0 * c->get("CJSW", 0.0) * (l + w);
                 const double d = 27.0 - c->get("TNOM", 27.0);
-                cap.capacitance_farads *= 1.0 + c->get("TC1", 0.0) * d + c->get("TC2", 0.0) * d * d;
+                cap.capacitance_farads *= 1.0 + (std::isnan(cap.tc1) ? c->get("TC1", 0.0) : cap.tc1) * d +
+                                          (std::isnan(cap.tc2) ? c->get("TC2", 0.0) : cap.tc2) * d * d;
                 cap.model_name.clear();
             } else if (std::isnan(cap.capacitance_farads)) throw std::runtime_error(cap.name + ": no value and no model");
             cap.capacitance_farads *= cap.m;  // was parsed and never applied
@@ -687,10 +743,13 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 continue;
             }
             if (m.extra.nf != 1) throw std::runtime_error(m.instanceName + ": NF is not supported yet (level 1)");
+            // RD, RS and RSH became series resistors in mosSeries(); JSSW is no MOS1 parameter in ngspice
+            // (it warns and ignores it), so it stays an error rather than a silently dropped one.
             supported(c, {"KP", "VTO", "LAMBDA", "GAMMA", "PHI", "IS", "LD", "TOX", "UO", "U0",
-                          "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC"});
+                          "CGSO", "CGDO", "CGBO", "CBD", "CBS", "CJ", "MJ", "CJSW", "MJSW", "PB", "FC",
+                          "RD", "RS", "RSH", "JS", "NSUB", "KF", "AF"});
             bounded(c, {"KP", "LAMBDA", "GAMMA", "IS", "LD", "TOX", "UO", "U0", "CGSO", "CGDO", "CGBO",
-                        "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW"},
+                        "CBD", "CBS", "CJ", "CJSW", "MJ", "MJSW", "RD", "RS", "RSH", "JS", "NSUB", "KF"},
                     {"PHI"});
             auto& k = m.card;
             k.resolved = true;
@@ -701,6 +760,24 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                                             : 2e-5);
             k.vto = c->get("VTO", 0.0); k.lambda = c->get("LAMBDA", 0.0); k.gamma = c->get("GAMMA", 0.0);
             k.phi = c->get("PHI", 0.6); k.is = c->get("IS", 1e-14); k.ld = c->get("LD", 0.0);
+            k.js = c->get("JS", 0.0); k.kf = c->get("KF", 0.0); k.af = c->get("AF", 1.0);
+            if (k.kf != 0.0 && !(k.tox > 0.0)) throw std::runtime_error("model " + c->name + ": KF needs TOX (flicker noise divides by the oxide capacitance)");
+            if (c->params.count("NSUB")) {
+                // ngspice mos1temp at TNOM = 27 C: PHI, GAMMA and VTO from the substrate doping unless given
+                // (aluminium-free n+ gate, NSS = 0)
+                const double nsub = c->get("NSUB", 0.0) * 1e6, vt = PhysicsConstants::V_THERMAL_NOM, type = k.pmos ? -1.0 : 1.0;
+                if (!(k.tox > 0.0) || !(nsub > 1.45e16))
+                    throw std::runtime_error("model " + c->name + ": NSUB needs TOX and NSUB > 1.45e10 cm^-3 (ni)");
+                const double cox = 3.9 * 8.854214871e-12 / k.tox, eg = 1.16 - 7.02e-4 * 300.15 * 300.15 / (300.15 + 1108.0);
+                if (!c->params.count("PHI")) k.phi = std::max(0.1, 2.0 * vt * std::log(nsub / 1.45e16));
+                if (!c->params.count("GAMMA"))
+                    k.gamma = std::sqrt(2.0 * 11.7 * 8.854214871e-12 * PhysicsConstants::Q_ELECTRON * nsub) / cox;
+                if (!c->params.count("VTO")) {
+                    const double fermis = type * 0.5 * k.phi, fermig = type * 0.5 * eg;
+                    const double wkfngs = (3.25 + 0.5 * eg - fermig) - (3.25 + 0.5 * eg + fermis);
+                    k.vto = wkfngs + type * (k.gamma * std::sqrt(k.phi) + k.phi);
+                }
+            }
             k.cgso = c->get("CGSO", 0.0); k.cgdo = c->get("CGDO", 0.0); k.cgbo = c->get("CGBO", 0.0);
             k.cbd = c->get("CBD", 0.0); k.cbs = c->get("CBS", 0.0); k.cj = c->get("CJ", 0.0);
             k.cjsw = c->get("CJSW", 0.0); k.mj = c->get("MJ", 0.5); k.mjsw = c->get("MJSW", 0.5);
@@ -782,11 +859,20 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             o.model = m;
         }
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
-            supported(c, {"BETA", "VTO", "LAMBDA"});
+            if (c->type != "NJF" && c->type != "PJF" && c->type != "NJFET" && c->type != "PJFET")
+                throw std::runtime_error(j.instanceName + ": model " + c->name + " is " + c->type + ", not an NJF/PJF model");
+            supported(c, {"BETA", "VTO", "LAMBDA", "IS", "N", "B", "CGS", "CGD", "PB", "FC", "KF", "AF", "RD", "RS"});
+            bounded(c, {"BETA", "LAMBDA", "IS", "CGS", "CGD", "KF", "RD", "RS"}, {"N", "B", "PB"});
             j.isNChannel = (c->type == "NJF" || c->type == "NJFET");
             j.beta   = c->get("BETA", 1e-4);
             j.Vto    = c->get("VTO", -2.0);
             j.lambda = c->get("LAMBDA", 0.0);
+            auto& k = j.card;
+            k.is = c->get("IS", 1e-14); k.n = c->get("N", 1.0); k.b = c->get("B", 1.0);
+            k.cgs = c->get("CGS", 0.0); k.cgd = c->get("CGD", 0.0); k.pb = c->get("PB", 1.0); k.fc = c->get("FC", 0.5);
+            k.kf = c->get("KF", 0.0); k.af = c->get("AF", 1.0);
+            if (!(k.fc < 1.0 && k.pb > j.Vto))
+                throw std::runtime_error("model " + c->name + ": needs FC < 1 and PB > VTO");
         }
         {
             const double ts = result_.tranStep;
@@ -905,6 +991,8 @@ void SPICEParser::parseCapacitor(const std::vector<std::string>& tok, TensorBloc
         if (upper == "W")      c.width_m  = parseValue(tok[++i]);
         else if (upper == "L") c.length_m = parseValue(tok[++i]);
         else if (upper == "M") c.m        = parseValue(tok[++i]);
+        else if (upper == "TC1") c.tc1 = parseValue(tok[++i]);
+        else if (upper == "TC2") c.tc2 = parseValue(tok[++i]);
         else if (upper == "IC") { c.ic_V = parseValue(tok[++i]); c.icGiven = true; }
         else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
@@ -1183,8 +1271,8 @@ void SPICEParser::parseSwitch(const std::vector<std::string>& tok, TensorBlock& 
 // J<name> <nd> <ng> <ns> <modelName>   (params from .model in parse())
 void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 5);
-    if (instanceArea(tok, 5) != 1.0) throw std::runtime_error(tok[0] + ": AREA scaling is not supported yet");
     JFET j;
+    j.area = instanceArea(tok, 5);
     j.instanceName = tok[0];
     j.drain  = nodeIndex(tok[1]);
     j.gate   = nodeIndex(tok[2]);
