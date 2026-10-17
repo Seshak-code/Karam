@@ -990,16 +990,23 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     if (j.d) {
       const auto m = diodeModel(*j.d, tempK);
       if (m.rs > 0.0) gens.push_back({j.n[0], j.n[2], kT4 / m.rs});
-      gens.push_back({j.n[2], j.n[1], q2 * std::abs(diode_iq(V(j.n[2]) - V(j.n[1]), m).first)});
+      const double id = diode_iq(V(j.n[2]) - V(j.n[1]), m).first;
+      gens.push_back({j.n[2], j.n[1], q2 * std::abs(id)});
+      if (j.d->card.kf != 0.0)  // flicker: KF |Id|^AF / f
+        gens.push_back({j.n[2], j.n[1], 0.0, [kf = j.d->card.kf, af = j.d->card.af, id = std::abs(id)](double f) {
+                          return kf * std::pow(std::max(id, 1e-38), af) / f; }});
       return;
     }
     const auto m = bjtModel(*j.q, tempK);
     if (m.rc > 0.0) gens.push_back({j.n[0], j.n[4], kT4 / m.rc});
-    if (m.rb > 0.0) gens.push_back({j.n[1], j.n[5], kT4 / m.rb});
     if (m.re > 0.0) gens.push_back({j.n[2], j.n[6], kT4 / m.re});
     const double t = m.type;
     const auto e = bjt_gp(t * (V(j.n[5]) - V(j.n[6])), t * (V(j.n[5]) - V(j.n[4])), t * (V(j.n[1]) - V(j.n[4])),
                           t * j.subSign * (V(j.n[3]) - V(j.n[j.sub])), m);
+    if (m.rb > 0.0) gens.push_back({j.n[1], j.n[5], kT4 / (m.varRb ? bjt_rbb(e.qb, e.cb, m) : m.rb)});
+    if (j.q->card.kf != 0.0)  // flicker: KF |Ib|^AF / f between B' and E'
+      gens.push_back({j.n[5], j.n[6], 0.0, [kf = j.q->card.kf, af = j.q->card.af, ib = std::abs(e.cb)](double f) {
+                        return kf * std::pow(std::max(ib, 1e-38), af) / f; }});
     gens.push_back({j.n[4], j.n[6], q2 * std::abs(e.cc)});
     gens.push_back({j.n[5], j.n[6], q2 * std::abs(e.cb)});
   });

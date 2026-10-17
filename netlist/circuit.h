@@ -567,10 +567,13 @@ struct Diode {
     // parser with SPICE defaults; area = the instance AREA factor.
     struct Card {
         double rs = 0.0, cjo = 0.0, vj = 1.0, m = 0.5, fc = 0.5, tt = 0.0;
+        double jsw = 0.0, ns = 1.0, cjsw = 0.0, mjsw = 0.33, php = 1.0, ikf = 0.0, ikr = 0.0;  // sidewall, knees
+        double kf = 0.0, af = 1.0;                                                            // flicker noise
         double bv = 0.0, ibv = 1e-3;
         bool bvGiven = false;
     } card;
     double area = 1.0;
+    double pj = 0.0, mult = 1.0;  // PJ= (sidewall perimeter) and M= (the sidewall terms scale by M, not by AREA)
 };
 
 /*
@@ -707,6 +710,8 @@ struct BJT {
         double nf = 1.0, nr = 1.0, vaf = 0.0, var = 0.0, ikf = 0.0, ikr = 0.0;
         double ise = 0.0, ne = 1.5, isc = 0.0, nc = 2.0;
         double rb = 0.0, rc = 0.0, re = 0.0;
+        double rbm = 0.0, irb = 0.0, nk = 0.5;                // RBM (= RB unless given), IRB, NK
+        double kf = 0.0, af = 1.0;                            // flicker noise
         double cje = 0.0, vje = 0.75, mje = 0.33, cjc = 0.0, vjc = 0.75, mjc = 0.33, xcjc = 1.0;
         double cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
         double iss = 0.0, ns = 1.0;                        // substrate junction

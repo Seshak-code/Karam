@@ -715,26 +715,30 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         // EG/XTI/XTB only act away from TNOM; the engine runs at TNOM.
         for (auto& d : blk.diodes) if (const ModelCard* c = kind(card(d.modelName), d.instanceName, {"D", "D"})) {
             supported(c, {"IS", "N", "RS", "CJO", "CJ0", "CJ", "VJ", "PB", "M", "MJ", "FC", "TT", "BV", "IBV",
-                          "EG", "XTI"});
-            bounded(c, {"IS", "RS", "CJO", "CJ0", "CJ", "M", "MJ", "TT"}, {"N", "BV"});  // ngspice: BV = 0 breaks down at 0 V
+                          "EG", "XTI", "JSW", "NS", "CJSW", "MJSW", "PHP", "IKF", "IK", "IKR", "KF", "AF"});
+            bounded(c, {"IS", "RS", "CJO", "CJ0", "CJ", "M", "MJ", "TT", "JSW", "CJSW", "MJSW", "IKF", "IK", "IKR", "KF"}, {"N", "BV", "NS", "PHP"});  // ngspice: BV = 0 breaks down at 0 V
             d.saturationCurrent_I_S_A = c->get("IS", 1e-14);
             d.emissionCoefficient_N   = c->get("N", 1.0);
             auto& k = d.card;
             k.rs = c->get("RS", 0.0); k.cjo = first(c, {"CJO", "CJ0", "CJ"}, 0.0);
             k.vj = first(c, {"VJ", "PB"}, 1.0); k.m = first(c, {"M", "MJ"}, 0.5);
             k.fc = c->get("FC", 0.5); k.tt = c->get("TT", 0.0);
+            k.jsw = c->get("JSW", 0.0); k.ns = c->get("NS", 1.0); k.cjsw = c->get("CJSW", 0.0);
+            k.mjsw = c->get("MJSW", 0.33); k.php = c->get("PHP", 1.0);
+            k.ikf = first(c, {"IKF", "IK"}, 0.0); k.ikr = c->get("IKR", 0.0);
+            k.kf = c->get("KF", 0.0); k.af = c->get("AF", 1.0);
             k.bvGiven = c->params.count("BV") > 0;  // BV > 0 (checked above)
             k.bv = c->get("BV", 0.0); k.ibv = c->get("IBV", 1e-3);
-            if (!(k.m < 1.0 && k.vj > 0.0 && k.fc < 1.0 && k.rs >= 0.0 && k.ibv > 0.0))
-                throw std::runtime_error("model " + c->name + ": needs M < 1, VJ > 0, FC < 1, RS >= 0, IBV > 0");
+            if (!(k.m < 1.0 && k.mjsw < 1.0 && k.vj > 0.0 && k.fc < 1.0 && k.rs >= 0.0 && k.ibv > 0.0))
+                throw std::runtime_error("model " + c->name + ": needs M, MJSW < 1, VJ > 0, FC < 1, RS >= 0, IBV > 0");
         }
         for (auto& q : blk.bjts) if (const ModelCard* c = kind(card(q.modelName), q.instanceName, {"NPN", "PNP"})) {
             supported(c, {"IS", "BF", "BR", "NF", "NR", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR",
                           "ISE", "NE", "ISC", "NC", "RB", "RC", "RE", "CJE", "VJE", "PE", "MJE", "ME",
                           "CJC", "VJC", "PC", "MJC", "MC", "XCJC", "CJS", "CCS", "VJS", "PS", "MJS", "MS",
-                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "ISS", "NS", "SUBS"});
+                          "FC", "TF", "XTF", "VTF", "ITF", "TR", "EG", "XTI", "XTB", "RBM", "IRB", "NK", "KF", "AF", "ISS", "NS", "SUBS"});
             bounded(c, {"IS", "VAF", "VA", "VAR", "VB", "IKF", "IK", "IKR", "ISE", "ISC", "CJE", "CJC", "CJS", "CCS",
-                        "MJE", "ME", "MJC", "MC", "MJS", "MS", "TF", "XTF", "VTF", "ITF", "TR", "ISS"},
+                        "MJE", "ME", "MJC", "MC", "MJS", "MS", "TF", "XTF", "VTF", "ITF", "TR", "ISS", "RBM", "IRB", "NK", "KF"},
                     {"NE", "NC", "NS"});
             q.isNPN = (c->type != "PNP");
             q.saturationCurrent_I_S_A = c->get("IS", 1e-16);
@@ -759,9 +763,8 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             k.lateral = subs == -1.0;
             k.tf = c->get("TF", 0.0); k.xtf = c->get("XTF", 0.0); k.vtf = c->get("VTF", 0.0);
             k.itf = c->get("ITF", 0.0); k.tr = c->get("TR", 0.0);
-            // RBM != RB makes the base resistance bias dependent (qb), which is not modelled
-            if (c->params.count("RBM") && c->params.at("RBM") != k.rb)
-                throw std::runtime_error("model " + c->name + ": RBM != RB (bias-dependent base resistance) is not supported yet");
+            k.rbm = c->get("RBM", k.rb); k.irb = c->get("IRB", 0.0); k.nk = c->get("NK", 0.5);
+            k.kf = c->get("KF", 0.0); k.af = c->get("AF", 1.0);
             if (!(k.mje < 1.0 && k.mjc < 1.0 && k.mjs < 1.0 && k.vje > 0.0 && k.vjc > 0.0 && k.vjs > 0.0 &&
                   k.fc < 1.0 && k.xcjc >= 0.0 && k.xcjc <= 1.0 && k.nf > 0.0 && k.nr > 0.0 &&
                   k.rb >= 0.0 && k.rc >= 0.0 && k.re >= 0.0 && q.betaF > 0.0 && q.betaR > 0.0))
@@ -1073,7 +1076,13 @@ void SPICEParser::parseCurrSrc(const std::vector<std::string>& tok, TensorBlock&
 void SPICEParser::parseDiode(const std::vector<std::string>& tok, TensorBlock& blk) {
     requireFields(tok, 4);
     Diode d;
-    d.area = instanceArea(tok, 4);
+    std::vector<std::string> rest(tok.begin(), tok.begin() + 4);  // PJ= is the sidewall perimeter; M= also scales it
+    for (size_t i = 4; i < tok.size(); ++i) {
+        const std::string k = toUpper(tok[i]);
+        if (k == "PJ" && i + 1 < tok.size() && isValue(tok[i + 1])) d.pj = parseValue(tok[++i]);
+        else { if (k == "M" && i + 1 < tok.size() && isValue(tok[i + 1])) d.mult = parseValue(tok[i + 1]); rest.push_back(tok[i]); }
+    }
+    d.area = instanceArea(rest, 4);
     d.instanceName = tok[0];
     d.anode = nodeIndex(tok[1]);
     d.cathode = nodeIndex(tok[2]);

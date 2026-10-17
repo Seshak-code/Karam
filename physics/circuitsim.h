@@ -956,7 +956,14 @@ public:
       auto res = [&](int a, int b, double r) {
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
       };
-      res(0, 4, p.rc); res(1, 5, p.rb); res(2, 6, p.re);
+      double rbb = p.rb;  // RBM != RB: the base resistance at this iterate's bias, held in the Jacobian (ngspice's gx)
+      if (p.varRb) {
+        auto dv = [](const T &v) { if constexpr (std::is_same_v<T, double>) return v; else return v.val; };
+        const auto ev = bjt_gp<double, double>(dv(shifted(T(type * (x[5] - x[6])), sh, 0)), dv(shifted(T(type * (x[5] - x[4])), sh, 1)),
+                                               dv(T(type * (x[1] - x[4]))), dv(T(type * j.subSign * (x[3] - x[j.sub]))), p);
+        rbb = bjt_rbb<double, double>(ev.qb, ev.cb, p);
+      }
+      res(0, 4, p.rc); res(1, 5, rbb); res(2, 6, p.re);
       const auto e = bjt_gp(shifted(T(type * (x[5] - x[6])), sh, 0), shifted(T(type * (x[5] - x[4])), sh, 1),
                             T(type * (x[1] - x[4])), T(type * j.subSign * (x[3] - x[j.sub])), p);
       I[4] += type * e.cc; I[5] += type * e.cb; I[6] -= type * (e.cc + e.cb);

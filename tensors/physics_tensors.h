@@ -71,6 +71,9 @@ inline DiodeModel<double> diodeModel(const Diode& d, double tempK = 300.15) {
     p.vte = d.emissionCoefficient_N * vt;
     p.rs = c.rs / d.area;
     p.cjo = c.cjo * d.area; p.vj = c.vj; p.m = c.m; p.fc = c.fc; p.tt = c.tt;
+    p.isw = c.jsw * d.pj * d.mult; p.vtesw = c.ns * vt;
+    p.cjsw = c.cjsw * d.pj * d.mult; p.mjsw = c.mjsw; p.vjsw = c.php;
+    p.ikf = c.ikf * d.area; p.ikr = c.ikr * d.area;
     p.breakdown = c.bvGiven;
     if (p.breakdown) p.xbv = diode_breakdown_xbv(c.bv, c.ibv * d.area, p.is, p.vte);
     return p;
@@ -89,6 +92,8 @@ inline BjtModel<double> bjtModel(const BJT& q, double tempK = 300.15) {
     p.oikf = c.ikf != 0.0 ? 1.0 / (c.ikf * a) : 0.0; p.oikr = c.ikr != 0.0 ? 1.0 / (c.ikr * a) : 0.0;
     p.ise = c.ise * a; p.vte = c.ne * vt; p.isc = c.isc * a; p.vtc = c.nc * vt;
     p.rb = c.rb / a; p.rc = c.rc / a; p.re = c.re / a;
+    p.varRb = c.rb > 0.0 && c.rbm != c.rb;
+    p.rbm = c.rbm / a; p.xjrb = c.irb * a; p.nk = c.nk;
     p.cje = c.cje * a; p.vje = c.vje; p.mje = c.mje;
     p.cjcInt = c.cjc * c.xcjc * a; p.cjcExt = c.cjc * (1.0 - c.xcjc) * a; p.vjc = c.vjc; p.mjc = c.mjc;
     p.cjs = c.cjs * a; p.vjs = c.vjs; p.mjs = c.mjs; p.fc = c.fc;

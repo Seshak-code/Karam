@@ -300,6 +300,9 @@ struct DiodeModel {
     P is = 1e-14, vte = PhysicsConstants::V_THERMAL_NOM;  // IS*AREA, N*Vt
     P rs = 0.0;                                            // RS/AREA (series, internal node)
     P cjo = 0.0, vj = 1.0, m = 0.5, fc = 0.5, tt = 0.0;    // CJO*AREA
+    P isw = 0.0, vtesw = PhysicsConstants::V_THERMAL_NOM;  // sidewall: JSW*PJ, NS*Vt
+    P cjsw = 0.0, mjsw = 0.33, vjsw = 1.0;                 // CJSW*PJ, MJSW, PHP
+    P ikf = 0.0, ikr = 0.0;                                // knee currents (IKF*AREA, IKR*AREA); 0: none
     bool breakdown = false; P xbv = 0.0;                    // BV adjusted so I(-BV) = IBV (diotemp)
 };
 
@@ -327,8 +330,15 @@ inline std::pair<T, T> diode_iq(T vd, const DiodeModel<P>& p)
     using std::exp;
     T cdb;
     if (p.breakdown && vd < -p.xbv) cdb = -p.is * exp(-(p.xbv + vd) / p.vte);
-    else cdb = spice_junction(vd, p.is, p.vte);
-    const T q = depletion_charge(vd, p.cjo, p.m, p.vj, p.fc) + p.tt * cdb;
+    else {
+        cdb = spice_junction(vd, p.is, p.vte);
+        // high-injection knees (ngspice dioload): forward IKF, reverse IKR; the bottom current only
+        using std::sqrt;
+        if (p.ikf > P(0.0) && cdb > T(0.0)) cdb = cdb / (1.0 + sqrt(cdb / p.ikf));
+        else if (p.ikr > P(0.0) && cdb < T(0.0)) cdb = cdb / (1.0 + sqrt(-cdb / p.ikr));
+        if (p.isw != P(0.0)) cdb = cdb + spice_junction(vd, p.isw, p.vtesw);
+    }
+    const T q = depletion_charge(vd, p.cjo, p.m, p.vj, p.fc) + depletion_charge(vd, p.cjsw, p.mjsw, p.vjsw, p.fc) + p.tt * cdb;
     return {cdb + PhysicsConstants::JUNCTION_GMIN * vd, q};
 }
 
@@ -342,6 +352,8 @@ struct BjtModel {
     P ise = 0.0, vte = 1.5 * PhysicsConstants::V_THERMAL_NOM; // ISE*AREA, NE*Vt
     P isc = 0.0, vtc = 2.0 * PhysicsConstants::V_THERMAL_NOM; // ISC*AREA, NC*Vt
     P rb = 0.0, rc = 0.0, re = 0.0;                            // per AREA; > 0: internal node
+    bool varRb = false; P rbm = 0.0, xjrb = 0.0;               // RBM != RB: RB falls to RBM with the base current (IRB*AREA = xjrb)
+    P nk = 0.5;                                                // high-current roll-off exponent
     P cje = 0.0, vje = 0.75, mje = 0.33;                        // *AREA
     P cjcInt = 0.0, cjcExt = 0.0, vjc = 0.75, mjc = 0.33;       // CJC*XCJC*AREA (B'-C'), rest (B-C')
     P cjs = 0.0, vjs = 0.75, mjs = 0.0, fc = 0.5;
@@ -353,7 +365,22 @@ struct BjtModel {
 // ISS diode + GMIN, as ngspice 4 bjtload: it exists even with ISS = 0) and the
 // four charges qbe (B'-E'), qbc (B'-C'), qbx (B-C'), qsub (S-C'), all in the
 // type domain, at junction voltages vbe, vbc (internal), vbx (external base), vsub.
-template <typename T> struct BjtEval { T cc, cb, cs, q[4]; };
+template <typename T> struct BjtEval { T cc, cb, cs, qb, q[4]; };
+
+// Base resistance of a bias-dependent RB (ngspice bjtload): RBM + (RB - RBM)/qb, or with IRB the
+// tan() law in the base current cb (qb is not used then).
+template <typename T, typename P>
+inline T bjt_rbb(T qb, T cb, const BjtModel<P>& p)
+{
+    using std::sqrt; using std::tan;
+    const P rbpi = p.rb - p.rbm;
+    if (p.xjrb == P(0.0)) return p.rbm + rbpi / qb;
+    T arg1 = cb / p.xjrb;
+    if (arg1 < T(1e-9)) arg1 = T(1e-9);
+    const T z = (-1.0 + sqrt(1.0 + 14.59025 * arg1)) / (2.4317 * sqrt(arg1));
+    const T t = tan(z);
+    return p.rbm + 3.0 * rbpi * (t - z) / (z * t * t);
+}
 
 template <typename T, typename P>
 inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
@@ -369,9 +396,10 @@ inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
     if (p.oikf != P(0.0) || p.oikr != P(0.0)) {
         T arg = 1.0 + 4.0 * (p.oikf * cbe + p.oikr * cbc);
         if (arg < P(0.0)) arg = T(0.0);
-        qb = q1 * (1.0 + sqrt(arg)) / 2.0;
+        qb = q1 * (1.0 + (p.nk == P(0.5) ? sqrt(arg) : pow(arg, p.nk))) / 2.0;
     }
     BjtEval<T> r;
+    r.qb = qb;
     r.cc = (cbe - cbc) / qb - cbc / p.br - cbcn;
     r.cb = cbe / p.bf + cben + cbc / p.br + cbcn;
     r.cs = (p.iss != P(0.0) ? spice_junction(vsub, p.iss, p.vts) : T(0.0)) + gmin * vsub;
