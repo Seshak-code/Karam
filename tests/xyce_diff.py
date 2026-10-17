@@ -68,9 +68,12 @@ DIALECT = {
 }
 
 # Cases the engine cannot do yet (a missing feature or a convergence limit), not a dialect: ngspice solves them.
+# Cases Xyce itself leaves out of normal testing
+EXCLUDED = {
+    "RLC_LADDER/rc_simple_xyce.cir": "performance test (its README: excluded from normal testing): 3000-stage RC, .tran 0.1u 1 = 1e7 steps",
+}
+
 OPEN = {
-    "SANDLER25/": "LM111 window detector: transient Newton fails at the 2.25 ms comparator flip (also with F in place of the "
-                  "B source, so it is the BJT macro, not B); ngspice completes",
     "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card: ngspice runs its BSIM4v5, the engine "
                   "BSIM4 4.8 (OSDI); v(1) 0.737 V vs ngspice 0.556 V, and ngspice with version=4.8 gives 0.739 V",
 }
@@ -106,6 +109,7 @@ def case(path, opts):
         if rel.startswith(key): return rel, "XYCE-DIALECT", why
     for key, why in OPEN.items():
         if rel.startswith(key): return rel, "ENGINE-LIMIT", why
+    if rel in EXCLUDED: return rel, "SKIPPED", EXCLUDED[rel]
     text = open(path, errors="ignore").read()
     full = expand(text, os.path.dirname(path))
     g = os.path.join(XYCE, "OutputData", rel + ".prn")

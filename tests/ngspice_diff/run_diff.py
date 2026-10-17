@@ -88,13 +88,6 @@ def node_map(text):
             if p < len(t) and t[p].upper() not in GROUND: m.setdefault(t[p].upper(), len(m) + 1)
     return m
 
-# Branch currents the engine gets wrong, with the node voltages fine (so only i() is skipped).
-NO_BRANCH_CHECK = {
-    "qa2_osdi_uic.cir": "UIC start: the engine seeds the OSDI charges at x0 (vdd node 0 V), the first step's inrush rings "
-                        "through trapezoidal integration forever (+-0.1 A on i(vdd)); ngspice solves the sources first",
-    "qa2_osdi_ic_ring.cir": "same UIC start",
-}
-
 def branch_names(text):
     """Top-level branch-current elements (ngspice name#branch): V, L, linear E, H and B voltage sources."""
     out, in_sub = [], False
@@ -363,7 +356,7 @@ def main():
         if missing:
             print(f"{'SKIPPED':<19} {name} (missing {', '.join(missing)}: datasets/osdi from tests/build_osdi.sh, datasets/pdk see ENGINE_HANDOFF)"); continue
         nm = node_map(text) if an[0] != "noise" else {}
-        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] != "noise" and name not in NO_BRANCH_CHECK else ())
+        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] != "noise" else ())
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             print(f"{'NGSPICE-ERROR':<19} {name} {e}"); fails += 1; continue
         for mode in args.modes.split(","):
