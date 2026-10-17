@@ -3,6 +3,7 @@
 // Prints: "CONVERGED <0|1>", "ERROR <text>", then one line per waveform point:
 //   <time> <v1> <v2> ...   (engine-internal node order)
 //   ac: <freq> <re1> <im1> <re2> <im2> ...
+//   (env TREESPICE_BASEDIR overrides the directory .include/.lib paths resolve against)
 //   noise: <freq> <onoise> <inoise> ... then "TOTAL <onoise_total> <inoise_total>"
 #include "engine_api/isimulation_engine.h"
 #include "engine_api/simulation_session.h"
@@ -29,6 +30,8 @@ int main(int argc, char** argv) {
     req.source.payload = ss.str();
     const std::string path = argv[1];
     req.source.baseDir = path.find('/') == std::string::npos ? "" : path.substr(0, path.rfind('/'));
+    // The harness runs a copy of the netlist; TREESPICE_BASEDIR points .include/.lib at the original directory.
+    if (const char* d = std::getenv("TREESPICE_BASEDIR")) req.source.baseDir = d;
     EngineCallbacks cb;
     std::string mode = argv[3];
     SimulationResponseDTO r;
