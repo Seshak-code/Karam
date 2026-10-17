@@ -180,6 +180,10 @@ public:
                 // ngspice truncates on charge with a floor (CHGTOL): a branch whose charge error at the
                 // voltage tolerance stays under it cannot limit the step. A comparator's fF junction
                 // capacitances, switching volts in a step, otherwise rejected it down to femtoseconds.
+                // ponytail: a voltage LTE scaled by the branch's charge sensitivity, not ngspice's CKTterr
+                // (divided differences of the charge against max(volttol, chargetol)); .options chgtol is
+                // not read. A direct CKTterr port is on mac/conv-cktterr: it moved the diode snap-off and
+                // MOS1 edges (qa_d_rev_rec, qa3_*), needing ngspice's order and breakpoint control as well.
                 const double lte_v = lteOf(y0, hist) * (cap >= 0.0 ? std::min(1.0, cap * trtol_ * tolerance_ / CHGTOL) : 1.0);
                 result.deviceRejects |= cap >= 0.0 && lte_v > trtol_ * tolerance_;
                 if (lte_v > result.maxLTE) {
