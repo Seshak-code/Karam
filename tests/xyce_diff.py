@@ -5,11 +5,12 @@
 
 For every Netlists/<dir>/<name>.cir with a gold OutputData/<dir>/<name>.cir.prn, run the engine for the
 netlist's .op/.dc/.tran (same runner and tolerances as tests/ngspice_diff/run_diff.py) and compare the
-single-node V(x) columns of the .prn (.ac: Re/Im(V(x))). .include/.lib run with their directory resolved
+single-node V(x) columns and the I(Vname)/I(Lname)/I(Ename)/I(Hname) branch currents of the .prn
+(.ac: Re/Im of each). .include/.lib run with their directory resolved
 (TREESPICE_BASEDIR, see cli/engine_dump_main.cpp). Statuses: PASS, FAIL, ENGINE-UNSUPPORTED (engine rejects a card or
 model parameter), PARSE-ERROR (Xyce syntax the parser lacks), TIMEOUT (--timeout), XYCE-DIALECT (gold follows Xyce-only
 semantics, listed in DIALECT), SKIPPED (a feature this comparison cannot judge: .step, multi-run
-output, a gold with no V(node) column (reason names the column kinds), HB/noise/...). Exit 1 on any FAIL.
+output, a gold with no V(node)/I(source) column (reason names the column kinds), HB/noise/...). Exit 1 on any FAIL.
 """
 import argparse, glob, os, re, sys, tempfile, types
 from concurrent.futures import ProcessPoolExecutor
@@ -48,6 +49,12 @@ DIALECT = {
     "MINDUCTORS/InductorICBug.cir": "gold prints V(2)=0 at t=0 (before the L IC acts) and steps straight to 0.1 ms; the "
                                     "engine resolves that interval and is within 1.7 mV of the exact "
                                     "-2.5(exp(-t/19.5ms)+exp(-t/0.5ms)) everywhere (the gold: 37 mV), as ngspice",
+    "Output/HOMOTOPY/homotopy-op-prn.cir": "LOCA continuation (.options loca conparam=R1): the gold is printed at the end of the run, R1 = 1500",
+    "IPULSE/": "values written 1A: Xyce reads amps, ngspice (and the engine) atto, so the source is 1e-18 A",
+    "IPWL/": "values written 1A: Xyce reads amps, ngspice (and the engine) atto",
+    "ISIN/": "values written 0.3A: Xyce reads amps, ngspice (and the engine) atto",
+    "IEXP/": "values written 1A/5A: Xyce reads amps, ngspice (and the engine) atto",
+    "CCCS/ftest.cir": "values written 1A: Xyce reads amps, ngspice (and the engine) atto",
     "MINCAPRES/mincr.cir": ".options DEVICE MINRES=1 gives the RS=0 diode 1 ohm (Xyce V(2a) = ngspice v(2b)); ngspice agrees with the engine",
     "LOAD/load.cir": "Xyce gold is 0.5 mV off ngspice near V4 = 54.7 V; the engine matches ngspice to 33 uV",
     "Certification_Tests/BUG_1962/ic2.cir": "gold samples every 0.5 ms; its first interval holds the .ic transient (tau 10 us), which a "
@@ -64,6 +71,8 @@ DIALECT = {
 OPEN = {
     "SANDLER25/": "LM111 window detector: transient Newton fails at the 2.25 ms comparator flip (also with F in place of the "
                   "B source, so it is the BJT macro, not B); ngspice completes",
+    "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card: ngspice runs its BSIM4v5, the engine "
+                  "BSIM4 4.8 (OSDI); v(1) 0.737 V vs ngspice 0.556 V, and ngspice with version=4.8 gives 0.739 V",
 }
 
 def gold(prn):
@@ -115,13 +124,20 @@ def case(path, opts):
     cols = {m.group(1).upper(): k for k, h in enumerate(head) if (m := re.fullmatch(pat, h, re.I))}
     named = sorted(cols)
     cols = {n: k for n, k in cols.items() if n in nm and (an[0] != "ac" or head[k + 1].lower() == f"im(v({n.lower()}))")}
-    if not cols or not rows:
+    br = rd.branch_names(full)  # I(name) of a top-level V/L/E/H: the engine's branch columns
+    ipat = r"Re\(I\((\w+)\)\)" if an[0] == "ac" else r"I\((\w+)\)"
+    icols = {f"i({m.group(1).lower()})": k for k, h in enumerate(head)
+             if (m := re.fullmatch(ipat, h, re.I)) and m.group(1).lower() in br
+             and (an[0] != "ac" or head[k + 1].lower() == f"im(i({m.group(1).lower()}))")}
+    nodes = set(cols)
+    cols.update(icols)
+    if not cols or not rows or (named and not nodes):  # V(x) columns that are no node: the gold is of another netlist
         hs = [h.upper() for h in head[2:]]
         if named: why = f"gold V({named[0].lower()}) is not a node of the netlist (stale gold or internal node)"
         elif any(h.startswith("{") for h in hs): why = "gold columns are .print expressions {...}"
         elif any(h.startswith("N(") for h in hs): why = "gold columns include N() device internal variables"
         elif any(re.match(r"(RE\(|IM\()?I[A-Z]?\(", h) for h in hs):
-            why = "gold has only branch-current columns I(...): engine dump prints node voltages, not MNA branch currents"
+            why = "gold has only device-current columns I(...) (I(R1), I(M1)...): not an element branch current"
         else: why = "no V(node) column in gold: " + " ".join(head[2:5])
         return rel, "SKIPPED", why
     xs = [] if an[0] == "op" else [r[1] for r in rows]
@@ -129,7 +145,7 @@ def case(path, opts):
             else {n: [r[k] for r in rows] for n, k in cols.items()})
     with tempfile.TemporaryDirectory(prefix="xyce_") as tmp:
         args = types.SimpleNamespace(**vars(opts), tmp=tmp, basedir=os.path.dirname(path))
-        st, wa, wr, note = rd.compare(args, text, an, "cpu", {n: nm[n] for n in cols}, (xs, vals))
+        st, wa, wr, note = rd.compare(args, text, an, "cpu", {n: nm[n] for n in nodes}, (xs, vals))
     if st == "FAIL" and "SPICE parse error" in note: st = "PARSE-ERROR"  # syntax the engine lacks
     if st == "FAIL" and "TIMEOUT" in note: st = "TIMEOUT"  # run-time limit, not an accuracy verdict
     return rel, st, f"worst abs={wa:.3g} V rel={wr:.3g}  {note}"

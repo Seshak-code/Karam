@@ -37,6 +37,7 @@ static std::string lower(std::string s) {
 SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   if (netlist.numGlobalNodes == 0)
     return {0.0, {}, {0, 0.0, true}, 0};
+  forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev; });
 
   // GPU mode currently solves on the CPU path: the former WebGPU "hybrid" loop
   // stamped and solved on the CPU anyway with its own copy of the device
@@ -145,7 +146,9 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
       matrixBuilder.setDimensions(nTot, nTot);
       rhsVector.assign(nTot, 0.0);
 
+      swForce_ = iteration == 0;
       stampAllElements(netlist, 0.0, voltageEstimate, 0.0);
+      swForce_ = false;
       addDiagonalConditioning(netlist.numGlobalNodes, gmin_factor);
       if (gmin_factor > 0.0) {  // device-internal nodes are nodes too (ngspice CKTdiagGmin)
         int totalRows = 0;
@@ -353,7 +356,9 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
     singularRow = lastPivotRow;
   }
 
-  if (!converged && finalSingular) {
+  bool anySwitch = false;
+  forEachSwitch(netlist, [&](const SwitchRef &, const std::array<int, 2> &) { anySwitch = true; });
+  if (!converged && (finalSingular || anySwitch)) {  // ngspice: a switch circuit without a DC state falls back to its transient OP
     // ngspice's defaults: 100 ns steps to 10 us (optran ... 100n 10u)
     srcFact_ = 1.0;  // source stepping may have left the sources scaled down
     TensorNetlist pseudo = netlist;
@@ -475,14 +480,17 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   // Gap 3: Save converged voltages for next solve's adaptive precision routing
   // Gap 4: Record solution in neural seeder history
   if (converged) {
+    acceptSwitches(netlist);
     prevVoltages_ = voltageEstimate;
     neuralSeeder_.recordSolution(voltageEstimate, final_kcl_error,
                                  total_iterations);
   }
 
   lastSolution_ = voltageEstimate;  // full x (incl. branch currents) seeds transient
+  std::vector<double> branches(voltageEstimate.begin() + std::min<size_t>(netlist.numGlobalNodes, voltageEstimate.size()),
+                               voltageEstimate.begin() + std::min<size_t>(netlist.numGlobalNodes + branchCount(netlist), voltageEstimate.size()));
   voltageEstimate.resize(netlist.numGlobalNodes);  // API returns node voltages
-  return {0.0, voltageEstimate, stats, netlist.globalBlock.topologyHash};
+  return {0.0, voltageEstimate, stats, netlist.globalBlock.topologyHash, std::move(branches)};
 }
 
 // =============================================================================
@@ -567,6 +575,7 @@ void CircuitSim::updateReactiveHistory(TensorNetlist &netlist, const std::vector
     if (st) mosCurrents<double>({getV(n[0]), getV(n[1]), getV(n[2]), getV(n[3])}, mos1Params(m), st, h,
                                 const_cast<BlockState::DeviceCharge *>(st));
   });
+  acceptSwitches(netlist);
   // Diode / BJT charges, likewise (junctionCurrents with next = st)
   forEachJunction(netlist, [&](const Junction &j) {
     if (!j.st) return;
@@ -702,9 +711,9 @@ void CircuitSim::tranCorners(const TensorNetlist &netlist) {
   corners.clear();
   auto addCorners = [&](const TensorBlock &b) {
     for (const auto &v : b.voltageSources)
-      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
+      if (v.type == "PULSE" || v.type == "SINE" || v.type == "PWL" || v.type == "EXP" || v.type == "AM") corners.push_back([&v](double x) { return nextBreakpoint(v, x); });
     for (const auto &i : b.currentSources)
-      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
+      if (i.type == "PULSE" || i.type == "SINE" || i.type == "PWL" || i.type == "EXP" || i.type == "AM") corners.push_back([&i](double x) { return nextBreakpoint(i, x); });
   };
   addCorners(netlist.globalBlock);
   for (const auto &[name, blk] : netlist.blockDefinitions) addCorners(blk);
@@ -725,6 +734,7 @@ std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool
   osdiNonFinite_.clear();
   applyOptions(netlist.environment);
   setIntegrationMethod(tranMethod_);
+  forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev = w.s->init; });
   const int nTot = systemSize(netlist);
   std::vector<double> x0(nTot, 0.0);
   if (uic) {
@@ -880,11 +890,23 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   rhsVector.assign(sys.n, 0.0);
   applyOptions(netlist.environment);
   limitJunctions_ = false;  // the Jacobian at the operating point itself
+  swAcOff_ = true;
   acLines_ = true;
   stampAllElements(netlist, 0.0, lastSolution_, 0.0);
   acLines_ = false;
+  swAcOff_ = false;
   addDiagonalConditioning(netlist.numGlobalNodes, 0.0);  // rshunt only
   limitJunctions_ = true;
+  int rtotal = 0;
+  for (const auto &sl : branchSlots(netlist, rtotal))  // AC=: the resistance .ac sees instead of R
+    for (const auto &r : sl.blk->resistors) {
+      if (std::isnan(r.ac_ohms)) continue;
+      const double dg = 1.0 / r.ac_ohms - 1.0 / r.resistance_ohms;
+      const int a = sl.map(r.nodeTerminal1), b = sl.map(r.nodeTerminal2);
+      if (a > 0) matrixBuilder.add(a - 1, a - 1, dg);
+      if (b > 0) matrixBuilder.add(b - 1, b - 1, dg);
+      if (a > 0 && b > 0) { matrixBuilder.add(a - 1, b - 1, -dg); matrixBuilder.add(b - 1, a - 1, -dg); }
+    }
   sys.G = matrixBuilder.createCsr();
   auto addC = [&](int r, int c, double v) {
     if (r >= 0 && c >= 0) { sys.cr.push_back(r); sys.cc.push_back(c); sys.cv.push_back(v); }
@@ -936,8 +958,8 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   forEachJunction(netlist, [&](const Junction &j) {
     if (!junctionHasCharge(j)) return;
     auto V = [&](int k) { return j.n[k] > 0 ? lastSolution_[j.n[k] - 1] : 0.0; };
-    const int *from = j.d ? diodeFrom : bjtFrom, *to = j.d ? diodeTo : bjtTo;
-    const double type = j.q ? (j.q->isNPN ? 1.0 : -1.0) : 1.0;
+    const int *from = j.d ? diodeFrom : j.f ? jfetFrom : bjtFrom, *to = j.d ? diodeTo : j.f ? jfetTo : bjtTo;
+    const double type = j.q ? (j.q->isNPN ? 1.0 : -1.0) : j.f ? jfetType(*j.f) : 1.0;
     for (int u = 0; u < j.terms; ++u) {
       if (j.n[u] <= 0) continue;
       bool seen = false;
@@ -1057,21 +1079,19 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     const auto &blk = *sl.blk;
     for (const auto &rr : blk.resistors)
       gens.push_back({sl.map(rr.nodeTerminal1), sl.map(rr.nodeTerminal2), kT4 / rr.resistance_ohms});
+    for (const auto &sw : blk.switches)  // thermal noise of the conductance the small-signal matrix holds (ROFF)
+      gens.push_back({sl.map(sw.nodePos), sl.map(sw.nodeNeg), kT4 / sw.roff});
     for (const auto &m : blk.mosfets) {
       const int d = sl.map(m.drain), g = sl.map(m.gate), s = sl.map(m.source), b = sl.map(m.body);
       // channel gm = dI_drain/dV_gate (the bulk junctions do not see the gate)
       const double gm = mos1_currents(Dual<double>(V(d)), Dual<double>(V(g), 1.0), Dual<double>(V(s)),
                                       Dual<double>(V(b)), mos1Params(m)).d.grad;
       gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
-    }
-    for (const auto &j : blk.jfets) {
-      const int d = sl.map(j.drain), g = sl.map(j.gate), s = sl.map(j.source);
-      const double sign = j.isNChannel ? 1.0 : -1.0;
-      JFETParams<double> p;
-      p.Beta = j.beta; p.Vto = j.Vto; p.Lambda = j.lambda;
-      const double gm = jfet_ids(Dual<double>(sign * (V(g) - V(s)), 1.0),
-                                 Dual<double>(sign * (V(d) - V(s)), 0.0), p).grad;
-      gens.push_back({d, s, kT4 * (2.0 / 3.0) * std::abs(gm)});
+      if (m.card.kf != 0.0) {  // flicker (ngspice mos1noise, as probed): 1e-3 KF |Id| / (Cox W Leff M f^AF)
+        const auto p = mos1Params(m);
+        const double id = std::abs(mos1_currents(V(d), V(g), V(s), V(b), p).d);
+        gens.push_back({d, s, 0.0, [k = 1e-3 * m.card.kf * id / p.cox, af = m.card.af](double f) { return k / std::pow(f, af); }});
+      }
     }
   }
   // Diodes / BJTs (ngspice dionoise, bjtnoise): series-resistance thermal noise,
@@ -1080,16 +1100,36 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
     if (j.d) {
       const auto m = diodeModel(*j.d);
       if (m.rs > 0.0) gens.push_back({j.n[0], j.n[2], kT4 / m.rs});
-      gens.push_back({j.n[2], j.n[1], q2 * std::abs(diode_iq(V(j.n[2]) - V(j.n[1]), m).first)});
+      const double id = diode_iq(V(j.n[2]) - V(j.n[1]), m).first;
+      gens.push_back({j.n[2], j.n[1], q2 * std::abs(id)});
+      if (j.d->card.kf != 0.0)  // flicker: KF |Id|^AF / f
+        gens.push_back({j.n[2], j.n[1], 0.0, [kf = j.d->card.kf, af = j.d->card.af, id = std::abs(id)](double f) {
+                          return kf * std::pow(std::max(id, 1e-38), af) / f; }});
+      return;
+    }
+    if (j.f) {  // ngspice jfetnoi: channel 8kT gm/3 and flicker KF |Id|^AF / f between D and S (RD, RS are resistors)
+      const auto m = jfetModel(*j.f);
+      const double t = m.type;
+      auto eval = [&](double dv) {  // dv: vgs and vgd move together, i.e. vds is fixed (gm)
+        return jfet_eval(Dual<double>(t * (V(j.n[1]) - V(j.n[2])), dv), Dual<double>(t * (V(j.n[1]) - V(j.n[0])), dv), m);
+      };
+      const auto e = eval(0.0);
+      gens.push_back({j.n[0], j.n[2], kT4 * (2.0 / 3.0) * std::abs(eval(1.0).id.grad)});
+      if (j.f->card.kf != 0.0)
+        gens.push_back({j.n[0], j.n[2], 0.0, [kf = j.f->card.kf, af = j.f->card.af, id = std::abs(e.id.val)](double f) {
+                          return kf * std::pow(std::max(id, 1e-38), af) / f; }});
       return;
     }
     const auto m = bjtModel(*j.q);
     if (m.rc > 0.0) gens.push_back({j.n[0], j.n[4], kT4 / m.rc});
-    if (m.rb > 0.0) gens.push_back({j.n[1], j.n[5], kT4 / m.rb});
     if (m.re > 0.0) gens.push_back({j.n[2], j.n[6], kT4 / m.re});
     const double t = m.type;
     const auto e = bjt_gp(t * (V(j.n[5]) - V(j.n[6])), t * (V(j.n[5]) - V(j.n[4])), t * (V(j.n[1]) - V(j.n[4])),
                           t * j.subSign * (V(j.n[3]) - V(j.n[j.sub])), m);
+    if (m.rb > 0.0) gens.push_back({j.n[1], j.n[5], kT4 / (m.varRb ? bjt_rbb(e.qb, e.cb, m) : m.rb)});
+    if (j.q->card.kf != 0.0)  // flicker: KF |Ib|^AF / f between B' and E'
+      gens.push_back({j.n[5], j.n[6], 0.0, [kf = j.q->card.kf, af = j.q->card.af, ib = std::abs(e.cb)](double f) {
+                        return kf * std::pow(std::max(ib, 1e-38), af) / f; }});
     gens.push_back({j.n[4], j.n[6], q2 * std::abs(e.cc)});
     gens.push_back({j.n[5], j.n[6], q2 * std::abs(e.cb)});
   });
@@ -1305,6 +1345,8 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
 
   if (!isFirstTransientStepHandled) {
     while (attempt < MAX_ATTEMPTS) {
+      // each attempt starts from the accepted switch states
+      forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { *w.on = *w.prev; });
       integrator->prepareStep(actualTimeStep);
 
       const int nTot = systemSize(netlist);
@@ -1363,6 +1405,16 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       if (!nrConverged) {
         actualTimeStep *= 0.5;
         attempt++;
+        continue;
+      }
+
+      // A switch toggled in a step much longer than the step/200 resolution: bisect to the
+      // crossing. ngspice (whose steps are what the user's tstep allows) toggles at the end of
+      // whichever step crosses; this lands within step/200 of the threshold instead.
+      bool toggled = false;
+      forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &) { toggled = toggled || *w.on != *w.prev; });
+      if (toggled && tran_.step > 0.0 && actualTimeStep > tran_.step / 200.0) {
+        actualTimeStep *= 0.5;
         continue;
       }
 
@@ -1496,12 +1548,15 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   neuralSeeder_.recordSolution(finalVoltages, lastResult.finalResidual,
                                lastResult.iterations);
   lastSolution_ = finalVoltages;                    // full x seeds the next step
+  std::vector<double> branches(finalVoltages.begin() + std::min<size_t>(netlist.numGlobalNodes, finalVoltages.size()),
+                               finalVoltages.begin() + std::min<size_t>(netlist.numGlobalNodes + branchCount(netlist), finalVoltages.size()));
   finalVoltages.resize(netlist.numGlobalNodes);     // API returns node voltages
 
   return {
       currentTime + actualTimeStep,
       finalVoltages,
       {lastResult.iterations, lastResult.finalResidual, simulationConverged},
-      netlist.globalBlock.topologyHash};
+      netlist.globalBlock.topologyHash,
+      std::move(branches)};
 }
 

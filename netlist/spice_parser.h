@@ -26,6 +26,10 @@
 
 namespace acutesim {
 
+// .print / .save / .probe: kind 'p' (print) or 's' (save, probe); analysis "" (any), tran, ac, dc or op;
+// specs are the output expressions as written ("v(a,b)*2", "vdb(out)", "i(v1)"), "all" included.
+struct OutputRequest { char kind; std::string analysis; std::vector<std::string> specs; };
+
 // Diagnostics from a parse run.
 struct SPICEParseResult {
     TensorNetlist netlist;
@@ -33,6 +37,7 @@ struct SPICEParseResult {
     bool          success = true;
     std::string   errorMessage;
     int           errorLine = -1;
+    std::vector<OutputRequest> outputs;
 
     // Informational
     int           linesProcessed = 0;
@@ -101,6 +106,7 @@ private:
     void parseDiode      (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseMosfet     (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseBJT        (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseSwitch     (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseJFET       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseOsdiDevice (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
@@ -142,6 +148,7 @@ private:
     std::string      subcktName_;
     std::vector<std::string> subcktPorts_;
     TensorBlock      subcktBlock_;
+    std::map<std::string, std::map<std::string, int>> subcktNames_;  // subckt -> local node name -> index
     std::map<std::string, int> subcktNodeMap_;   // local node names of the body being parsed
     int              nextLocalNode_ = 1;
     struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; std::string name; };
@@ -149,14 +156,12 @@ private:
     struct PendingIC { std::string node; double value; int line; bool nodeset; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
     std::map<std::string, std::vector<PendingIC>> subcktICs_;   // .ic / .nodeset in a body (local names), applied per instance
-    std::map<std::string, std::vector<std::string>> subcktNames_;  // subckt -> name of local node l at [l-1]
-    std::map<std::string, int> hierNodes_;         // "X1.N" (upper case) -> global node, for subcircuit internals
     std::string noiseOut_, noiseRef_;              // .noise node names, resolved likewise
     std::set<std::string> globals_;                // .global node names
     std::map<std::string, std::map<int, std::string>> subcktGlobals_;  // subckt -> local index -> name
     std::map<std::string, std::vector<PendingInstance>> subcktChildren_;  // nodes are body-local
     std::map<std::string, int> savedInductorIndex_; // top-level K lookup, saved inside a body
-    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth, const std::string& path);
+    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth, const std::string& path = "");
 
     // Model cards collected during parse, merged into netlist at end
     std::map<std::string, ModelCard> modelCards_;

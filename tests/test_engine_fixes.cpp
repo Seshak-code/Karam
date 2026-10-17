@@ -520,6 +520,40 @@ int main() {
         check(bad == 0, ".param expressions: ngspice associativity, rounding, pwr, mil, errors for non-finite results");
     }
 
+    {   // Monte Carlo: samples differ, the same seed reproduces, the spread follows the distribution
+        auto mcRun = [](uint32_t seed, const char* dist, double sigma, double tol) {
+            auto engine = ISimulationEngine::create();
+            auto session = engine->createSession();
+            SimulationRequestDTO req;
+            req.source.payload = "mc\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 1k\n.end\n";
+            MonteCarloConfigDTO mc;
+            mc.sampleCount = 400; mc.seed = seed;
+            mc.variations = {{"R1", "resistance", sigma, dist, 0.0, tol}};
+            std::vector<double> v;
+            for (const auto& p : session->runMonteCarlo(req, mc).waveformPoints) v.push_back(p.nodeVoltages[1]);
+            return v;
+        };
+        const auto a = mcRun(7, "Gaussian", 0.05, 0), b = mcRun(7, "Gaussian", 0.05, 0), c = mcRun(8, "Gaussian", 0.05, 0);
+        const auto u = mcRun(7, "Uniform", 0, 0.10);
+        double lo = 1e9, hi = -1e9, mean = 0;
+        for (double x : u) { lo = std::min(lo, x); hi = std::max(hi, x); mean += x / u.size(); }
+        check(a.size() == 400 && a != std::vector<double>(400, a[0]), "Monte Carlo samples are not all identical");
+        check(a == b && a != c, "Monte Carlo: same seed reproduces, another seed differs");
+        // V2 = 10*R2/(R1+R2), R1 = 1k*(1 +/- 10%) -> V2 in [4.762, 5.263]
+        check(lo >= 4.76 && hi <= 5.27 && hi - lo > 0.4 && near(mean, 5.0, 0.05), "Monte Carlo: uniform stays within tolerance and fills it");
+        {   // a .dc TEMP sweep re-parses the netlist per temperature: each point keeps the sample's variation
+            auto engine = ISimulationEngine::create();
+            auto session = engine->createSession();
+            SimulationRequestDTO req;
+            req.source.payload = "mc\nV1 1 0 10\nR1 1 2 1k\nR2 2 0 1k\n.dc TEMP 0 100 100\n.end\n";
+            req.mc.variations = {{"R1", "resistance", 0.05, "Gaussian", 0.0, 0.0}};
+            req.mcSeed = 3;
+            const auto w = session->runDC(req).waveformPoints;
+            check(w.size() == 2 && w[0].nodeVoltages[1] == w[1].nodeVoltages[1] && std::abs(w[0].nodeVoltages[1] - 5.0) > 1e-6,
+                  "Monte Carlo variation survives the .dc TEMP re-parse");
+        }
+    }
+
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }
