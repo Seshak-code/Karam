@@ -604,7 +604,9 @@ struct Mosfet {
     int drain;                        // D terminal
     int gate;                         // G terminal
     int source;                       // S terminal
-    int body;                         // B (Bulk/Substrate) terminal
+    int body;                         // B (Bulk/Substrate) terminal; E (substrate) of a BSIM-SOI device
+    std::vector<int> soiNodes;        // BSIM-SOI P, B, T after E (M d g s e [p [b [t]]]), LEVEL 10/58 only
+    std::map<std::string, double> osdiParams;  // instance parameters only an OSDI model takes (BSIM-SOI SOIMOD, RTH0, ...)
     
     // Standard SPICE / PDK Parameters
     std::string modelName;                // .model reference (e.g., "nfet_01v8")

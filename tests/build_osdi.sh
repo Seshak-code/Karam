@@ -24,6 +24,14 @@ perl -0pe 's/(if \(!BSIM4wk1Given\)\s*BSIM4wk1 = 0\.0;\s*)if \(!BSIM4wk1Given\)\
   "$OPENVAF_DIR/integration_tests/BSIM4/bsim4.va" > "$tmp/bsim4.va"
 "$OPENVAF" "$tmp/bsim4.va" -o "$out/bsim4.osdi"
 "$OPENVAF" "$OPENVAF_DIR/integration_tests/BSIMCMG/bsimcmg.va" -o "$out/bsimcmg.osdi"
+# BSIM-SOI 4.6 (ngspice's native B4SOI, LEVEL 10/58, is 4.4; at SHMOD=0 they agree to 0.01 %, Gemini QA).
+"$OPENVAF" "$OPENVAF_DIR/integration_tests/BSIMSOI/bsimsoi.va" -o "$out/bsimsoi.osdi"
+# EKV 2.6 has no native ngspice model: ngspice runs it through OSDI only. ekv.va defaults TNOM to 25 C
+# (ngspice: 27), and declares L, W, M, NS, AS, AD, PS and PD as model parameters, so an instance cannot give them.
+perl -0pe 's/`define DEFAULT_TNOM 25\b/`define DEFAULT_TNOM 27/ or die "ekv.va: TNOM patch no longer applies\n";
+           s/^(\s*)parameter real (L|W|M|NS|AS|AD|PS|PD) =/$1(* type="instance" *) parameter real $2 =/mg == 8 or die "ekv.va: instance patch no longer applies\n"' \
+  "$OPENVAF_DIR/integration_tests/EKV/ekv.va" > "$tmp/ekv.va"
+"$OPENVAF" "$tmp/ekv.va" -o "$out/ekv.osdi"
 # IHP SG13G2's own PSP103 (module psp103va), when its PDK files are in datasets/pdk/ihp
 ihp="$out/../pdk/ihp/ihp-sg13g2/libs.tech/verilog-a/psp103/psp103.va"
 [ -f "$ihp" ] && "$OPENVAF" "$ihp" -o "$out/psp103.osdi"

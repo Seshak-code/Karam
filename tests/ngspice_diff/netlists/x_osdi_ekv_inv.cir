@@ -1,0 +1,13 @@
+* EKV 2.6 on OSDI: CMOS inverter transient and its supply current
+.osdi ekv.osdi
+VDD vdd 0 DC 3.3
+VIN in 0 PULSE(0 3.3 1n 0.2n 0.2n 4n 10n)
+N1 out in 0 0 nekv l=0.35u w=0.8u
+N2 out in vdd vdd pekv l=0.35u w=2u
+CL out 0 50f
+.model nekv ekv_va (type=1 tnom=27 cox=4.379e-3 xj=22.53n vto=0.5706 gamma=0.6707 phi=0.45 kp=232.1e-6
++ e0=42.216meg ucrit=3.146e6 lambda=0.2283 dl=-60.86n dw=-209.7n weta=2.001 leta=0.2646 q0=230e-6 lk=0.4e-6)
+.model pekv ekv_va (type=-1 tnom=27 cox=4.379e-3 xj=22.53n vto=-0.6 gamma=0.4 phi=0.45 kp=70e-6
++ e0=51meg ucrit=18e6 lambda=0.25 dl=-60.86n dw=-209.7n weta=2.001 leta=0.2646 q0=230e-6 lk=0.4e-6)
+.tran 10p 20n
+.end
