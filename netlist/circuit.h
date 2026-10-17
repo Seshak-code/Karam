@@ -77,7 +77,6 @@ struct Resistor {
     double width_m = 0.0;
     double length_m = 0.0;
 
-    double tolerance_percent = 0.0; // Monte Carlo Tolerance (e.g. 1.0 = 1%)
     std::string expression;         // Symbolic override (e.g. "Rload", "2*Vbias/Iref")
 
     double tc1 = 0.0, tc2 = 0.0;    // TC1, TC2: applied by the parser's resolve step, with inst
@@ -124,7 +123,6 @@ struct Capacitor {
     double length_m = 0.0;
     double m = 1.0;               // Multiplier
 
-    double tolerance_percent = 0.0;
     std::string expression;         // Symbolic override for capacitance
 
     bool   icGiven = false;           // IC= (initial voltage), used only with UIC
@@ -437,21 +435,7 @@ struct Behavioural {
  * Models a realistic power supply network (PDN).
  * Model: V_ideal -> [ESL] -> [ESR] -> Node_Chip -> [C_decap] -> GND
  */
-struct PowerRail {
-    std::string name;              // "Vdd", "Vcc", "Vio"
-    int nodeRail;                  // The chip-side node index
-    double nominal_V;              // 1.8V, 3.3V, 5V, 12V
-    double ripple_Vpp;             // Peak-to-peak ripple voltage
-    double frequency_Hz;           // Ripple frequency (e.g., 1MHz switching)
-    double ESR_ohms;               // Equivalent Series Resistance (package + regulator)
-    double ESL_henries;            // Equivalent Series Inductance (bond wires)
-    double capacitance_F;          // Decoupling capacitance (local)
-    
-    // Monte Carlo parameters
-    double tolerance_percent;      // ±5% for typical regulators
-    double temp_coefficient;       // Voltage drift with temperature [V/K]
-    
-};
+;
 
 /*
  * PDK Power Domain (Phase 1.3 Addition)
@@ -551,7 +535,6 @@ struct SimulationEnvironment {
     enum Corner { TT, FF, SS, SF, FS } process = TT;
     double vdd_variation_sigma = 0.0; // σ for MC
     double global_voltage_scale = 1.0; // PVT Voltage Scale
-    int monte_carlo_seed = 0;          // Deterministic seed for MC runs
     bool gmin_stepping = true;         // .options gminsteps=0 (ngspice): DC goes straight to source stepping
 
     // .options the solver honours (ngspice names and defaults). itl4 0: the engine's own transient limit (50).
@@ -614,63 +597,6 @@ struct Diode {
     double area = 1.0;
     double pj = 0.0, mult = 1.0;  // PJ= (sidewall perimeter) and M= (the sidewall terms scale by M, not by AREA)
     InstTemp inst;  // card and saturation current are held at the instance temperature (resolved by the parser)
-};
-
-/*
- * Schottky Diode (D) - Metal-Semiconductor Junction
- * Lower forward voltage drop (~0.3V vs ~0.7V PN), faster switching.
- * SPICE Model: Same Shockley equation but different defaults:
- *   I_S = 100nA - 1µA (higher than PN)
- *   N = 1.05 (closer to ideal)
- *   Rs = Series resistance (significant for high current)
- *   Cj0 = Zero-bias junction capacitance
- *   Vj = Junction potential (~0.4V for Schottky)
- *   M = Grading coefficient (~0.5)
- */
-struct SchottkyDiode {
-    std::string instanceName;             // e.g., "D1"
-    int anode = -1;                       // Metal side (+)
-    int cathode = -1;                     // Semiconductor side (-)
-    std::string modelName = "BAT54";      // SPICE model reference
-    
-    // DC Parameters
-    double saturationCurrent_I_S_A = 200e-9;   // Higher than PN (~200nA typ)
-    double emissionCoefficient_N = 1.05;       // Closer to ideal
-    double seriesResistance_Rs_ohms = 1.0;     // Package/bond wire resistance
-    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM;     // kT/q at 27 C
-    
-    // Junction Capacitance (AC/Transient)
-    double junctionCapacitance_Cj0_F = 2e-12;  // Zero-bias capacitance
-    double junctionPotential_Vj_V = 0.4;       // Lower than PN
-    double gradingCoefficient_M = 0.5;         // ~0.5 for abrupt junction
-    
-    double temperature_K = 300.15;
-};
-
-
-
-/*
- * Zener Diode (D) - Breakdown Diode
- * Operates in reverse breakdown region to regulate voltage.
- * Model:
- *   Forward: Standard PN junction
- *   Reverse: Breakdown at BV with impedance Rz
- */
-struct ZenerDiode {
-    std::string instanceName;             // e.g., "D1"
-    int anode = -1;                       // Anode (+)
-    int cathode = -1;                     // Cathode (-)
-    std::string modelName = "1N4733";     // default 5.1V
-    
-    // DC Parameters
-    double breakdownVoltage_V = 5.1;      // BV
-    double currentAtBreakdown_A = 0.049;  // Izt
-    double seriesResistance_Rs_ohms = 7.0; // Rz
-    double emissionCoefficient_N = 1.0;
-    double saturationCurrent_I_S_A = 1e-14;
-    double thermalVoltage_V_T_V = PhysicsConstants::V_THERMAL_NOM;
-    
-    double temperature_K = 300.15;
 };
 
 struct Mosfet {
@@ -890,7 +816,6 @@ struct TensorBlock {
     std::vector<CurrentSource> currentSources;
 
     // System Simulation Sources (Phase 2.9)
-    std::vector<PowerRail> powerRails;
     std::vector<SignalSource> signalSources;
     
     // PDK Power Domains (Phase 1.3)
@@ -905,12 +830,10 @@ struct TensorBlock {
     
     // Semiconductors
     std::vector<Diode> diodes;
-    std::vector<SchottkyDiode> schottkyDiodes;
     std::vector<Mosfet> mosfets;
     std::vector<BJT> bjts;
     std::vector<JFET> jfets;
     std::vector<OsdiDevice> osdiDevices;
-    std::vector<ZenerDiode> zenerDiodes;
     
     // Interconnects
     std::vector<TransmissionLine> transmissionLines;
@@ -1042,24 +965,6 @@ struct TensorBlock {
     }
     
     // System Simulation Helpers
-    void addPowerRail(const std::string& name, int node, double V, double ripple = 0.0) {
-        if (isFrozen) return;
-        PowerRail rail;
-        rail.name = name;
-        rail.nodeRail = node;
-        rail.nominal_V = V;
-        rail.ripple_Vpp = ripple;
-        // Defaults for simple model
-        rail.frequency_Hz = 1e6;
-        rail.ESR_ohms = 0.01;
-        rail.ESL_henries = 1e-9;
-        rail.capacitance_F = 100e-9;
-        rail.tolerance_percent = 5.0;
-        rail.temp_coefficient = 0.0;
-        
-        powerRails.push_back(rail);
-        updateNodeCount(node);
-    }
     
     void addSignalSource(const std::string& name, int nPos, int nNeg, 
                          SignalSource::WaveformType type, double amp, double freq) {
@@ -1154,38 +1059,6 @@ struct TensorBlock {
         
         jfets.push_back(newJfet);
         updateNodeCount(D); updateNodeCount(G); updateNodeCount(S);
-    }
-    void addSchottkyDiode(const std::string& name, int anode, int cathode, 
-                          const std::string& model = "BAT54",
-                          double Is = 200e-9, double N = 1.05, double Rs = 1.0) {
-        if (isFrozen) return;
-        
-        SchottkyDiode newD;
-        newD.instanceName = name;
-        newD.anode = anode;
-        newD.cathode = cathode;
-        newD.modelName = model;
-        newD.saturationCurrent_I_S_A = Is;
-        newD.emissionCoefficient_N = N;
-        newD.seriesResistance_Rs_ohms = Rs;
-        
-        schottkyDiodes.push_back(newD);
-        updateNodeCount(anode); updateNodeCount(cathode);
-    }
-    void addZenerDiode(const std::string& name, int anode, int cathode, 
-                       double Vz = 5.1, double Rz = 7.0, double Izt = 0.049) {
-        if (isFrozen) return;
-        
-        ZenerDiode newD;
-        newD.instanceName = name;
-        newD.anode = anode;
-        newD.cathode = cathode;
-        newD.breakdownVoltage_V = Vz;
-        newD.seriesResistance_Rs_ohms = Rz;
-        newD.currentAtBreakdown_A = Izt;
-        
-        zenerDiodes.push_back(newD);
-        updateNodeCount(anode); updateNodeCount(cathode);
     }
     void addTransmissionLine(int p1p, int p1n, int p2p, int p2n, double Z0, double Td, const std::string& name = "") {
         if (isFrozen) return;
@@ -1310,7 +1183,6 @@ struct BlockState {
 
     std::vector<History> capacitorState;
     std::vector<History> inductorState;
-    std::vector<History> powerRailState;
     std::vector<DeviceCharge> mosfetState, diodeState, bjtState, jfetState;
     std::vector<char> swOn, swPrev;  // per Switch: the state the last stamp used / the last accepted one
     // Lossless line: the outgoing waves w = v + Z0*i at both ports after every accepted step (t[0] = 0),
@@ -1328,9 +1200,6 @@ struct BlockState {
 
         inductorState.resize(block.inductors.size());
         for(auto& h : inductorState) h.resize(3);
-
-        powerRailState.resize(block.powerRails.size());
-        for(auto& h : powerRailState) h.resize(3);
 
         swOn.resize(block.switches.size());
         swPrev.resize(block.switches.size());
@@ -1491,13 +1360,6 @@ public:
         if (nPos > numGlobalNodes) numGlobalNodes = nPos;
         if (nNeg > numGlobalNodes) numGlobalNodes = nNeg;
     }
-    void addPowerRail(const std::string& name, int node, double V, double ripple = 0.0) {
-        globalBlock.addPowerRail(name, node, V, ripple);
-        globalState.powerRailState.emplace_back();
-        globalState.powerRailState.back().resize(3);
-
-        if (node > numGlobalNodes) numGlobalNodes = node;
-    }
     void addSignalSource(const std::string& name, int nPos, int nNeg, 
                          SignalSource::WaveformType type, double amp, double freq) {
         globalBlock.addSignalSource(name, nPos, nNeg, type, amp, freq);
@@ -1513,13 +1375,6 @@ public:
     void addDiode(int anode, int cathode, double Is) {
         globalBlock.addDiode(anode, cathode, Is);
         globalState.diodeState.emplace_back();
-        if (anode > numGlobalNodes) numGlobalNodes = anode;
-        if (cathode > numGlobalNodes) numGlobalNodes = cathode;
-    }
-    void addSchottkyDiode(const std::string& name, int anode, int cathode,
-                          const std::string& model = "BAT54",
-                          double Is = 200e-9, double N = 1.05, double Rs = 1.0) {
-        globalBlock.addSchottkyDiode(name, anode, cathode, model, Is, N, Rs);
         if (anode > numGlobalNodes) numGlobalNodes = anode;
         if (cathode > numGlobalNodes) numGlobalNodes = cathode;
     }
@@ -1542,11 +1397,6 @@ public:
                  double beta = 1e-4, double Vto = -2.0, double lambda = 0.01) {
         globalBlock.addJFET(name, D, G, S, model, isNChannel, beta, Vto, lambda);
         numGlobalNodes = std::max({numGlobalNodes, D, G, S});
-    }
-    void addZenerDiode(const std::string& name, int anode, int cathode, 
-                       double Vz = 5.1, double Rz = 7.0, double Izt = 0.049) {
-        globalBlock.addZenerDiode(name, anode, cathode, Vz, Rz, Izt);
-        numGlobalNodes = std::max({numGlobalNodes, anode, cathode});
     }
     void addTransmissionLine(int p1p, int p1n, int p2p, int p2n, double Z0, double Td, const std::string& name = "") {
         globalBlock.addTransmissionLine(p1p, p1n, p2p, p2n, Z0, Td, name);

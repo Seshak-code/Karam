@@ -1306,7 +1306,7 @@ CircuitSim::SensResult CircuitSim::solveSens(TensorNetlist &netlist, int outNode
   auto note = [&](const char *kind, size_t count) { if (count) r.unsupported.push_back(std::to_string(count) + " " + kind); };
   note("switch(es)", g.switches.size()); note("controlled source(s)", g.voltageControlledVoltageSources.size() +
       g.voltageControlledCurrentSources.size() + g.currentControlledVoltageSources.size() + g.currentControlledCurrentSources.size());
-  note("behavioural source(s)", g.behavioural.size()); note("diode(s)", g.diodes.size() + g.schottkyDiodes.size() + g.zenerDiodes.size());
+  note("behavioural source(s)", g.behavioural.size()); note("diode(s)", g.diodes.size());
   note("MOSFET(s)", g.mosfets.size()); note("BJT(s)", g.bjts.size()); note("JFET(s)", g.jfets.size());
   note("OSDI device(s)", g.osdiDevices.size()); note("transmission line(s)", g.transmissionLines.size());
   note("subcircuit instance(s)", netlist.instances.size());
@@ -1622,34 +1622,6 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       setIntegrationMethod(tranMethod_);
     }
 
-    // Update Power Rail History (Local Decap)
-    for (size_t i = 0; i < netlist.globalBlock.powerRails.size(); ++i) {
-      const auto &rail = netlist.globalBlock.powerRails[i];
-      auto &hist = netlist.globalState.powerRailState[i];
-
-      double v_curr = 0.0;
-      if (rail.nodeRail > 0 && rail.nodeRail <= (int)finalVoltages.size())
-        v_curr = finalVoltages[rail.nodeRail - 1];
-
-      double i_curr = 0.0;
-      double C = rail.capacitance_F;
-      IntegrationType type = integrator->getType();
-
-      if (hist.v.empty())
-        hist.resize(3);
-
-      // I_cap = C * dv/dt (Trapezoidal integration)
-      if (type == IntegrationType::TRAPEZOIDAL) {
-        if (!hist.v.empty())
-          i_curr =
-              (2.0 * C / actualTimeStep) * (v_curr - hist.v[0]) - hist.i[0];
-      } else if (type == IntegrationType::GEAR_1_EULER) {
-        if (!hist.v.empty())
-          i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-      }
-
-      integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
-    }
   }
 
   if (!simulationConverged)
