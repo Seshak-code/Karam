@@ -252,7 +252,7 @@ def run_ngspice(args, text, an, names, cur=(), dn=()):
         cir = os.path.join(args.tmp, "ng.cir")
         open(cir, "w").write("\n".join(kept) + "\n" + "\n".join(ctl) + "\n")
         p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout, cwd=args.tmp)
-        got = {m[0].lower(): float(m[1]) for m in re.findall(r"^(\S+) = (\S+)$", p.stdout, re.M)}
+        got = {m[0].lower(): num_or_nan(m[1]) for m in re.findall(r"^(\S+) = (\S+)$", p.stdout, re.M)}
         if not got: raise RuntimeError("ngspice sens: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
         return [], got
     if an[0] == "pz":
@@ -293,6 +293,11 @@ def run_ngspice(args, text, an, names, cur=(), dn=()):
     if an[0] == "ac":
         return xs, {n: [complex(r[3 * k + 1], r[3 * k + 2]) for r in rows] for k, n in enumerate(keys)}
     return xs, {n: [r[2 * k + 1] for r in rows] for k, n in enumerate(keys)}
+
+def num_or_nan(s):
+    """A number as a simulator printed it; NaN in any spelling (MSVC's runtime prints -nan(ind))."""
+    try: return float(s)
+    except ValueError: return math.nan if "nan" in s.lower() else math.inf if "inf" in s.lower() else float(s)
 
 def transitions(seq):
     """(t, value) samples -> the changes: the value at the first time, then each new one (the last at a time wins)."""

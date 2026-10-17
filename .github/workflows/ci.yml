@@ -50,6 +50,14 @@ jobs:
           path: ~/ngspice
           key: ngspice-${{ env.NGSPICE_VERSION }}-${{ matrix.os }}
 
+      - name: MSYS2 (Windows ngspice)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-ngspice
+
       - name: ngspice ${{ env.NGSPICE_VERSION }}
         run: |
           base="https://sourceforge.net/projects/ngspice/files/ng-spice-rework/$NGSPICE_VERSION"
@@ -63,10 +71,10 @@ jobs:
                  --enable-osdi --disable-debug && make -j4 > /dev/null && make install > /dev/null)
             fi
             echo "NGSPICE=$HOME/ngspice/bin/ngspice" >> "$GITHUB_ENV" ;;
-          Windows)
-            curl -sSL "$base/ngspice-${NGSPICE_VERSION}_64.7z/download" -o ng.7z
-            7z x -y -o"$RUNNER_TEMP" ng.7z > /dev/null
-            echo "NGSPICE=$RUNNER_TEMP/Spice64/bin/ngspice_con.exe" >> "$GITHUB_ENV" ;;
+          Windows)  # MSYS2's gcc build from the same source: the official MSVC build's numbers differ from it
+            ng="$(cygpath -m '${{ steps.msys2.outputs.msys2-location }}')/ucrt64/bin/ngspice.exe"
+            "$ng" -v | head -2
+            echo "NGSPICE=$ng" >> "$GITHUB_ENV" ;;
           macOS)
             brew install ngspice > /dev/null
             echo "NGSPICE=$(brew --prefix)/bin/ngspice" >> "$GITHUB_ENV" ;;
