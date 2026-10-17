@@ -1327,24 +1327,28 @@ public:
     const TensorBlock *blk;
     const BlockState *st;
     std::function<int(int)> map;   // local node -> global node
-    int vs, ind, e, h, dev;        // first matrix row of each branch kind; dev: device internal nodes
+    int vs, ind, e, h, bv, dev;    // first matrix row of each branch kind (bv: voltage behavioural sources); dev: device internal nodes
   };
   std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
     std::vector<BranchSlot> branchList;
-    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0});
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0});
     for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
       auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
       if (it == nl.blockDefinitions.end()) continue;
       const auto *inst = &nl.instances[k];
       branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
         return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
-      }, 0, 0, 0, 0, 0});
+      }, 0, 0, 0, 0, 0, 0});
     }
     int next = nl.numGlobalNodes;
     for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
     for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
+    for (auto &s : branchList) {
+      s.bv = next;
+      for (const auto &b : s.blk->behavioural) next += b.voltage;
+    }
     for (auto &s : branchList) { s.dev = next; next += deviceInternals(*s.blk, *s.st); }
     total = next;
     return branchList;
@@ -1389,6 +1393,7 @@ public:
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
       for (const auto &e : b.currentControlledCurrentSources) mark({e.outPos, e.outNeg});
+      for (const auto &e : b.behavioural) mark({e.outPos, e.outNeg});
       for (const auto &e : b.powerRails) mark({e.nodeRail});
       for (const auto &e : b.parasiticResistors) mark({e.node1, e.node2});
       for (const auto &e : b.parasiticCapacitors) mark({e.node1, e.node2});
@@ -1475,6 +1480,9 @@ public:
         if (hs.ctrlSource >= 0 && hs.ctrlSource < (int)blk.voltageSources.size())
           add(b, sl.vs + hs.ctrlSource, -hs.rm);
       }
+      int bv = sl.bv;
+      for (const auto &bs : blk.behavioural)
+        if (bs.voltage) branch(bv++, node(bs.outPos), node(bs.outNeg));  // f(x) itself: stampBehav
       for (const auto &f : blk.currentControlledCurrentSources) {
         if (f.ctrlSource < 0 || f.ctrlSource >= (int)blk.voltageSources.size()) continue;
         const int bc = sl.vs + f.ctrlSource;  // alpha * I(ctrl) leaves out+ through the source
@@ -1488,6 +1496,73 @@ public:
     buildBranchSystem(nl, h, time, S);
     for (size_t t = 0; t < S.r.size(); ++t) matrixBuilder.add(S.r[t], S.c[t], S.v[t]);
     for (size_t i = 0; i < S.rhs.size() && i < rhsVector.size(); ++i) rhsVector[i] += S.rhs[i];
+  }
+
+  // Behavioural sources: f(x) over the unknowns x (node voltages, branch currents), plus df/dx_col for
+  // every column it reads, from one Dual pass per V()/I() reference (the seed is that reference).
+  struct BehavEnv {
+    static constexpr bool strict = false;
+    const std::vector<double> &rv;
+    int seed;
+    double t;
+    double time() const { return t; }
+    Dual<double> ref(int k) const { return Dual<double>(rv[k], k == seed ? 1.0 : 0.0); }
+  };
+  struct BehavEval { double f = 0.0; std::vector<std::pair<int, double>> d; };
+  BehavEval behavEval(const Behavioural &b, const BranchSlot &sl, const std::vector<double> &x, double time, bool grad) const {
+    const size_t n = b.refs.size();
+    auto X = [&](int c) { return c >= 0 && c < (int)x.size() ? x[c] : 0.0; };
+    std::vector<int> ca(n, -1), cb(n, -1);
+    std::vector<double> rv(n);
+    for (size_t k = 0; k < n; ++k) {
+      const auto &r = b.refs[k];
+      if (r.kind == 0) { ca[k] = sl.map(r.a) - 1; cb[k] = sl.map(r.b) - 1; }  // ground: -1, reads 0
+      else ca[k] = r.kind == 1 ? sl.vs + r.a : r.kind == 2 ? sl.ind + r.a : sl.bv + r.a;
+      rv[k] = X(ca[k]) - X(cb[k]);
+    }
+    BehavEnv env{rv, -1, time};
+    const acutesim::numparam::Evaluator<BehavEnv> ev{*b.expr, env};
+    BehavEval out;
+    if (!grad || n == 0) { out.f = ev(b.expr->root).val; return out; }
+    for (size_t k = 0; k < n; ++k) {
+      env.seed = (int)k;
+      const auto r = ev(b.expr->root);
+      out.f = r.val;
+      if (ca[k] >= 0) out.d.push_back({ca[k], r.grad});
+      if (cb[k] >= 0) out.d.push_back({cb[k], -r.grad});
+    }
+    return out;
+  }
+  // f(x) of each behavioural source in every block; row: its branch row (voltage sources), else -1
+  template <class F> void forEachBehav(const TensorNetlist &nl, F &&f) const {
+    int total = 0;
+    for (const auto &sl : branchSlots(nl, total)) {
+      int row = sl.bv;
+      for (const auto &b : sl.blk->behavioural) f(b, sl, b.voltage ? row++ : -1);
+    }
+  }
+  // Newton stamp at x: f ~ f0 + g.(x' - x). A voltage source's row reads v+ - v- - g.x' = f0 - g.x; a
+  // current source leaves + (enters -) with g.x' + f0 - g.x.
+  void stampBehav(const Behavioural &b, const BranchSlot &sl, int row, const std::vector<double> &x, double time) {
+    auto ev = behavEval(b, sl, x, time, true);
+    // ponytail: outside a function's domain (ln(0) at the cold start, V = 0) the Newton step sees 0 here;
+    // the audit (calculatePhysicalResiduals) keeps the exact value, so a real domain error cannot converge
+    if (!std::isfinite(ev.f)) ev.f = 0.0;
+    for (auto &[c, g] : ev.d) if (!std::isfinite(g)) g = 0.0;
+    double rhs = ev.f;
+    for (auto [c, g] : ev.d) rhs -= g * (c < (int)x.size() ? x[c] : 0.0);
+    const int np = sl.map(b.outPos) - 1, nn = sl.map(b.outNeg) - 1;
+    if (b.voltage) {
+      for (auto [c, g] : ev.d) matrixBuilder.add(row, c, -g);
+      rhsVector[row] += rhs;
+      return;
+    }
+    for (auto [c, g] : ev.d) {
+      if (np >= 0) matrixBuilder.add(np, c, g);
+      if (nn >= 0) matrixBuilder.add(nn, c, -g);
+    }
+    if (np >= 0) rhsVector[np] -= rhs;
+    if (nn >= 0) rhsVector[nn] += rhs;
   }
 
   /**
@@ -1764,6 +1839,14 @@ public:
       for (size_t t = 0; t < S.r.size(); ++t) node_residuals[S.r[t]] -= S.v[t] * xAt(S.c[t]);
       for (size_t i = 0; i < S.rhs.size(); ++i) node_residuals[i] += S.rhs[i];
     }
+
+    // Behavioural sources: the exact f(x), not the linearisation just stamped
+    forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) {
+      const double f = behavEval(b, sl, v_candidate, time, false).f;
+      if (b.voltage) { node_residuals[row] += f; return; }
+      addRes(sl.map(b.outPos), -f);
+      addRes(sl.map(b.outNeg), f);
+    });
 
     // 6. Find Max Residual
     double max_err = 0.0;
@@ -2409,6 +2492,7 @@ public:
 
     // Branch-current elements (V, L+K, E, F, H), MOSFETs, diodes and BJTs: one implementation for both paths
     stampBranchSystem(netlist, h, time);
+    forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) { stampBehav(b, sl, row, v_guess, time); });
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
     const double tempK = netlist.environment.ambient_temp_K;

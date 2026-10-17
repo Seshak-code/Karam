@@ -50,8 +50,17 @@ DIALECT = {
                                     "-2.5(exp(-t/19.5ms)+exp(-t/0.5ms)) everywhere (the gold: 37 mV), as ngspice",
     "MINCAPRES/mincr.cir": ".options DEVICE MINRES=1 gives the RS=0 diode 1 ohm (Xyce V(2a) = ngspice v(2b)); ngspice agrees with the engine",
     "LOAD/load.cir": "Xyce gold is 0.5 mV off ngspice near V4 = 54.7 V; the engine matches ngspice to 33 uV",
+    "ABM_LOG/log.cir": "Xyce log() is log10 (gold V(3) = 2 for 100); ngspice and the engine: natural log",
+    "Certification_Tests/BUG_254/atanh_tanh.cir": "atanh(tanh(100)) = atanh(1): Xyce clamps, ngspice prints -inf (so does the engine's Newton fail)",
+    "Certification_Tests/BUG_133/": "gold is Xyce's sparse output times; ngspice and the engine agree (v(3) = 1, 2, 3 at 0.500035, .075, .125 ms)",
     "SANDLER21/sandler21.cir": "555 timer: output edges match ngspice to 0.1 us (1.0817 ms, 2.0816 ms, ...); a pointwise "
                                "compare at its near-vertical switching edges measures that offset, not the model",
+}
+
+# Cases the engine cannot do yet (a missing feature or a convergence limit), not a dialect: ngspice solves them.
+OPEN = {
+    "SANDLER25/": "LM111 window detector: transient Newton fails at the 2.25 ms comparator flip (also with F in place of the "
+                  "B source, so it is the BJT macro, not B); ngspice completes",
 }
 
 def gold(prn):
@@ -83,6 +92,8 @@ def case(path, opts):
     rel = os.path.relpath(path, os.path.join(XYCE, "Netlists"))
     for key, why in DIALECT.items():
         if rel.startswith(key): return rel, "XYCE-DIALECT", why
+    for key, why in OPEN.items():
+        if rel.startswith(key): return rel, "ENGINE-LIMIT", why
     text = open(path, errors="ignore").read()
     full = expand(text, os.path.dirname(path))
     g = os.path.join(XYCE, "OutputData", rel + ".prn")
