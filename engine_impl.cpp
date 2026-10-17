@@ -301,8 +301,8 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     if (!deserialiseRequest(req, parsed, failure)) return failure;
     TensorNetlist& netlist = parsed.netlist;
     const bool uic = parsed.tranUIC || req.transient.uic;
-    const double  stopTime = req.transient.stopTimeS > 0 ? req.transient.stopTimeS : parsed.tranStop;  // else the netlist's .tran
-    const double  dt       = req.transient.stepSizeS > 0 ? req.transient.stepSizeS : parsed.tranStep;
+    const double  stopTime = req.transient.stopTimeS != 0 ? req.transient.stopTimeS : parsed.tranStop;  // else the netlist's .tran
+    const double  dt       = req.transient.stepSizeS != 0 ? req.transient.stepSizeS : parsed.tranStep;
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);

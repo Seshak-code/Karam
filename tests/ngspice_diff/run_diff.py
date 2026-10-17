@@ -164,7 +164,7 @@ def run_ngspice(args, text, an, names, cur=()):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
-    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end|osdi)\b", re.I)
+    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end|osdi|save|probe)\b", re.I)
     kept, skip = [], False
     for i, ln in enumerate(text.splitlines()):
         if i > 0 and ln.strip()[:1] == "+":
