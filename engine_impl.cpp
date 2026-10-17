@@ -306,6 +306,52 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     return result;
 }
 
+// ── Lockstep transient ────────────────────────────────────────────────────
+namespace {
+// Owns the parsed netlist and the CircuitSim whose state it advances (the sim keeps
+// references into the netlist, so neither moves after construction).
+class TransientImpl final : public TransientHandle {
+public:
+    TransientImpl(const SimulationRequestDTO& req, PrecisionMode prec) {
+        SimulationResponseDTO failure;
+        if (!deserialiseRequest(req, parsed_, failure)) { err_ = failure.errorDetail; return; }
+        sim_.execMode = selectExecMode(prec);
+        const double step = req.transient.stepSizeS > 0 ? req.transient.stepSizeS : parsed_.tranStep;
+        err_ = sim_.beginTransient(parsed_.netlist, step, parsed_.tranUIC || req.transient.uic);
+    }
+    bool setSource(const std::string& name, double volts, double rampS) override {
+        if (!err_.empty()) return false;
+        if (sim_.setSource(parsed_.netlist, name, volts, rampS)) return true;
+        err_ = "unknown source '" + name + "'";
+        return false;
+    }
+    bool advanceTo(double t) override {
+        if (!err_.empty()) return false;
+        err_ = sim_.advanceTo(parsed_.netlist, t);
+        return err_.empty();
+    }
+    double time() const override { return sim_.tranTime(); }
+    bool voltage(const std::string& node, double& v) const override {
+        std::string key = node;
+        for (auto& c : key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (key == "0" || key == "GND") { v = 0.0; return err_.empty(); }
+        const auto it = parsed_.nodeIndex.find(key);
+        if (it == parsed_.nodeIndex.end() || !err_.empty()) return false;
+        v = sim_.nodeVoltage(it->second);
+        return true;
+    }
+    std::string error() const override { return err_; }
+private:
+    SPICEParseResult parsed_;
+    CircuitSim sim_;
+    std::string err_;
+};
+}  // namespace
+
+std::unique_ptr<TransientHandle> SessionImpl::beginTransient(const SimulationRequestDTO& req) {
+    return std::make_unique<TransientImpl>(req, precision_);
+}
+
 // ── Monte Carlo ───────────────────────────────────────────────────────────
 SimulationResponseDTO SessionImpl::runMonteCarlo(const SimulationRequestDTO& req,
                                                    const MonteCarloConfigDTO& mc,

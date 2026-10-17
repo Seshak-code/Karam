@@ -29,6 +29,7 @@ namespace acutesim {
 // Diagnostics from a parse run.
 struct SPICEParseResult {
     TensorNetlist netlist;
+    std::map<std::string, int> nodeIndex;  // top-level node name (upper case) -> index
     bool          success = true;
     std::string   errorMessage;
     int           errorLine = -1;

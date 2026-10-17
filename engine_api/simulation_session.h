@@ -20,6 +20,7 @@
 #include "job_status.h"
 
 #include <memory>
+#include <string>
 #include <functional>
 #include <cstdint>
 
@@ -27,6 +28,22 @@ namespace acutesim {
 
 // ── Streaming result callback (for live waveform updates) ─────────────────
 using ResultChunkCallback = std::function<void(const compute::orchestration::WaveformDataPoint&, uint64_t timeStepIdx)>;
+
+// ── TransientHandle ────────────────────────────────────────────────────────
+// A transient kept alive between calls, for a digital simulator that drives
+// analog nodes in lockstep: setSource, advanceTo, voltage, repeat. Methods
+// return false (and error() says why) after a failed begin or step.
+class ENGINE_API TransientHandle {
+public:
+    virtual ~TransientHandle() = default;
+    // Re-drive V (or I) source `name` from its value now to `volts` over `rampS` (0 = step)
+    virtual bool setSource(const std::string& name, double volts, double rampS) = 0;
+    virtual bool advanceTo(double t) = 0;
+    virtual double time() const = 0;
+    // Node voltage by netlist name (case-insensitive; "0"/"gnd" = ground)
+    virtual bool voltage(const std::string& node, double& v) const = 0;
+    virtual std::string error() const = 0;
+};
 
 // ── SimulationSession ──────────────────────────────────────────────────────
 class ENGINE_API SimulationSession {
@@ -55,6 +72,11 @@ public:
     virtual compute::orchestration::SimulationResponseDTO runNoise(
         const compute::orchestration::SimulationRequestDTO&,
         const EngineCallbacks& = {}) = 0;
+
+    // Starts a transient at t = 0 (request.transient.stepSizeS = max step, uic) and
+    // returns it for lockstep stepping; check error() for a failed start.
+    virtual std::unique_ptr<TransientHandle> beginTransient(
+        const compute::orchestration::SimulationRequestDTO&) = 0;
 
     // === Lifecycle ===
     virtual JobID       jobId()   const = 0;
