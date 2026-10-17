@@ -76,7 +76,7 @@ public:
 
     // === Factory function (defined in acutesim_engine/engine_impl.cpp) ===
     // The ONLY legal way to obtain an engine instance from outside.
-    static ENGINE_API std::unique_ptr<ISimulationEngine> create();
+    static std::unique_ptr<ISimulationEngine> create();  // exported with the class (MSVC refuses both)
 };
 
 } // namespace acutesim
