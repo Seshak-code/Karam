@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include "../infrastructure/safe_utils.h"
+#include "../math/pole_zero.h"
 #include "../physics/circuitsim.h"
 #include "../physics/device_physics.h"
 #include "../physics/physics_constants.h"
@@ -1205,6 +1206,110 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
   }
   r.onoiseTotal = std::sqrt(onTot);
   r.inoiseTotal = std::sqrt(inTot);
+  return r;
+}
+
+CircuitSim::PoleZeroResult CircuitSim::solvePoleZero(TensorNetlist &netlist, int inP, int inN, int outP, int outN,
+                                                     bool volt, bool wantPoles, bool wantZeros) {
+  PoleZeroResult r;
+  ACSystem sys;
+  if (!acSystem(netlist, sys)) { r.error = "pole-zero needs a converged DC operating point"; return r; }
+  const int n = sys.n, N = n + 1;
+  // (G + sC) x = 0 bordered: column `in` (the input source's injection), row `row` (shorted input / nulled output)
+  auto roots = [&](const std::vector<std::pair<int, double>> &col, const std::vector<std::pair<int, double>> &row,
+                   double corner, std::vector<std::complex<double>> &out) {
+    std::vector<double> A(N * N, 0.0), B(N * N, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int p = sys.G.row_pointer[i]; p < sys.G.row_pointer[i + 1]; ++p) A[i * N + sys.G.col_indices[p]] += sys.G.values[p];
+    for (size_t t = 0; t < sys.cv.size(); ++t) B[sys.cr[t] * N + sys.cc[t]] += sys.cv[t];
+    for (auto [i, v] : col) A[i * N + n] += v;
+    for (auto [j, v] : row) A[n * N + j] += v;
+    A[n * N + n] = corner;
+    return acutesim::finiteRoots(std::move(A), std::move(B), N, out);
+  };
+  auto pair = [&](int a, int b) {
+    std::vector<std::pair<int, double>> v;
+    if (a > 0) v.push_back({a - 1, 1.0});
+    if (b > 0) v.push_back({b - 1, -1.0});
+    return v;
+  };
+  for (int nd : {inP, inN, outP, outN})
+    if (nd < 0 || nd > netlist.numGlobalNodes) { r.error = "pole-zero node out of range"; return r; }
+  // Open input: border with a unit diagonal, which adds no root. Shorted input: the bordered system is singular
+  // when an ideal source already holds the pair (the short is then a no-op), so that case is the open matrix too.
+  if (wantPoles) {
+    if (volt) r.error = roots(pair(inP, inN), pair(inP, inN), 0.0, r.poles);
+    if (!volt || !r.error.empty()) r.error = roots({}, {}, 1.0, r.poles = {});
+  }
+  if (r.error.empty() && wantZeros) {
+    r.error = roots(pair(inP, inN), pair(outP, outN), 0.0, r.zeros);
+    if (!r.error.empty() && volt) {  // a source already holds the input pair: its value is the input (rhs of its branch row)
+      int total = 0;
+      for (const auto &sl : branchSlots(netlist, total))
+        for (size_t i = 0; i < sl.blk->voltageSources.size(); ++i) {
+          const int p = sl.map(sl.blk->voltageSources[i].nodePositive), m = sl.map(sl.blk->voltageSources[i].nodeNegative);
+          if ((p == inP && m == inN) || (p == inN && m == inP)) {
+            r.zeros.clear();
+            return r.error = roots({{sl.vs + (int)i, 1.0}}, pair(outP, outN), 0.0, r.zeros), r;
+          }
+        }
+    }
+  }
+  return r;
+}
+
+CircuitSim::SensResult CircuitSim::solveSens(TensorNetlist &netlist, int outNode, int refNode, const std::string &outSource) {
+  SensResult r;
+  ACSystem sys;
+  if (!acSystem(netlist, sys)) { r.error = "sensitivity needs a converged DC operating point"; return r; }
+  const int n = sys.n;
+  auto &g = netlist.globalBlock;
+  std::vector<double> e(n, 0.0);
+  if (!outSource.empty()) {
+    int total = 0;
+    const int vs = branchSlots(netlist, total)[0].vs;
+    const auto it = std::find_if(g.voltageSources.begin(), g.voltageSources.end(), [&](const VoltageSource &v) { return v.name == outSource; });
+    if (it == g.voltageSources.end()) { r.error = ".sens i(" + outSource + "): no such voltage source at the top level"; return r; }
+    e[vs + (it - g.voltageSources.begin())] = 1.0;
+  } else {
+    if (outNode > 0) e[outNode - 1] += 1.0;
+    if (refNode > 0) e[refNode - 1] -= 1.0;
+  }
+  MatrixConstructor T;  // J^T
+  T.setDimensions(n, n);
+  for (int i = 0; i < n; ++i)
+    for (int p = sys.G.row_pointer[i]; p < sys.G.row_pointer[i + 1]; ++p) T.add(sys.G.col_indices[p], i, sys.G.values[p]);
+  const SolverResult adj = solveLinear(T.createCsr(), e);
+  if ((int)adj.solution.size() != n) { r.error = "sensitivity: adjoint solve failed"; return r; }
+  const std::vector<double> v(lastSolution_.begin(), lastSolution_.begin() + netlist.numGlobalNodes);
+  auto lower = [](std::string s) { for (auto &c : s) c = (char)std::tolower((unsigned char)c); return s; };
+  auto d = [&](ComponentType t, int idx) {
+    const std::vector<double> b = sensRhs(netlist, t, idx, "R", v, n);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += adj.solution[i] * b[i];
+    return s;
+  };
+  auto add = [&](const std::string &name, double val) { r.names.push_back(lower(name)); r.values.push_back(val); };
+  for (size_t i = 0; i < g.resistors.size(); ++i) {
+    const double dR = d(ComponentType::RESISTOR, (int)i), R = g.resistors[i].resistance_ohms;
+    add(g.resistors[i].name, dR);
+    add(g.resistors[i].name + "_m", -R * dR);
+    add(g.resistors[i].name + "_scale", R * dR);
+  }
+  for (size_t i = 0; i < g.voltageSources.size(); ++i) add(g.voltageSources[i].name, d(ComponentType::VSOURCE, (int)i));
+  for (size_t i = 0; i < g.currentSources.size(); ++i) {
+    const double dI = d(ComponentType::ISOURCE, (int)i);
+    add(g.currentSources[i].name, dI);
+    add(g.currentSources[i].name + "_m", g.currentSources[i].current_A * dI);
+  }
+  // ponytail: only top-level R, V and I values; every other device (and any subcircuit instance) is counted, not guessed.
+  auto note = [&](const char *kind, size_t count) { if (count) r.unsupported.push_back(std::to_string(count) + " " + kind); };
+  note("switch(es)", g.switches.size()); note("controlled source(s)", g.voltageControlledVoltageSources.size() +
+      g.voltageControlledCurrentSources.size() + g.currentControlledVoltageSources.size() + g.currentControlledCurrentSources.size());
+  note("behavioural source(s)", g.behavioural.size()); note("diode(s)", g.diodes.size() + g.schottkyDiodes.size() + g.zenerDiodes.size());
+  note("MOSFET(s)", g.mosfets.size()); note("BJT(s)", g.bjts.size()); note("JFET(s)", g.jfets.size());
+  note("OSDI device(s)", g.osdiDevices.size()); note("transmission line(s)", g.transmissionLines.size());
+  note("subcircuit instance(s)", netlist.instances.size());
   return r;
 }
 

@@ -1,4 +1,4 @@
-// acutesim_engine_dump <netlist> <cpu|gpu> <dc|tran|ac|noise> [step stop]
+// acutesim_engine_dump <netlist> <cpu|gpu> <dc|tran|ac|noise|pz|sens> [step stop]
 // Machine-readable waveform dump for differential testing (tests/ngspice_diff).
 // Prints: "CONVERGED <0|1>", "ERROR <text>", "BACKEND <what ran>", then one line per waveform point:
 //   <time> <v1> <v2> ...   (engine-internal node order)
@@ -7,6 +7,8 @@
 //   voltages: <i1> <i2> ... (ac: <re> <im> pairs). "NODES n1 n2 ..." ("-" if unnamed) and
 //   "BRANCHES b1 b2 ..." (lower case) precede the points and name the columns in order.
 //   (env TREESPICE_BASEDIR overrides the directory .include/.lib paths resolve against)
+//   pz: no waveform; "POLE <re> <im>" and "ZERO <re> <im>" lines
+//   sens: "SENS <name> <d(output)/d(parameter)>" lines, "UNSUPPORTED <element>" for devices left out
 //   noise: <freq> <onoise> <inoise> ... then "TOTAL <onoise_total> <inoise_total>"
 // A nested .dc / .temp list adds "SWEEP <name>=<value> ..." before the first row of each outer value
 //   (the row's first column is the innermost sweep value).
@@ -46,6 +48,10 @@ int main(int argc, char** argv) {
         r = session->runTransient(req, cb, nullptr);
     } else if (mode == "ac") {
         r = session->runAC(req, cb);
+    } else if (mode == "sens") {
+        r = session->runSens(req, cb);
+    } else if (mode == "pz") {
+        r = session->runPoleZero(req, cb);
     } else if (mode == "noise") {
         r = session->runNoise(req, cb);
     } else {
@@ -56,6 +62,12 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < nz.frequencies.size(); ++k)
         std::printf("%.9g %.9g %.9g\n", nz.frequencies[k], nz.onoise[k], nz.inoise[k]);
     if (r.extended.hasNoise) std::printf("TOTAL %.9g %.9g\n", nz.onoiseTotal, nz.inoiseTotal);
+    const auto& pz = r.extended.pz;
+    for (size_t k = 0; k < pz.poleRe.size(); ++k) std::printf("POLE %.9g %.9g\n", pz.poleRe[k], pz.poleIm[k]);
+    for (size_t k = 0; k < pz.zeroRe.size(); ++k) std::printf("ZERO %.9g %.9g\n", pz.zeroRe[k], pz.zeroIm[k]);
+    const auto& sn = r.extended.sens;
+    for (size_t k = 0; k < sn.names.size(); ++k) std::printf("SENS %s %.9g\n", sn.names[k].c_str(), sn.values[k]);
+    for (const auto& u : sn.unsupported) std::printf("UNSUPPORTED %s\n", u.c_str());
     std::printf("NODES");
     for (const auto& n : r.nodeNames) std::printf(" %s", n.empty() ? "-" : n.c_str());
     std::printf("\nBRANCHES");
