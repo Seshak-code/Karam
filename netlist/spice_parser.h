@@ -63,6 +63,13 @@ struct SPICEParseResult {
     std::string   noiseSweep;
     int           noiseOut = 0, noiseRef = 0, noisePoints = 0;
     double        noiseStart = 0.0, noiseStop = 0.0;
+    // .pz in+ in- out+ out- cur|vol pol|zer|pz
+    bool          hasPZ = false, pzVolt = false, pzPoles = false, pzZeros = false;
+    int           pzNode[4] = {0, 0, 0, 0};
+    // .sens v(out[,ref]) | i(vsrc): DC sensitivity of one output
+    bool          hasSens = false;
+    std::string   sensSource;        // i(vsrc): the source name, else empty
+    int           sensOut = 0, sensRef = 0;
     std::string   acSweep;           // .ac dec|oct|lin n fstart fstop
     int           acPoints = 0;
     double        acStart = 0.0, acStop = 0.0;
@@ -84,6 +91,7 @@ private:
     double parseValue(const std::string& s) const;  // throws on non-numbers; resolves .param
     bool isValue(const std::string& s) const;
     static void requireFields(const std::vector<std::string>& tok, size_t n);
+    double takeMultiplier(std::vector<std::string>& tok) const;  // removes M <value> pairs; the last wins
     static void requireLinearForm(const std::vector<std::string>& tok, size_t n);
     double instanceArea(const std::vector<std::string>& tok, size_t from, InstTemp* t = nullptr) const;  // t: accept TEMP, DTEMP
     static std::string toUpper(const std::string& s);
@@ -117,6 +125,7 @@ private:
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseTLine      (const std::vector<std::string>& tok, TensorBlock& blk);
     static bool nonlinearForm(const std::vector<std::string>& tok);  // POLY / VALUE / VOL / CUR / TABLE
     void parseBehav      (const std::string& line, const std::vector<std::string>& tok, TensorBlock& blk);
     // F/H name their controlling V source, behavioural I() its source; resolve once the block is complete
@@ -142,6 +151,7 @@ private:
     // ── State ─────────────────────────────────────────────────────────
     std::map<std::string, int> nodeMap_;
     int nextNode_ = 1;
+    double mult_ = 1.0;   // m= of the R, L, I, G, F or J card being parsed
 
     // .subckt parsing state. Bodies use LOCAL node numbers (ports 1..P, then
     // internal nodes); X cards are expanded after the whole file is read, so
@@ -155,8 +165,11 @@ private:
     int              nextLocalNode_ = 1;
     struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; std::string name; };
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
-    struct PendingIC { std::string node; double value; int line; };
+    struct PendingIC { std::string node; double value; int line; bool nodeset; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
+    std::string pzNames_[4];                       // .pz node names, resolved likewise
+    std::string sensOut_, sensRef_;                // .sens v() node names, resolved likewise
+    std::map<std::string, std::vector<PendingIC>> subcktICs_;   // .ic / .nodeset in a body (local names), applied per instance
     std::string noiseOut_, noiseRef_;              // .noise node names, resolved likewise
     std::set<std::string> globals_;                // .global node names
     std::map<std::string, std::map<int, std::string>> subcktGlobals_;  // subckt -> local index -> name

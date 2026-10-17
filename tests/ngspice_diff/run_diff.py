@@ -87,16 +87,16 @@ def osdi_libs(text): return re.findall(r"^\s*\.osdi\s+(\S+)", text, re.I | re.M)
 
 def node_map(text):
     """Engine column order: first appearance in top-level element cards (name -> 1-based column)."""
-    m, in_sub = {}, False
+    m, depth = {}, 0  # depth: open .subckt definitions (they nest)
     models = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".model")}
     for line in cards(text):
         t = toks(line)
         if t[0][0] == ".":
             kw = t[0].upper()
             if kw == ".END": break
-            in_sub = kw == ".SUBCKT" or (in_sub and kw != ".ENDS")
+            depth += (kw == ".SUBCKT") - (kw == ".ENDS" and depth > 0)
             continue
-        if in_sub: continue
+        if depth: continue
         c = t[0][0].upper()
         pos = range(1, len(t) - 1) if c == "X" else NODE_POS.get(c, [])
         if c == "X":  # X<name> <nodes...> <subckt> [params:] [k=v ...]: the words before the parameters
@@ -114,13 +114,6 @@ def node_map(text):
             if p < len(t) and t[p].upper() not in GROUND: m.setdefault(t[p].upper(), len(m) + 1)
     return m
 
-# Branch currents the engine gets wrong, with the node voltages fine (so only i() is skipped).
-NO_BRANCH_CHECK = {
-    "qa2_osdi_uic.cir": "UIC start: the engine seeds the OSDI charges at x0 (vdd node 0 V), the first step's inrush rings "
-                        "through trapezoidal integration forever (+-0.1 A on i(vdd)); ngspice solves the sources first",
-    "qa2_osdi_ic_ring.cir": "same UIC start",
-}
-
 def branch_names(text):
     """Top-level branch-current elements (ngspice name#branch): V, L, linear E, H and B voltage sources."""
     out, in_sub = [], False
@@ -137,11 +130,13 @@ def branch_names(text):
 
 def analysis(text):
     """-> ('op',) | ('dc', src, start, stop, step[, src2, start2, ...]) | ('tran', tstep, tstop, uic) | ('ac', sweep, n, f1, f2)
-       | ('noise', "v(out[,ref])", src, sweep, n, f1, f2) | ('unsupported', why)"""
+       | ('noise', "v(out[,ref])", src, sweep, n, f1, f2) | ('pz', in+, in-, out+, out-, cur|vol, pol|zer|pz) | ('sens', "v(out[,ref])" | "i(vsrc)") | ('unsupported', why)"""
     for line in cards(text):
         t = line.split()
         kw = t[0].lower()
         if kw == ".ac": return ("ac", t[1].lower(), int(num(t[2])), num(t[3]), num(t[4]))
+        if kw == ".sens": return ("sens", t[1].lower()) if len(t) == 2 else ("unsupported", ".sens form (AC / several outputs)")
+        if kw == ".pz": return ("pz", *t[1:7])
         if kw == ".noise":
             k = next(i for i, x in enumerate(t) if x.lower() in ("dec", "oct", "lin"))
             return ("noise", " ".join(t[1:k - 1]), t[k - 1], t[k].lower(), int(num(t[k + 1])), num(t[k + 2]), num(t[k + 3]))
@@ -161,17 +156,19 @@ def run_engine(args, text, mode, kind, step=0.0, stop=0.0):
     env = {**os.environ, **({"TREESPICE_BASEDIR": args.basedir} if getattr(args, "basedir", None) else {})}
     try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env, cwd=args.tmp).stdout  # cwd: bsim4.osdi writes bsim4v5.out there
     except subprocess.TimeoutExpired: return dict(conv=False, err="TIMEOUT", pts=[])
-    conv, err, pts, total, branches, nodes = False, "", [], None, [], []
+    conv, err, pts, total, branches, nodes, pz, sens = False, "", [], None, [], [], dict(POLE=[], ZERO=[]), {}
     for ln in out.splitlines():
         if ln.startswith("BRANCHES"): branches = ln.split()[1:]
         elif ln.startswith("NODES"): nodes = ln.split()[1:]
         elif ln.startswith("TOTAL"): total = [float(x) for x in ln.split()[1:]]
+        elif ln.startswith(("POLE ", "ZERO ")): pz[ln[:4]].append(complex(*map(float, ln.split()[1:3])))
+        elif ln.startswith("SENS "): sens[ln.split()[1]] = float(ln.split()[2])
         elif ln.startswith("CONVERGED"): conv = ln.split()[1] == "1"
         elif ln.startswith("ERROR"): err = ln[6:].strip()
         elif ln and (ln[0].isdigit() or ln[0] == "-"):
             try: pts.append([float(x) for x in ln.split()])
             except ValueError: pass
-    return dict(conv=conv, err=err, pts=pts, total=total, branches=branches, nn=len(nodes))
+    return dict(conv=conv, err=err, pts=pts, total=total, branches=branches, nn=len(nodes), pz=pz, sens=sens)
 
 # ---------------------------------------------------------------- ngspice side
 def tran_tmax(text, an):
@@ -195,7 +192,7 @@ def run_ngspice(args, text, an, names, cur=()):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
-    drop = re.compile(r"\.(op|dc|tran|ac|noise|print|plot|four|end|osdi|save|probe|temp|step|meas|measure)\b", re.I)
+    drop = re.compile(r"\.(op|dc|tran|ac|noise|pz|sens|print|plot|four|end|osdi|save|probe|temp|step|meas|measure)\b", re.I)
     kept, skip = [], False
     for i, ln in enumerate(text.splitlines()):
         if i > 0 and ln.strip()[:1] == "+":
@@ -205,12 +202,17 @@ def run_ngspice(args, text, an, names, cur=()):
         if not skip: kept.append(ln)
     cmd = {"op": "op", "dc": "dc " + " ".join(repr(x) if isinstance(x, float) else x for x in an[1:]) if an[0] == "dc" else "",
            "tran": "tran {0!r} {1!r} 0 {2!r}{3}".format(an[1], an[2], tran_tmax(text, an), " uic" if an[3] else "") if an[0] == "tran" else "",
-           "ac": "ac {1} {2} {3!r} {4!r}".format(*an) if an[0] == "ac" else "", "noise": ""}[an[0]]
+           "ac": "ac {1} {2} {3!r} {4!r}".format(*an) if an[0] == "ac" else "", "noise": "", "pz": "", "sens": ""}[an[0]]
     keys = list(names) + [f"i({c})" for c in cur]
     vecs = " ".join(f"{k[2:-1]}#branch" if k[0] == "i" else f"v({k.lower()})" for k in keys)
     out = os.path.join(args.tmp, "ng.dat")
     if os.path.exists(out): os.remove(out)
     ctl = [".control", cmd, f"wrdata {out} {vecs}", "quit", ".endc", ".end"]
+    if an[0] == "sens":  # every element parameter ngspice reports, as "name = value" (ngspice prints the dependence on each)
+        ctl = [".control", f"sens {an[1]}", "print all", "quit", ".endc", ".end"]
+    if an[0] == "pz":  # ngspice prints "name = re,im" (a lone vector as "all = re,im"): one run per kind, marked
+        ctl = [".control"] + [x for k in ("pol", "zer") if an[6] in (k, "pz") for x in
+                              (f"echo {k.upper()}", "pz " + " ".join(an[1:6]) + " " + k, "print all")] + ["quit", ".endc", ".end"]
     if an[0] == "noise":  # spectra in plot noise1, integrated totals in noise2
         ctl = [".control", "noise {1} {2} {3} {4} {5!r} {6!r}".format(*an), "setplot noise1",
                f"wrdata {out} onoise_spectrum inoise_spectrum", "setplot noise2",
@@ -222,6 +224,24 @@ def run_ngspice(args, text, an, names, cur=()):
     cir = os.path.join(args.tmp, "ng.cir")
     rows = []
     # ngspice takes one .temp value and has no .step: each .temp value and .step combination is run on its own, the rows joined
+    if an[0] == "sens":
+        cir = os.path.join(args.tmp, "ng.cir")
+        open(cir, "w").write("\n".join(kept) + "\n" + "\n".join(ctl) + "\n")
+        p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout, cwd=args.tmp)
+        got = {m[0].lower(): float(m[1]) for m in re.findall(r"^(\S+) = (\S+)$", p.stdout, re.M)}
+        if not got: raise RuntimeError("ngspice sens: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
+        return [], got
+    if an[0] == "pz":
+        cir = os.path.join(args.tmp, "ng.cir")
+        open(cir, "w").write("\n".join(kept) + "\n" + "\n".join(ctl) + "\n")
+        p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout, cwd=args.tmp)
+        got, kind = dict(POL=[], ZER=[]), None
+        for ln in p.stdout.splitlines():
+            m = re.match(r"(POL|ZER)$|(?:pole\(\d+\)|zero\(\d+\)|all) = (\S+),(\S+)", ln.strip())
+            if m and m.group(1): kind = m.group(1)
+            elif m: got[kind].append(complex(float(m.group(2)), float(m.group(3))))
+        if not any(got.values()) and "Error" in p.stdout + p.stderr: raise RuntimeError("ngspice pz: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
+        return [], dict(POLE=got["POL"], ZERO=got["ZER"])
     sd = steps(text)
     combos = itertools.product(*[[((k, n, vs), v) for v in vs] for k, n, vs in sd])
     for combo in combos:
@@ -262,7 +282,7 @@ def compare(args, text, an, mode, nm, ref):
     """-> (status, worst_abs, worst_rel, note)"""
     xs, vals = ref
     # node names, then "i(name)" branch currents; a reference current above 1 kA is a diverged run, not a value
-    names = [n for n in vals if n[0] != "i" or max(abs(v) for v in vals[n]) <= 1e3] if an[0] != "noise" else []
+    names = [n for n in vals if n[0] != "i" or max(abs(v) for v in vals[n]) <= 1e3] if an[0] not in ("noise", "pz", "sens") else []
     def ecol(r, n, ac=False):  # engine column of a node or branch current (None: the engine has no such column)
         if n in nm: return 2 * nm[n] - 1 if ac else nm[n]
         b = n[2:-1]
@@ -279,7 +299,41 @@ def compare(args, text, an, mode, nm, ref):
         e = abs(got - exp) if math.isfinite(got) else math.inf
         worst_abs = max(worst_abs, e); worst_rel = max(worst_rel, e / (scale or max(abs(exp), 1e-3)))
         if not e <= tol: bad.append(f"{label}: {got:.6g} vs ngspice {exp:.6g}")
-    if an[0] == "noise":
+    if an[0] == "sens":
+        r = run_engine(args, text, mode, "sens")
+        if unsupported(r): return "ENGINE-UNSUPPORTED", 0, 0, r["err"]
+        if not r["conv"]: return "FAIL", math.inf, math.inf, f"engine not converged: {r['err']}"
+        # Element values ngspice reports at the top level: R (r, r_m, r_scale), V (v), I (i, i_m). Device parameters are
+        # not implemented: the engine lists those devices as UNSUPPORTED and the harness does not compare them.
+        want, names, in_sub = [], {}, False
+        for t in map(toks, cards(text)):
+            if t[0][0] == ".": in_sub = t[0].upper() == ".SUBCKT" or (in_sub and t[0].upper() != ".ENDS")
+            elif not in_sub and t[0][0].upper() in "RVI": names[t[0].lower()] = t[0][0].upper()
+        for n, c in names.items(): want += [n] + ([n + "_m", n + "_scale"] if c == "R" else [n + "_m"] if c == "I" else [])
+        scale = max([abs(vals[n]) for n in want if n in vals], default=0)
+        for n in want:
+            if n not in vals: continue  # ngspice does not report it (e.g. v1_m)
+            if n not in r["sens"]: bad.append(f"engine has no {n}"); continue
+            got, exp = r["sens"][n], vals[n]
+            worst_abs = max(worst_abs, abs(got - exp)); worst_rel = max(worst_rel, abs(got - exp) / max(abs(exp), 1e-300))
+            if abs(got - exp) > 1e-6 * scale + args.dc_rtol * abs(exp): bad.append(f"d/d{n}: {got:.6g} vs ngspice {exp:.6g}")
+    elif an[0] == "pz":
+        r = run_engine(args, text, mode, "pz")
+        if unsupported(r): return "ENGINE-UNSUPPORTED", 0, 0, r["err"]
+        if not r["conv"]: return "FAIL", math.inf, math.inf, f"engine not converged: {r['err']}"
+        for kind in ("POLE", "ZERO"):  # order-insensitive: each reference root takes the nearest unused engine root
+            exp, got = vals[kind], list(r["pz"][kind])
+            # ngspice's root search misses the highest-frequency poles of device circuits (7 of 9 on x_pz_bjt_amp): the
+            # engine may have extra roots, but only above every root ngspice reports. A root at the origin is matched to 1 mrad/s.
+            if len(got) < len(exp): bad.append(f"{kind.lower()}s: engine {len(got)} vs ngspice {len(exp)}"); continue
+            for z in exp:
+                near = min(got, key=lambda g: abs(g - z))
+                got.remove(near)
+                worst_abs = max(worst_abs, abs(near - z)); worst_rel = max(worst_rel, abs(near - z) / max(abs(z), 1.0))
+                if abs(near - z) > 1e-3 + args.dc_rtol * abs(z): bad.append(f"{kind.lower()} {near:.6g} vs ngspice {z:.6g}")
+            for g in got:
+                if abs(g) <= max(map(abs, exp), default=0): bad.append(f"engine has extra {kind.lower()} {g:.6g} inside ngspice's range")
+    elif an[0] == "noise":
         r = run_engine(args, text, mode, "noise")
         if unsupported(r): return "ENGINE-UNSUPPORTED", 0, 0, r["err"]
         if not r["conv"] or len(r["pts"]) != len(xs) or not r["total"]:
@@ -393,8 +447,8 @@ def main():
         missing += sorted({p for p in re.findall(r"\bpdk/[\w.-]+", text) if not os.path.exists(os.path.join(ROOT, "datasets", p))})
         if missing:
             print(f"{'SKIPPED':<19} {name} (missing {', '.join(missing)}: datasets/osdi from tests/build_osdi.sh, datasets/pdk see ENGINE_HANDOFF)"); continue
-        nm = node_map(text) if an[0] != "noise" else {}
-        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] != "noise" and name not in NO_BRANCH_CHECK else ())
+        nm = node_map(text) if an[0] not in ("noise", "pz", "sens") else {}
+        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] not in ("noise", "pz", "sens") else ())
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             print(f"{'NGSPICE-ERROR':<19} {name} {e}"); fails += 1; continue
         for mode in args.modes.split(","):

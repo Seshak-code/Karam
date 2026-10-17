@@ -75,7 +75,7 @@ honest expected scaling, not a claim of beating it.
 
 | Area | Supported |
 |---|---|
-| Analyses | `.op`, `.dc` sweeps, `.tran` (trapezoidal, LTE step control, breakpoints, `uic` / `.ic`), `.ac`, `.noise` |
+| Analyses | `.op`, `.dc` sweeps, `.tran` (trapezoidal, LTE step control, breakpoints, `uic` / `.ic`), `.ac`, `.noise`, `.pz` (poles/zeros, dense, up to 500 unknowns), `.sens` (DC adjoint sensitivity to top-level R, V and I values; device parameters and AC `.sens` are reported as not supported) |
 | Elements | R, C, L, K (mutual inductance), V/I sources (DC, PULSE, SIN, AC), E/F/G/H controlled sources, J (Shichman–Hodges), X subcircuits (nested, local node scoping) |
 | Diode | SPICE level 1: IS, N, RS (internal node), CJO/VJ/M/FC, TT, BV/IBV breakdown, instance AREA/M |
 | BJT | Gummel–Poon: IS, BF/BR, NF/NR, VAF/VAR, IKF/IKR, ISE/NE, ISC/NC, RB/RC/RE (internal nodes), CJE/CJC with XCJC, CJS (substrate node), TF/XTF/VTF/ITF, TR, AREA |
@@ -242,7 +242,7 @@ build/acutesim_engine_dump <netlist> cpu tran <step> <stop>   # machine-readable
 ### Command line
 
 ```bash
-build/treespice circuit.cir                   # runs the netlist's .op/.dc/.ac/.tran/.noise cards, prints the .print tables
+build/treespice circuit.cir                   # runs the netlist's .op/.dc/.ac/.tran/.noise/.pz/.sens cards, prints the .print tables
 build/treespice -b -o run.log -r out.raw circuit.cir   # batch, log to a file, ngspice raw file (--ascii for text)
 build/treespice --tran 1n 10u circuit.cir     # override the analysis; numbers take SI suffixes
 build/treespice --help
