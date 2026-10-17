@@ -879,14 +879,14 @@ public:
   }
 
   template <typename T>
-  int junctionCharges(const Junction &j, const std::array<T, 7> &x, double tempK, T *v, T *q,
+  int junctionCharges(const Junction &j, const std::array<T, 7> &x, T *v, T *q,
                       const JShift *sh = nullptr) const {
     if (j.d) {
       v[0] = shifted(T(x[2] - x[1]), sh, 0);
-      q[0] = diode_iq(v[0], diodeModel(*j.d, tempK)).second;
+      q[0] = diode_iq(v[0], diodeModel(*j.d)).second;
       return 1;
     }
-    const auto p = bjtModel(*j.q, tempK);
+    const auto p = bjtModel(*j.q);
     const double t = p.type;
     for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
     v[3] = t * j.subSign * (x[3] - x[j.sub]);
@@ -905,20 +905,20 @@ public:
   // integrated from the last accepted step (TRAP, else BE), as mosCurrents().
   // next != null: write the accepted charge state (history update).
   template <typename T>
-  std::array<T, 7> junctionCurrents(const Junction &j, const std::array<T, 7> &x, double tempK, double h,
+  std::array<T, 7> junctionCurrents(const Junction &j, const std::array<T, 7> &x, double h,
                                     BlockState::DeviceCharge *next = nullptr, const JShift *sh = nullptr) const {
     std::array<T, 7> I{};
     for (auto &i : I) i = T(0.0);
     double type = 1.0;
     const int *from, *to;
     if (j.d) {
-      const auto p = diodeModel(*j.d, tempK);
+      const auto p = diodeModel(*j.d);
       if (p.rs > 0.0) { const T ir = (x[0] - x[2]) / p.rs; I[0] += ir; I[2] -= ir; }
       const T id = diode_iq(shifted(T(x[2] - x[1]), sh, 0), p).first;
       I[2] += id; I[1] -= id;
       from = diodeFrom; to = diodeTo;
     } else {
-      const auto p = bjtModel(*j.q, tempK);
+      const auto p = bjtModel(*j.q);
       type = p.type;
       auto res = [&](int a, int b, double r) {
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
@@ -933,7 +933,7 @@ public:
     const BlockState::DeviceCharge *st = j.st;
     if (!st || !(h > 1e-15) || !integrator || !junctionHasCharge(j)) return I;
     T v[5], q[5];
-    const int K = junctionCharges(j, x, tempK, v, q, sh);
+    const int K = junctionCharges(j, x, v, q, sh);
     if constexpr (std::is_same_v<T, double>)
       if (next) {  // shift the voltage history (next may alias st)
         std::copy(st->v[1], st->v[1] + 5, next->v[2]);
@@ -984,13 +984,13 @@ public:
   // raw junction voltages at x are limited against the last iteration's
   // (DeviceCharge::jv) and the device is linearised there; node voltages are
   // left alone. First iteration of a solve: vcrit (BJT vbc = 0), as MODEINITJCT.
-  JShift junctionLimit(const Junction &j, const std::vector<double> &x, double tempK) const {
+  JShift junctionLimit(const Junction &j, const std::vector<double> &x) const {
     JShift sh;
     if (!j.st) return sh;
     auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
     auto *st = j.st;
     if (j.d) {
-      const auto m = diodeModel(*j.d, tempK);
+      const auto m = diodeModel(*j.d);
       const double vcrit = compute_vcrit(m.vte, m.is), raw = V(2) - V(1);
       double vl = vcrit;
       if (st->jvState) {
@@ -1002,7 +1002,7 @@ public:
       sh.d[0] = vl - raw;
       return sh;
     }
-    const auto m = bjtModel(*j.q, tempK);
+    const auto m = bjtModel(*j.q);
     const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
     const double raw[2] = {m.type * (V(5) - V(6)), m.type * (V(5) - V(4))};
     for (int k = 0; k < 2; ++k) {
@@ -1032,15 +1032,15 @@ public:
   // Newton stamp of a junction device: I(x) ~ I(vl) + G (v(x) - vl) at the
   // limited junction voltages vl (ngspice's companion), i.e. stampByDual at the
   // shifted point plus the G*(vl - v) correction from one seeded pass.
-  void stampJunction(const Junction &j, const std::vector<double> &v, double tempK, double h) {
-    const JShift sh = limitJunctions_ ? junctionLimit(j, v, tempK) : JShift{};
-    stampByDual(j.n, j.terms, v, [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, tempK, h, nullptr, &sh); });
+  void stampJunction(const Junction &j, const std::vector<double> &v, double h) {
+    const JShift sh = limitJunctions_ ? junctionLimit(j, v) : JShift{};
+    stampByDual(j.n, j.terms, v, [&](const std::array<Dual<double>, 7> &x) { return junctionCurrents(j, x, h, nullptr, &sh); });
     if (sh.d[0] == 0.0 && sh.d[1] == 0.0) return;
     JShift seeded = sh;
     seeded.seed = true;
     std::array<Dual<double>, 7> x;
     for (int k = 0; k < 7; ++k) x[k] = Dual<double>(j.n[k] > 0 && j.n[k] <= (int)v.size() ? v[j.n[k] - 1] : 0.0, 0.0);
-    const auto cur = junctionCurrents(j, x, tempK, h, nullptr, &seeded);
+    const auto cur = junctionCurrents(j, x, h, nullptr, &seeded);
     for (int t = 0; t < j.terms; ++t)
       if (j.n[t] > 0) rhsVector[j.n[t] - 1] += cur[t].grad;
   }
@@ -1168,7 +1168,6 @@ public:
   // Phase 1.8: PVT Application
   void applyCorner(TensorNetlist &netlist, const acutesim::physics::CornerConfig& corner) {
       netlist.environment.process = (SimulationEnvironment::Corner)corner.process;
-      netlist.environment.ambient_temp_K = corner.temperatureC + 273.15;
       
       // If voltage scale is 0 or negative, ignore (safety)
       if (corner.voltageScale > 0.1) {
@@ -1656,7 +1655,7 @@ public:
     forEachJunction(netlist, [&](const Junction &j) {
         std::array<double, 7> x{};
         for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
-        const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, h);
+        const auto I = junctionCurrents(j, x, h);
         for (int k = 0; k < j.terms; ++k)
           if (j.n[k] > 0 && j.n[k] <= (int)node_residuals.size()) node_residuals[j.n[k] - 1] -= I[k];
     });
@@ -1965,7 +1964,7 @@ public:
     forEachJunction(netlist, [&](const Junction &j) {
       std::array<double, 7> x{};
       for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
-      const auto I = junctionCurrents(j, x, netlist.environment.ambient_temp_K, 0.0);
+      const auto I = junctionCurrents(j, x, 0.0);
       DeviceAttribution a{j.d ? j.d->instanceName : j.q->instanceName, j.d ? "Diode" : "BJT", {}};
       for (int k = 0; k < j.terms; ++k) {
         addRes(j.n[k], -I[k]);
@@ -2156,8 +2155,8 @@ public:
               std::array<double, 7> x{};
               for (int k = 0; k < jj.terms; ++k) x[k] = getV(jj.n[k]);
               const double p0 = *par, dp = 1e-6 * std::max(std::abs(p0), 1e-30);
-              *par = p0 + dp; const auto Ip = junctionCurrents(jj, x, netlist.environment.ambient_temp_K, 0.0);
-              *par = p0 - dp; const auto Im = junctionCurrents(jj, x, netlist.environment.ambient_temp_K, 0.0);
+              *par = p0 + dp; const auto Ip = junctionCurrents(jj, x, 0.0);
+              *par = p0 - dp; const auto Im = junctionCurrents(jj, x, 0.0);
               for (int k = 0; k < jj.terms; ++k)
                   if (jj.n[k] > 0 && jj.n[k] <= (int)b_sens.size()) b_sens[jj.n[k] - 1] -= (Ip[k] - Im[k]) / (2.0 * dp);
           }
@@ -2495,8 +2494,7 @@ public:
     forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) { stampBehav(b, sl, row, v_guess, time); });
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
                                const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
-    const double tempK = netlist.environment.ambient_temp_K;
-    forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, tempK, h); });
+    forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, h); });
     osdiAll(netlist, v_guess, h, true, false);  // stamped in device order: the same sequence every iteration
     for (size_t i = 0; i < osdiRefs_.size(); ++i) stampOsdi(osdiRefs_[i], osdiI_[i], osdiJ_[i], v_guess);
 

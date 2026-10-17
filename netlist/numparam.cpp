@@ -11,6 +11,9 @@
 #include <stdexcept>
 
 namespace acutesim { namespace numparam {
+
+thread_local double temperC = 27.0;  // TEMPER: the circuit temperature of this thread's parse in progress
+
 namespace {
 
 std::string upper(std::string s) {
@@ -235,7 +238,7 @@ private:
         }
         if (auto it = bind_.find(name); it != bind_.end()) return it->second;
         if (name == "PI") return mk(Expr::Const, {}, M_PI);
-        if (name == "TEMPER") return mk(Expr::Const, {}, 27.0);  // circuit temperature in C: .temp is not supported, always 27
+        if (name == "TEMPER") return mk(Expr::Const, {}, temperC);  // circuit temperature in C
         if (name == "TIME" && c_.beh) return mk(Expr::Time);
         double v;
         if (c_.look(name, v)) return mk(Expr::Const, {}, v);
@@ -720,7 +723,8 @@ std::string text(const Expr &e) {
     return out;
 }
 
-std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine) {
+std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine, double tempC) {
+    temperC = tempC;
     return Expander(errLine).run(lines);
 }
 
