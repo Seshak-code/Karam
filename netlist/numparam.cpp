@@ -517,7 +517,7 @@ struct Subckt {
 
 class Expander {
 public:
-    explicit Expander(int &errLine) : errLine_(errLine) {}
+    Expander(int &errLine, const std::map<std::string, double> &overrides) : errLine_(errLine), overrides_(overrides) {}
 
     Lines run(const Lines &in) {
         Lines top;
@@ -541,6 +541,7 @@ public:
             subckts_[s.name] = std::move(s);
         }
         for (const auto &[n, l] : top) { errLine_ = n; collectParams(l, global_, n); }
+        for (const auto &[name, v] : overrides_) { global_.raw[name] = num(v); global_.line.emplace(name, 0); }  // .step param
         Lines out = walk(top, global_, "", nullptr);
         Lines params;  // the evaluated global parameters, for the parser's {NAME} / bare-name values
         for (const auto &[name, e] : global_.raw) {
@@ -560,6 +561,7 @@ public:
 
 private:
     int &errLine_;
+    const std::map<std::string, double> &overrides_;
     std::map<std::string, Subckt> subckts_;
     std::map<std::string, std::string> specialized_;  // key -> emitted subckt name
     Scope global_;
@@ -723,9 +725,10 @@ std::string text(const Expr &e) {
     return out;
 }
 
-std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine, double tempC) {
+std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine, double tempC,
+                                                const std::map<std::string, double> &overrides) {
     temperC = tempC;
-    return Expander(errLine).run(lines);
+    return Expander(errLine, overrides).run(lines);
 }
 
 }}  // namespace acutesim::numparam
