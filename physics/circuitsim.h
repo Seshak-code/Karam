@@ -1337,14 +1337,14 @@ public:
   int branchCount(const TensorNetlist &nl) const { int t = 0; return branchSlots(nl, t)[0].dev - nl.numGlobalNodes; }
   std::vector<std::string> branchNames(const TensorNetlist &nl) const {
     int t = 0;
-    const auto slots = branchSlots(nl, t);
-    std::vector<std::string> names(slots[0].dev - nl.numGlobalNodes);
+    const auto sl = branchSlots(nl, t);
+    std::vector<std::string> names(sl[0].dev - nl.numGlobalNodes);
     auto put = [&](const BranchSlot &s, int row, const std::string &n) {
       std::string full = s.inst ? n.substr(0, 1) + "." + s.inst->name + "." + n : n;
       for (auto &c : full) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
       names[row - nl.numGlobalNodes] = full;
     };
-    for (const auto &s : slots) {
+    for (const auto &s : sl) {
       for (size_t i = 0; i < s.blk->voltageSources.size(); ++i) put(s, s.vs + i, s.blk->voltageSources[i].name);
       for (size_t i = 0; i < s.blk->inductors.size(); ++i) put(s, s.ind + i, s.blk->inductors[i].name);
       for (size_t i = 0; i < s.blk->voltageControlledVoltageSources.size(); ++i)
