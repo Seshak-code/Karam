@@ -246,6 +246,7 @@ build/treespice circuit.cir                   # runs the netlist's .op/.dc/.ac/.
 build/treespice -b -o run.log -r out.raw circuit.cir   # batch, log to a file, ngspice raw file (--ascii for text)
 build/treespice --tran 1n 10u circuit.cir     # override the analysis; numbers take SI suffixes
 build/treespice --help
+cmake --install build --prefix ~/treespice    # bin/treespice, lib/libacutesim_engine.a, include/treespice/engine_api/
 python3 tests/cli_check.py                    # .print tables and raw files against ngspice
 ```
 

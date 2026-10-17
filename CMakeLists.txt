@@ -96,7 +96,8 @@ target_include_directories(acutesim_engine_objects
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>              # "engine_api/x.h", "netlist/circuit.h"
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/engine_api>   # bare "simulation_dto.h"
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:include/treespice>
+        $<INSTALL_INTERFACE:include/treespice/engine_api>
 )
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,15 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(treespice cli/engine_cli_main.cpp)
 target_link_libraries(treespice PRIVATE acutesim_engine)
+
+# cmake --install build --prefix X: bin/treespice, lib/libacutesim_engine.a, include/treespice/engine_api/*.h
+# (the static library carries every object, so the OBJECT target needs no install)
+if(TREESPICE_STANDALONE)
+    include(GNUInstallDirs)
+    install(TARGETS treespice RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(TARGETS acutesim_engine ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(DIRECTORY engine_api DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/treespice FILES_MATCHING PATTERN "*.h")
+endif()
 
 # ---------------------------------------------------------------------------
 # Waveform dump tool — machine-readable output for tests/ngspice_diff
