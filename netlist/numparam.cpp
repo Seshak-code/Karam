@@ -3,8 +3,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -222,6 +224,9 @@ struct Scope {
     std::map<std::string, double> val;
     std::set<std::string> busy;
     Scope *parent = nullptr;
+    const void *owner = nullptr;                      // the Subckt whose body this scope holds
+    std::string tag;                                  // that instance's emitted subcircuit name
+    std::map<std::string, std::string> models;        // its local .model names -> hoisted names
 
     bool lookup(const std::string &n, double &v) {
         if (auto it = val.find(n); it != val.end()) { v = it->second; return true; }
@@ -345,6 +350,8 @@ struct Subckt {
     std::vector<std::string> ports;
     std::vector<std::pair<std::string, std::string>> defaults;
     Lines body;
+    const Subckt *parent = nullptr;     // the .subckt this one is nested in (null: top level)
+    std::map<std::string, Subckt> kids; // nested definitions, visible in this body and below
 };
 
 class Expander {
@@ -357,23 +364,10 @@ public:
             errLine_ = in[i].first;
             const auto w = words(in[i].second);
             if (in[i].first == 1 || w.empty() || upper(w[0]) != ".SUBCKT") { top.push_back(in[i]); continue; }
-            const std::string hdr = in[i].second.substr(in[i].second.find(w[0]) + w[0].size());
-            const auto hw = headWords(hdr);
-            if (hw.empty()) throw std::runtime_error(".subckt needs a name");
-            Subckt s{upper(hw[0]), {hw.begin() + 1, hw.end()}, pairs(hdr), {}};
-            if (subckts_.count(s.name)) throw std::runtime_error("subcircuit " + s.name + " defined twice");
-            for (++i; i < in.size(); ++i) {
-                const auto bw = words(in[i].second);
-                const std::string k = bw.empty() ? "" : upper(bw[0]);
-                if (k == ".ENDS") break;
-                if (k == ".SUBCKT") { errLine_ = in[i].first; throw std::runtime_error("nested .subckt definitions are not supported (missing .ends for " + s.name + "?)"); }
-                s.body.push_back(in[i]);
-            }
-            if (i == in.size()) throw std::runtime_error(".subckt " + s.name + " has no .ends");
-            subckts_[s.name] = std::move(s);
+            readSubckt(in, i, subckts_, nullptr);
         }
         for (const auto &[n, l] : top) collectParams(l, global_, n);
-        Lines out = walk(top, global_, "", nullptr);
+        Lines out = walk(top, global_, "", nullptr, nullptr, "");
         Lines params;  // the evaluated global parameters, for the parser's {NAME} / bare-name values
         for (const auto &[name, e] : global_.raw) {
             errLine_ = global_.line[name];
@@ -393,6 +387,36 @@ public:
 private:
     int &errLine_;
     std::map<std::string, Subckt> subckts_;
+    // The .subckt at in[i] up to its .ends, nested definitions into its kids; i ends on the .ends
+    void readSubckt(const Lines &in, size_t &i, std::map<std::string, Subckt> &into, const Subckt *parent) {
+        const std::string &card = in[i].second;
+        const std::string hdr = card.substr(card.find(words(card)[0]) + 7);
+        const auto hw = headWords(hdr);
+        if (hw.empty()) throw std::runtime_error(".subckt needs a name");
+        auto [it, isNew] = into.try_emplace(upper(hw[0]));
+        if (!isNew) throw std::runtime_error("subcircuit " + upper(hw[0]) + " defined twice");
+        Subckt &s = it->second;
+        s.name = upper(hw[0]);
+        s.ports = {hw.begin() + 1, hw.end()};
+        s.defaults = pairs(hdr);
+        s.parent = parent;
+        for (++i; i < in.size(); ++i) {
+            const auto bw = words(in[i].second);
+            const std::string k = bw.empty() ? "" : upper(bw[0]);
+            if (k == ".ENDS") return;
+            errLine_ = in[i].first;
+            if (k == ".SUBCKT") readSubckt(in, i, s.kids, &s);
+            else s.body.push_back(in[i]);
+        }
+        throw std::runtime_error(".subckt " + s.name + " has no .ends");
+    }
+    // The subcircuit an X card names: a nested definition of the enclosing bodies, innermost first, else a top-level one
+    const Subckt *find(const std::string &name, const Subckt *ctx) const {
+        for (; ctx; ctx = ctx->parent)
+            if (auto it = ctx->kids.find(name); it != ctx->kids.end()) return &it->second;
+        const auto it = subckts_.find(name);
+        return it == subckts_.end() ? nullptr : &it->second;
+    }
     std::map<std::string, std::string> specialized_;  // key -> emitted subckt name
     Scope global_;
     Lines defs_;  // specialized .subckt definitions and their hoisted .model cards
@@ -408,8 +432,10 @@ private:
     }
 
     // Lines of one scope: .if resolved, .param consumed, X cards specialized,
-    // expressions substituted. localModels: renames for hoisted local .model cards.
-    Lines walk(const Lines &in, Scope &sc, const std::string &prefix, std::map<std::string, std::string> *localModels) {
+    // expressions substituted. localModels: renames for hoisted local .model cards. ctx: the .subckt whose
+    // body this is (for nested definitions). mult: the instance's m=, set on every device that has one.
+    Lines walk(const Lines &in, Scope &sc, const std::string &prefix, std::map<std::string, std::string> *localModels,
+               const Subckt *ctx, const std::string &mult) {
         Lines out;
         std::vector<std::pair<bool, bool>> ifs;  // (this branch active, some branch taken)
         std::vector<bool> elses;                 // per open .if: its .else seen
@@ -455,7 +481,13 @@ private:
                 defs_.push_back({n, line});
                 continue;
             }
-            if (k[0] == 'X') line = instance(line, sc, n);
+            if (!mult.empty() && std::strchr("RCLIDQMJGFX", k[0])) {  // the instance's m= replaces any of the device's own (ngspice)
+                static const std::regex own(R"((^|\s)[mM]\s*=\s*[^\s]+)");
+                line = std::regex_replace(line, own, "$1") + " m=" + mult;
+            }
+            if (k[0] == 'N' && !mult.empty())
+                throw std::runtime_error(w[0] + ": m= on a subcircuit holding an OSDI device is not supported yet");
+            if (k[0] == 'X') line = instance(line, sc, n, ctx);
             out.push_back({n, line});
         }
         if (!ifs.empty()) throw std::runtime_error(".if without .endif");
@@ -476,39 +508,50 @@ private:
     }
 
     // X<name> <nodes...> <subckt> [params:] [k=v ...] -> X<name> <nodes...> <specialized subckt>
-    std::string instance(const std::string &line, Scope &caller, int n) {
+    std::string instance(const std::string &line, Scope &caller, int n, const Subckt *ctx) {
         const auto hw = headWords(line);
         if (hw.size() < 2) throw std::runtime_error(hw.empty() ? "empty X card" : hw[0] + ": no subcircuit name");
         const std::string name = upper(hw.back());
-        auto it = subckts_.find(name);
-        if (it == subckts_.end()) return line;  // the parser reports the unknown subcircuit
-        const Subckt &s = it->second;
+        const Subckt *found = find(name, ctx);
+        if (!found) return line;  // the parser reports the unknown subcircuit
+        const Subckt &s = *found;
         Scope sc;
         sc.parent = &global_;
+        Scope *lex = nullptr;  // a nested definition sees the parameters and models of the instance it sits in
+        if (s.parent) {
+            for (lex = &caller; lex && lex->owner != s.parent; lex = lex->parent) {}
+            if (!lex) throw std::runtime_error(hw[0] + ": " + s.name + " is not visible here");
+            sc.parent = lex;
+            sc.models = lex->models;
+        }
+        sc.owner = &s;
         for (const auto &[k, v] : s.defaults) sc.raw[k] = v;
         // The body's own .param values are defaults too: an X card overrides them
         // (ngspice; sky130 declares l, w, ... that way). Overridden values win
         // because a scope reads val before raw.
         Scope body;
         for (const auto &[bn, bl] : s.body) collectParams(bl, body);
-        std::string given;
+        std::string given, mult;
         for (const auto &[k, v] : pairs(line)) {
-            if (k == "M" && !sc.raw.count(k) && !body.raw.count(k))  // ngspice scales every device inside
-                throw std::runtime_error(hw[0] + ": m= on a subcircuit instance is not supported yet");
+            if (k == "M" && !sc.raw.count(k) && !body.raw.count(k)) {  // ngspice scales every device inside
+                mult = num(caller.evaluate(v));
+                continue;
+            }
             if (!sc.raw.count(k) && !body.raw.count(k)) throw std::runtime_error(hw[0] + ": " + s.name + " has no parameter " + k);
             sc.raw.erase(k);
             sc.val[k] = caller.evaluate(v);
             if (body.raw.count(k)) given += " " + k + "=" + num(sc.val[k]);
         }
-        std::string key = s.name + given;
+        std::string key = (s.parent ? s.name + "@" + lex->tag : s.name) + given + (mult.empty() ? "" : " m=" + mult);
         for (const auto &[k, v] : s.defaults) { double x; sc.lookup(k, x); key += " " + k + "=" + num(x); }
         // Generated names use '|', which SPICE names never hold (sky130's hold "__"): the parser's
         // messages map them back to the user's names (SPICEParser::parse, fail). Only a key with no
         // parameters keeps the plain name: body-.param subckts (sky130) differ by `given` alone
-        auto [spec, isNew] = specialized_.emplace(key, key == s.name ? s.name : s.name + "|" + std::to_string(specialized_.size() + 1));
+        auto [spec, isNew] = specialized_.emplace(key, key == s.name && !s.parent ? s.name : s.name + "|" + std::to_string(specialized_.size() + 1));
+        sc.tag = spec->second;
         if (isNew) {
             for (const auto &[bn, bl] : s.body) collectParams(bl, sc);  // body .params (any order)
-            std::map<std::string, std::string> models;
+            std::map<std::string, std::string> &models = sc.models;
             for (const auto &[bn, bl] : s.body)
                 if (const auto w = words(bl); w.size() > 1 && upper(w[0]) == ".MODEL") {
                     const std::string m = upper(w[1]);
@@ -518,7 +561,7 @@ private:
                 }
             std::string hdr = ".subckt " + spec->second;
             for (const auto &p : s.ports) hdr += " " + p;
-            Lines body = walk(s.body, sc, spec->second, &models);
+            Lines body = walk(s.body, sc, spec->second, &models, &s, mult);
             errLine_ = n;
             defs_.push_back({s.body.empty() ? n : s.body.front().first, hdr});
             defs_.insert(defs_.end(), body.begin(), body.end());

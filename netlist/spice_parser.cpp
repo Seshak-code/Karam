@@ -118,6 +118,18 @@ void SPICEParser::requireFields(const std::vector<std::string>& tok, size_t n) {
                                  std::to_string(n - 1) + " fields after the name");
 }
 
+// R, L, I, G, F and J take m= (parallel copies) at the end of the card; C, D, Q and M parse their own.
+double SPICEParser::takeMultiplier(std::vector<std::string>& tok) const {
+    double m = 1.0;
+    for (size_t i = 3; i + 1 < tok.size();) {
+        if (toUpper(tok[i]) != "M") { ++i; continue; }
+        m = parseValue(tok[i + 1]);
+        if (!(m > 0.0)) throw std::runtime_error(tok[0] + ": M must be > 0");
+        tok.erase(tok.begin() + i, tok.begin() + i + 2);
+    }
+    return m;
+}
+
 // Instance fields after a D/Q model name: [area] [AREA=a] [M=m]. AREA and M both
 // scale the device (currents, capacitances; resistances divide). OFF and IC=
 // steer which operating point SPICE finds (ngspice holds OFF junctions at 0 V
@@ -278,6 +290,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     inSubckt_ = false;
     topInstances_.clear();
     pendingICs_.clear();
+    subcktICs_.clear();
+    subcktNames_.clear();
+    hierNodes_.clear();
     globals_.clear();
     subcktGlobals_.clear();
     noiseOut_.clear();
@@ -363,13 +378,40 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 else if (keyword == ".ENDS")   parseSubcktEnd();
                 else if (keyword == ".OP")     result_.hasOP = true;
                 else if (keyword == ".OPTION" || keyword == ".OPTIONS") {
-                    // gminsteps changes the DC homotopy; temp/tnom would change every device
-                    // and are not modelled yet (like .temp); the other options are ignored
-                    for (size_t i = 1; i + 1 < tok.size(); ++i) {
+                    // temp/tnom would change every device and are not modelled yet (like .temp). Options the
+                    // solver does not read are ignored with a warning, as ngspice does for unknown ones.
+                    auto& env = result_.netlist.environment;
+                    auto positive = [&](const std::string& k, double v) {
+                        if (!(v > 0.0)) throw std::runtime_error(".options " + k + " must be > 0");
+                        return v;
+                    };
+                    for (size_t i = 1; i < tok.size(); ++i) {
                         const std::string k = toUpper(tok[i]);
-                        if (k == "GMINSTEPS") result_.netlist.environment.gmin_stepping = parseValue(tok[i + 1]) != 0.0;
-                        if (k == "TEMP" || k == "TNOM") throw std::runtime_error(".options " + k + " is not supported yet");
+                        const bool kv = i + 1 < tok.size() && isValue(tok[i + 1]);
+                        const double v = kv ? parseValue(tok[i + 1]) : 0.0;
+                        if (k == "METHOD" && i + 1 < tok.size()) {
+                            const std::string m = toUpper(tok[++i]);
+                            if (m != "TRAP" && m != "TRAPEZOIDAL" && m != "GEAR") std::cerr << "Warning: .options method=" << m << " is ignored\n";
+                            else env.gear = m == "GEAR";
+                            continue;
+                        }
+                        if (!kv) { if (k != "SCALE" && k != "GMINSTEPS") std::cerr << "Warning: .options " << k << " is ignored\n"; continue; }
+                        ++i;
+                        if (k == "GMINSTEPS") env.gmin_stepping = v != 0.0;
+                        else if (k == "TEMP" || k == "TNOM") throw std::runtime_error(".options " + k + " is not supported yet");
+                        else if (k == "RELTOL") env.reltol = positive(k, v);
+                        else if (k == "ABSTOL") env.abstol = positive(k, v);
+                        else if (k == "VNTOL") env.vntol = positive(k, v);
+                        else if (k == "TRTOL") env.trtol = positive(k, v);
+                        else if (k == "GMIN") { if (v < 0.0) throw std::runtime_error(".options gmin must be >= 0"); env.gmin = v; }
+                        else if (k == "RSHUNT") env.rshunt = positive(k, v);
+                        else if (k == "ITL1") env.itl1 = (int)positive(k, v);
+                        else if (k == "ITL2") env.itl2 = (int)positive(k, v);
+                        else if (k == "ITL4") env.itl4 = (int)positive(k, v);
+                        else if (k == "MAXORD") env.maxord = (int)positive(k, v);
+                        else if (k != "SCALE") std::cerr << "Warning: .options " << k << " is ignored\n";
                     }
+                    // ponytail: chgtol has no counterpart in the engine's LTE (an absolute bound scaled by RELTOL and TRTOL): warned, ignored
                 }
                 else if (keyword == ".TRAN") {
                     result_.hasTRAN = true;
@@ -382,15 +424,15 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                     for (const auto& t : tok)
                         if (toUpper(t) == "UIC") result_.tranUIC = true;
                 }
-                else if (keyword == ".IC") {
-                    // .ic V(node)=value ...  → tokens: V node value
-                    if (inSubckt_) throw std::runtime_error(".ic inside .subckt is not supported");
+                else if (keyword == ".IC" || keyword == ".NODESET") {
+                    // .ic / .nodeset V(node)=value ...  → tokens: V node value
                     if (tok.size() < 4 || (tok.size() - 1) % 3 != 0)
-                        throw std::runtime_error(".ic expects V(node)=value entries");
+                        throw std::runtime_error(keyword + " expects V(node)=value entries");
                     for (size_t i = 1; i + 2 < tok.size(); i += 3) {
                         if (toUpper(tok[i]) != "V")
-                            throw std::runtime_error(".ic supports V(node)=value only");
-                        pendingICs_.push_back({toUpper(tok[i + 1]), parseValue(tok[i + 2]), lineNum});
+                            throw std::runtime_error(keyword + " supports V(node)=value only");
+                        (inSubckt_ ? subcktICs_[subcktName_] : pendingICs_)
+                            .push_back({toUpper(tok[i + 1]), parseValue(tok[i + 2]), lineNum, keyword == ".NODESET"});
                     }
                 }
                 else if (keyword == ".NOISE") {
@@ -445,6 +487,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             // Choose target block: subcircuit body or global
             TensorBlock& blk = inSubckt_ ? subcktBlock_ : result_.netlist.globalBlock;
             char type = static_cast<char>(std::toupper(static_cast<unsigned char>(keyword[0])));
+            mult_ = std::strchr("RLIGFJ", type) ? takeMultiplier(tok) : 1.0;
 
             switch (type) {
                 case 'R': parseResistor(tok, blk);   break;
@@ -462,13 +505,13 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 case 'G': parseVCCS(tok, blk);        break;
                 case 'H': parseCCVS(tok, blk);        break;
                 case 'F': parseCCCS(tok, blk);        break;
-                // T used to be two unconnected resistors (silently wrong)
-                case 'T':
-                    throw std::runtime_error(tok[0] + ": transmission lines are not supported yet");
+                case 'T': parseTLine(tok, blk);       break;
+                case 'O':
+                    throw std::runtime_error(tok[0] + ": lossy transmission lines (LTRA) are not supported yet");
                 case 'X': {
                     // X<name> <nodes...> <subcktName>; expanded after parsing
                     requireFields(tok, 3);
-                    PendingInstance pi{toUpper(tok.back()), {}, lineNum};
+                    PendingInstance pi{toUpper(tok.back()), {}, lineNum, tok[0]};
                     for (size_t i = 1; i + 1 < tok.size(); ++i)
                         pi.nodes.push_back(nodeIndex(tok[i]));
                     (inSubckt_ ? subcktChildren_[subcktName_] : topInstances_).push_back(pi);
@@ -488,6 +531,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
 
     if (inSubckt_)
         return fail(lines.back().first, ".subckt " + subcktName_ + " has no .ends");
+    // ponytail: the engine's Gear 2 has constant-step coefficients, wrong under LTE step changes, so method=gear
+    // with maxord > 1 runs the trapezoidal rule (same solution within LTE); maxord=1 is exact backward Euler.
+    if (result_.netlist.environment.gear && result_.netlist.environment.maxord > 1)
+        std::cerr << "Warning: .options method=gear (maxord > 1) runs as trapezoidal\n";
     try { resolveControlledSources(result_.netlist.globalBlock); }
     catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
 
@@ -511,19 +558,32 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             return fail(lines.back().first, ".noise names an unknown output node");
     }
 
-    // .ic may name a node defined later in the file
-    for (const auto& ic : pendingICs_) {
-        auto it = nodeMap_.find(ic.node);
-        if (it == nodeMap_.end())
-            return fail(ic.line, ".ic names unknown node '" + ic.node + "'");
-        result_.netlist.nodeICs.push_back({it->second, ic.value});
-    }
-
     // Expand X cards (recursively) now that every .subckt is defined
     for (const auto& pi : topInstances_) {
-        try { expandInstance(pi, pi.nodes, 0); }
+        try { expandInstance(pi, pi.nodes, 0, toUpper(pi.name)); }
         catch (const std::exception& e) { return fail(pi.line, e.what()); }
     }
+
+    // .ic / .nodeset may name a node defined later in the file, or a subcircuit internal (x1.n)
+    for (const auto& ic : pendingICs_) {
+        auto it = nodeMap_.find(ic.node);
+        const bool top = it != nodeMap_.end();
+        if (!top) it = hierNodes_.find(ic.node);
+        if (!top && it == hierNodes_.end())
+            return fail(ic.line, (ic.nodeset ? ".nodeset" : ".ic") + std::string(" names unknown node '") + ic.node + "'");
+        (ic.nodeset ? result_.netlist.nodeSets : result_.netlist.nodeICs).push_back({it->second, ic.value});
+    }
+
+    for (auto* v : {&result_.netlist.nodeICs, &result_.netlist.nodeSets}) {  // one value per node: the last given (a top-level card beats a body's)
+        std::map<int, double> last;
+        for (const auto& [n, val] : *v) last[n] = val;
+        v->assign(last.begin(), last.end());
+    }
+
+    result_.netlist.nodeNames.assign(result_.netlist.numGlobalNodes + 1, "");
+    for (const auto* names : {&nodeMap_, &hierNodes_})
+        for (const auto& [name, idx] : *names)
+            if (idx >= 0 && idx < (int)result_.netlist.nodeNames.size()) result_.netlist.nodeNames[idx] = name;
 
     // Resolve .model cards now that the whole file is read (SPICE allows .model
     // after the instance; resolving at the instance made a late PNP an NPN).
@@ -742,7 +802,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
             supported(c, {"BETA", "VTO", "LAMBDA"});
             j.isNChannel = (c->type == "NJF" || c->type == "NJFET");
-            j.beta   = c->get("BETA", 1e-4);
+            j.beta   = c->get("BETA", 1e-4) * j.m;
             j.Vto    = c->get("VTO", -2.0);
             j.lambda = c->get("LAMBDA", 0.0);
         }
@@ -812,6 +872,7 @@ void SPICEParser::parseResistor(const std::vector<std::string>& tok, TensorBlock
     size_t first = 4;  // "R1 a b r=1k" (IHP cap_cmim) as well as "R1 a b 1k"
     if (const std::string k = toUpper(tok[3]); (k == "R" || k == "RESISTANCE") && tok.size() > 4) r.resistance_ohms = parseValue(tok[first++]);
     else r.resistance_ohms = parseValue(tok[3]);
+    r.resistance_ohms /= mult_;
     if (r.resistance_ohms == 0.0) {  // an exact short: a 0 V branch (negative R is legal SPICE)
         blk.voltageSources.push_back({r.nodeTerminal1, r.nodeTerminal2, 0.0});
         return;
@@ -863,7 +924,7 @@ void SPICEParser::parseInductor(const std::vector<std::string>& tok, TensorBlock
     ind.name = tok[0];
     ind.nodeCoil1 = nodeIndex(tok[1]);
     ind.nodeCoil2 = nodeIndex(tok[2]);
-    ind.inductance_henries = parseValue(tok[3]);
+    ind.inductance_henries = parseValue(tok[3]) / mult_;
     // IC= (initial current) applies with UIC; anything else used to be ignored silently
     for (size_t i = 4; i < tok.size(); ++i) {
         if (toUpper(tok[i]) != "IC" || i + 1 >= tok.size())
@@ -993,6 +1054,10 @@ void SPICEParser::parseCurrSrc(const std::vector<std::string>& tok, TensorBlock&
     cs.nodePositive = nodeIndex(tok[1]);
     cs.nodeNegative = nodeIndex(tok[2]);
     parseSourceSpec(tok, cs, cs.current_A);
+    if (mult_ != 1.0) {  // m parallel sources: every amplitude scales
+        for (double* a : {&cs.current_A, &cs.ac_mag, &cs.pulse_v1, &cs.pulse_v2, &cs.sine_vo, &cs.sine_va}) *a *= mult_;
+        for (double& v : cs.pwl_v) v *= mult_;
+    }
     blk.currentSources.push_back(cs);
 }
 
@@ -1087,6 +1152,7 @@ void SPICEParser::parseJFET(const std::vector<std::string>& tok, TensorBlock& bl
     j.gate   = nodeIndex(tok[2]);
     j.source = nodeIndex(tok[3]);
     j.modelName = tok[4];
+    j.m = mult_;
     blk.jfets.push_back(j);
 }
 
@@ -1106,6 +1172,31 @@ void SPICEParser::parseOsdiDevice(const std::vector<std::string>& tok, TensorBlo
     for (size_t i = 1; i < m; ++i) o.nodes.push_back(nodeIndex(tok[i]));
     for (size_t i = m + 1; i + 1 < tok.size(); i += 2) o.params.push_back({tok[i], parseValue(tok[i + 1])});
     blk.osdiDevices.push_back(o);
+}
+
+// T<name> <p1+> <p1-> <p2+> <p2-> Z0=<z0> (TD=<delay> | F=<f> [NL=<wavelengths, 0.25>]) [IC=v1,i1,v2,i2]   (ngspice TRA)
+void SPICEParser::parseTLine(const std::vector<std::string>& tok, TensorBlock& blk) {
+    requireFields(tok, 8);
+    TransmissionLine t{};
+    t.name = tok[0];
+    t.nodePort1Pos = nodeIndex(tok[1]); t.nodePort1Neg = nodeIndex(tok[2]);
+    t.nodePort2Pos = nodeIndex(tok[3]); t.nodePort2Neg = nodeIndex(tok[4]);
+    double td = 0.0, f = 0.0, nl = 0.25;
+    for (size_t i = 5; i + 1 < tok.size(); ++i) {
+        const std::string k = toUpper(tok[i]);
+        if (k == "Z0" || k == "ZO") t.characteristicImpedance_Z0_ohms = parseValue(tok[++i]);
+        else if (k == "TD") td = parseValue(tok[++i]);
+        else if (k == "F") f = parseValue(tok[++i]);
+        else if (k == "NL") nl = parseValue(tok[++i]);
+        else if (k == "IC" && i + 4 < tok.size()) {
+            for (double& v : t.ic) v = parseValue(tok[++i]);
+            t.icGiven = true;
+        } else throw std::runtime_error(tok[0] + ": parameter " + k + " is not supported yet");
+    }
+    t.propagationDelay_Td_s = td > 0.0 ? td : f > 0.0 ? nl / f : 0.0;
+    if (!(t.characteristicImpedance_Z0_ohms > 0.0)) throw std::runtime_error(tok[0] + ": Z0 must be given and > 0");
+    if (!(t.propagationDelay_Td_s > 0.0)) throw std::runtime_error(tok[0] + ": TD (or F and NL) must be given and > 0");
+    blk.transmissionLines.push_back(t);
 }
 
 // E<name> <n+> <n-> <nc+> <nc-> <gain>
@@ -1141,7 +1232,7 @@ void SPICEParser::parseVCCS(const std::vector<std::string>& tok, TensorBlock& bl
     g.outNeg  = nodeIndex(tok[2]);
     g.ctrlPos = nodeIndex(tok[3]);
     g.ctrlNeg = nodeIndex(tok[4]);
-    g.gm      = parseValue(tok[5]);
+    g.gm      = parseValue(tok[5]) * mult_;
     blk.voltageControlledCurrentSources.push_back(g);
 }
 
@@ -1215,7 +1306,7 @@ void SPICEParser::parseCCCS(const std::vector<std::string>& tok, TensorBlock& bl
     f.outNeg = nodeIndex(tok[2]);
     f.ctrlPos = f.ctrlNeg = 0;
     f.ctrlName = toUpper(tok[3]);
-    f.alpha = parseValue(tok[4]);
+    f.alpha = parseValue(tok[4]) * mult_;
     blk.currentControlledCurrentSources.push_back(f);
 }
 
@@ -1237,6 +1328,13 @@ void SPICEParser::parseSubcktEnd() {
     inSubckt_ = false;
     inductorIndex_.swap(savedInductorIndex_);
     subcktBlock_.numInternalNodes = nextLocalNode_ - 1;  // ports + internal nodes
+    auto& names = subcktNames_[subcktName_];
+    names.assign(nextLocalNode_ - 1, "");
+    for (const auto& [name, l] : subcktNodeMap_) names[l - 1] = name;
+    for (const auto& ic : subcktICs_[subcktName_])
+        if (!subcktNodeMap_.count(ic.node))
+            throw std::runtime_error(std::string(ic.nodeset ? ".nodeset" : ".ic") + " (line " + std::to_string(ic.line) +
+                                     ") names unknown node '" + ic.node + "' in subcircuit " + subcktName_);
 
     result_.netlist.defineBlock(subcktBlock_);
     result_.subcircuitsCreated++;
@@ -1245,7 +1343,7 @@ void SPICEParser::parseSubcktEnd() {
 // One instance of `pi.subckt` with ports on global nodes `portNodes`: fresh
 // global nodes for its internal nodes, then its own X cards, recursively.
 void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes,
-                                 int depth) {
+                                 int depth, const std::string& path) {
     if (depth > 64) throw std::runtime_error("subcircuit nesting deeper than 64 (recursive .subckt?)");
     auto it = result_.netlist.blockDefinitions.find(pi.subckt);
     if (it == result_.netlist.blockDefinitions.end())
@@ -1259,17 +1357,25 @@ void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<in
     const auto& globals = subcktGlobals_[pi.subckt];  // internal locals named in .global
     for (int l = (int)map.size() + 1; l <= blk.numInternalNodes; ++l) {
         auto g = globals.find(l);
-        if (g == globals.end()) { map.push_back(nextNode_++); continue; }
+        if (g == globals.end()) {
+            hierNodes_[path + "." + subcktNames_[pi.subckt][l - 1]] = nextNode_;
+            map.push_back(nextNode_++);
+            continue;
+        }
         auto [node, isNew] = nodeMap_.emplace(g->second, nextNode_);
         if (isNew) ++nextNode_;
         map.push_back(node->second);
     }
     result_.netlist.addInstance(pi.subckt, map);
+    const auto& localNames = subcktNames_[pi.subckt];
+    for (const auto& ic : subcktICs_[pi.subckt])  // a body's .ic / .nodeset applies to each instance
+        (ic.nodeset ? result_.netlist.nodeSets : result_.netlist.nodeICs)
+            .push_back({map[std::find(localNames.begin(), localNames.end(), ic.node) - localNames.begin()], ic.value});
 
     for (const auto& child : subcktChildren_[pi.subckt]) {
         std::vector<int> childPorts;
         for (int l : child.nodes) childPorts.push_back(l == 0 ? 0 : map[l - 1]);
-        expandInstance(child, childPorts, depth + 1);
+        expandInstance(child, childPorts, depth + 1, path + "." + toUpper(child.name));
     }
 }
 

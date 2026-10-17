@@ -454,7 +454,25 @@ public:
     std::vector<std::function<double(double)>> corners;  // next waveform corner after x, per source
   } tran_;
   void tranCorners(const TensorNetlist &netlist);
+  // Append an accepted step to a line's history and note a kink in either wave (its break is TD later)
+  static void pushLine(BlockState::LineHistory &h, double dt, double w1, double w2, double td);
   double lteTolerance_ = 1e-4;  // absolute LTE tolerance
+  // .options (SimulationEnvironment), applied at each analysis entry
+  double reltol_ = 1e-3, vntol_ = 1e-6, abstol_ = 1e-12, gmin_ = 1e-12, gshunt_ = 0.0;
+  int itl1_ = 100, itl2_ = 50, itl4_ = 0;
+  IntegrationType tranMethod_ = IntegrationType::TRAPEZOIDAL;
+  void applyOptions(const SimulationEnvironment &e) {
+    reltol_ = e.reltol; vntol_ = e.vntol; abstol_ = e.abstol; gmin_ = e.gmin;
+    gshunt_ = e.rshunt > 0.0 ? 1.0 / e.rshunt : 0.0;
+    itl1_ = e.itl1; itl2_ = e.itl2; itl4_ = e.itl4;
+    PhysicsConstants::JUNCTION_GMIN = e.gmin;
+    lteController_.setTRTOL(e.trtol);
+    lteTolerance_ = 1e-4 * e.reltol / 1e-3;  // the engine's LTE bound scales with RELTOL (default unchanged)
+    lteController_.setTolerance(lteTolerance_);
+    // ngspice: order 1 is backward Euler for either method; trapezoidal is order 2 at most
+    tranMethod_ = e.maxord <= 1 ? IntegrationType::GEAR_1_EULER : IntegrationType::TRAPEZOIDAL;
+  }
+  int nrLimit() const { return itl4_ > 0 ? itl4_ : PhysicsConstants::MAX_NR_ITER; }  // transient Newton iterations
 
   // Callbacks for orchestration
   std::function<void(int, double)> onConvergenceStep;
@@ -1274,9 +1292,6 @@ private:
 
   // NR Parameters (Using centralized PhysicsConstants)
   // Note: Kept as local constexpr for backward compatibility; prefer PhysicsConstants::
-  static constexpr double RELTOL = 1e-3;
-  static constexpr double VNTOL = 1e-6;
-  static constexpr double ABSTOL = PhysicsConstants::ABSTOL; 
   static constexpr int MAX_NR_ITER = PhysicsConstants::MAX_NR_ITER;
   static constexpr double PCG_TOL = 1e-10;
   static constexpr int PCG_MAX_ITER = 1000;
@@ -1303,7 +1318,7 @@ private:
     // 1. Check Voltage Updates (Standard RELTOL/VNTOL)
     for (size_t i = 0; i < v_new.size(); ++i) {
       double diff = std::abs(v_new[i] - v_old[i]);
-      double limit = RELTOL * std::max(std::abs(v_new[i]), std::abs(v_old[i])) + VNTOL;
+      double limit = reltol_ * std::max(std::abs(v_new[i]), std::abs(v_old[i])) + vntol_;
       if (!(diff <= limit)) return false;
     }
 
@@ -1327,24 +1342,25 @@ public:
     const TensorBlock *blk;
     const BlockState *st;
     std::function<int(int)> map;   // local node -> global node
-    int vs, ind, e, h, dev;        // first matrix row of each branch kind; dev: device internal nodes
+    int vs, ind, e, h, tl, dev;    // first matrix row of each branch kind; tl: two per transmission line; dev: device internal nodes
   };
   std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
     std::vector<BranchSlot> branchList;
-    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0});
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0});
     for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
       auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
       if (it == nl.blockDefinitions.end()) continue;
       const auto *inst = &nl.instances[k];
       branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
         return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
-      }, 0, 0, 0, 0, 0});
+      }, 0, 0, 0, 0, 0, 0});
     }
     int next = nl.numGlobalNodes;
     for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
     for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
+    for (auto &s : branchList) { s.tl = next; next += 2 * (int)s.blk->transmissionLines.size(); }
     for (auto &s : branchList) { s.dev = next; next += deviceInternals(*s.blk, *s.st); }
     total = next;
     return branchList;
@@ -1353,7 +1369,8 @@ public:
 
   // Small-signal system at the last DC operating point: G (Newton Jacobian
   // without node gmin), reactive triplets C. Shared by solveAC and solveNoise.
-  struct ACSystem { Csr_matrix G; std::vector<int> cr, cc; std::vector<double> cv; int n = 0; };
+  // dr/dc/dv/dtd: entries dv * e^(-jw dtd) (transmission lines), beside the jw*cv ones
+  struct ACSystem { Csr_matrix G; std::vector<int> cr, cc; std::vector<double> cv; std::vector<int> dr, dc; std::vector<double> dv, dtd; int n = 0; };
   bool acSystem(TensorNetlist &netlist, ACSystem &sys);
   // R(Y) = [[G, -wC], [wC, G]] for Y = G + jwC (transpose: R(Y)^T = R(Y^H)).
   static Csr_matrix acMatrix(const ACSystem &s, double w, bool transpose);
@@ -1389,6 +1406,7 @@ public:
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
       for (const auto &e : b.currentControlledCurrentSources) mark({e.outPos, e.outNeg});
+      for (const auto &e : b.transmissionLines) mark({e.nodePort1Pos, e.nodePort1Neg, e.nodePort2Pos, e.nodePort2Neg});
       for (const auto &e : b.powerRails) mark({e.nodeRail});
       for (const auto &e : b.parasiticResistors) mark({e.node1, e.node2});
       for (const auto &e : b.parasiticCapacitors) mark({e.node1, e.node2});
@@ -1411,6 +1429,20 @@ public:
     }
     return flux;
   }
+
+  // Outgoing waves of a lossless line at time t, linearly interpolated; before the first
+  // point (t < 0) and past the last they hold (the step cap TD keeps t - TD inside the history).
+  static void lineWaves(const BlockState::LineHistory &h, double t, double &w1, double &w2) {
+    if (h.t.empty()) { w1 = w2 = 0.0; return; }
+    const size_t k = std::upper_bound(h.t.begin(), h.t.end(), t) - h.t.begin();
+    if (k == 0) { w1 = h.w1[0]; w2 = h.w2[0]; return; }
+    if (k == h.t.size()) { w1 = h.w1.back(); w2 = h.w2.back(); return; }
+    const double f = (t - h.t[k - 1]) / (h.t[k] - h.t[k - 1]);
+    w1 = h.w1[k - 1] + f * (h.w1[k] - h.w1[k - 1]);
+    w2 = h.w2[k - 1] + f * (h.w2[k] - h.w2[k - 1]);
+  }
+  // AC build: transmission lines stamp only their frequency-independent half (acSystem adds the delayed half)
+  bool acLines_ = false;
 
   // All branch-element matrix entries + rhs. Stamping adds them to the matrix;
   // the KCL audit evaluates rhs - A x from the SAME triplets, so the two can
@@ -1481,6 +1513,24 @@ public:
         add(node(f.outPos), bc, f.alpha);
         add(node(f.outNeg), bc, -f.alpha);
       }
+      // Lossless lines (ngspice TRA): branch currents i1, i2 flow into the + terminals. Transient:
+      // v1 - Z0 i1 = w2(t - TD), v2 - Z0 i2 = w1(t - TD) with w = v + Z0 i. DC: a short, v1 = v2, i1 = -i2.
+      // AC: the same equations with e^(-jw TD) on the far-port terms (acSystem adds those).
+      for (size_t k = 0; k < blk.transmissionLines.size(); ++k) {
+        const auto &t = blk.transmissionLines[k];
+        const int b1 = sl.tl + 2 * (int)k, b2 = b1 + 1;
+        const int p1 = node(t.nodePort1Pos), n1 = node(t.nodePort1Neg), p2 = node(t.nodePort2Pos), n2 = node(t.nodePort2Neg);
+        add(p1, b1, 1.0); add(n1, b1, -1.0); add(p2, b2, 1.0); add(n2, b2, -1.0);
+        if (tran || acLines_) {
+          const double z0 = t.characteristicImpedance_Z0_ohms;
+          add(b1, p1, 1.0); add(b1, n1, -1.0); add(b1, b1, -z0);
+          add(b2, p2, 1.0); add(b2, n2, -1.0); add(b2, b2, -z0);
+          if (tran && k < sl.st->lineState.size()) lineWaves(sl.st->lineState[k], time - t.propagationDelay_Td_s, S.rhs[b2], S.rhs[b1]);
+        } else {
+          add(b1, p1, 1.0); add(b1, n1, -1.0); add(b1, p2, -1.0); add(b1, n2, 1.0);
+          add(b2, b1, 1.0); add(b2, b2, 1.0);
+        }
+      }
     }
   }
   void stampBranchSystem(const TensorNetlist &nl, double h, double time) {
@@ -1532,8 +1582,8 @@ public:
     // 1.5 The transient OP's node gmin (addDiagonalConditioning(ptranGmin_)): the audit must
     // see the current the matrix holds, or a node at volts never passes KCL there (10 V at
     // 1e-12 S is 10 pA: a floating node behind a 1 ms RC failed every step at t = 0)
-    if (ptranGmin_ > 0.0)
-      for (int i = 1; i <= n; ++i) addRes(i, -ptranGmin_ * getV(i));
+    if (ptranGmin_ + gshunt_ > 0.0)
+      for (int i = 1; i <= n; ++i) addRes(i, -(ptranGmin_ + gshunt_) * getV(i));
 
     // 2. V sources, inductors, E/F/H: branch-current elements, audited from
     //    the same triplets they are stamped with (see buildBranchSystem below)
@@ -2194,15 +2244,6 @@ public:
                   vccs.gm, matrixBuilder, rhsVector);
     }
 
-    // 7. Transmission Lines (Phase 2 placeholder)
-    for (const auto &t : block.transmissionLines) {
-      // Simple resistive model for Phase 1
-      double z0 = t.characteristicImpedance_Z0_ohms;
-      stampResistor(mapNode(t.nodePort1Pos), mapNode(t.nodePort1Neg), z0,
-                    matrixBuilder);
-      stampResistor(mapNode(t.nodePort2Pos), mapNode(t.nodePort2Neg), z0,
-                    matrixBuilder);
-    }
   }
 
   /**
@@ -2430,6 +2471,7 @@ public:
     // the only gmin is the 1e-12 S across each junction (device models); a
     // node-to-ground leak settles floating junction nodes differently
     // (aac_10_bridge). Mid-ladder DC steps still pass gmin > 0 for conditioning.
+    gmin += gshunt_;  // .options rshunt: a resistor from every node to ground, in every analysis
     if (gmin <= 0.0) return;
     for (int i = 0; i < n; ++i)
       matrixBuilder.add(i, i, gmin);

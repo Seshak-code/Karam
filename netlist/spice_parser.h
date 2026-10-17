@@ -71,6 +71,7 @@ private:
     double parseValue(const std::string& s) const;  // throws on non-numbers; resolves .param
     bool isValue(const std::string& s) const;
     static void requireFields(const std::vector<std::string>& tok, size_t n);
+    double takeMultiplier(std::vector<std::string>& tok) const;  // removes M <value> pairs; the last wins
     static void requireLinearForm(const std::vector<std::string>& tok, size_t n);
     double instanceArea(const std::vector<std::string>& tok, size_t from) const;
     static std::string toUpper(const std::string& s);
@@ -103,6 +104,7 @@ private:
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseTLine      (const std::vector<std::string>& tok, TensorBlock& blk);
     // F/H name their controlling V source; resolve once the block is complete
     void resolveControlledSources(TensorBlock& blk);
 
@@ -126,6 +128,7 @@ private:
     // ── State ─────────────────────────────────────────────────────────
     std::map<std::string, int> nodeMap_;
     int nextNode_ = 1;
+    double mult_ = 1.0;   // m= of the R, L, I, G, F or J card being parsed
 
     // .subckt parsing state. Bodies use LOCAL node numbers (ports 1..P, then
     // internal nodes); X cards are expanded after the whole file is read, so
@@ -136,16 +139,19 @@ private:
     TensorBlock      subcktBlock_;
     std::map<std::string, int> subcktNodeMap_;   // local node names of the body being parsed
     int              nextLocalNode_ = 1;
-    struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; };
+    struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; std::string name; };
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
-    struct PendingIC { std::string node; double value; int line; };
+    struct PendingIC { std::string node; double value; int line; bool nodeset; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
+    std::map<std::string, std::vector<PendingIC>> subcktICs_;   // .ic / .nodeset in a body (local names), applied per instance
+    std::map<std::string, std::vector<std::string>> subcktNames_;  // subckt -> name of local node l at [l-1]
+    std::map<std::string, int> hierNodes_;         // "X1.N" (upper case) -> global node, for subcircuit internals
     std::string noiseOut_, noiseRef_;              // .noise node names, resolved likewise
     std::set<std::string> globals_;                // .global node names
     std::map<std::string, std::map<int, std::string>> subcktGlobals_;  // subckt -> local index -> name
     std::map<std::string, std::vector<PendingInstance>> subcktChildren_;  // nodes are body-local
     std::map<std::string, int> savedInductorIndex_; // top-level K lookup, saved inside a body
-    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth);
+    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth, const std::string& path);
 
     // Model cards collected during parse, merged into netlist at end
     std::map<std::string, ModelCard> modelCards_;

@@ -54,16 +54,16 @@ def osdi_libs(text): return re.findall(r"^\s*\.osdi\s+(\S+)", text, re.I | re.M)
 
 def node_map(text):
     """Engine column order: first appearance in top-level element cards (name -> 1-based column)."""
-    m, in_sub = {}, False
+    m, depth = {}, 0  # depth: open .subckt definitions (they nest)
     models = {toks(l)[1].upper() for l in cards(text) if l.lower().startswith(".model")}
     for line in cards(text):
         t = toks(line)
         if t[0][0] == ".":
             kw = t[0].upper()
             if kw == ".END": break
-            in_sub = kw == ".SUBCKT" or (in_sub and kw != ".ENDS")
+            depth += (kw == ".SUBCKT") - (kw == ".ENDS" and depth > 0)
             continue
-        if in_sub: continue
+        if depth: continue
         c = t[0][0].upper()
         pos = range(1, len(t) - 1) if c == "X" else NODE_POS.get(c, [])
         if c == "X":  # X<name> <nodes...> <subckt> [params:] [k=v ...]: the words before the parameters
