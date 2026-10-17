@@ -5,10 +5,11 @@
 
 For every Netlists/<dir>/<name>.cir with a gold OutputData/<dir>/<name>.cir.prn, run the engine for the
 netlist's .op/.dc/.tran (same runner and tolerances as tests/ngspice_diff/run_diff.py) and compare the
-single-node V(x) columns of the .prn. Statuses: PASS, FAIL, ENGINE-UNSUPPORTED (engine rejects a card or
+single-node V(x) columns of the .prn (.ac: Re/Im(V(x))). .include/.lib run with their directory resolved
+(TREESPICE_BASEDIR, see cli/engine_dump_main.cpp). Statuses: PASS, FAIL, ENGINE-UNSUPPORTED (engine rejects a card or
 model parameter), PARSE-ERROR (Xyce syntax the parser lacks), TIMEOUT (--timeout), XYCE-DIALECT (gold follows Xyce-only
-semantics, listed in DIALECT), SKIPPED (a feature this comparison cannot judge: .step, .include/.lib, multi-run
-output, no V(node) column, AC/HB/noise/...). Exit 1 on any FAIL.
+semantics, listed in DIALECT), SKIPPED (a feature this comparison cannot judge: .step, multi-run
+output, a gold with no V(node) column (reason names the column kinds), HB/noise/...). Exit 1 on any FAIL.
 """
 import argparse, glob, os, re, sys, tempfile, types
 from concurrent.futures import ProcessPoolExecutor
@@ -18,12 +19,25 @@ sys.path.insert(0, os.path.join(HERE, "ngspice_diff"))
 import run_diff as rd  # noqa: E402
 
 XYCE = os.path.join(os.path.dirname(HERE), "datasets", "xyce")
-SKIP_CARDS = re.compile(r"^\s*\.(step|include|inc|lib|sens|hb|mpde|four|data|func|global_param|sampling|"
-                        r"embeddedsampling|pce|lin|ac|noise)\b", re.I | re.M)
+SKIP_CARDS = re.compile(r"^\s*\.(step|sens|hb|mpde|data|func|global_param|sampling|"
+                        r"embeddedsampling|pce|lin|noise)\b", re.I | re.M)
+
+SKIP_WHY = {  # card -> why this comparison cannot judge it
+    "step": ".step: multi-run gold, no .step in the engine yet",
+    "sens": ".sens: Xyce sensitivity output, no engine analysis",
+    "hb": ".hb: harmonic balance, no engine analysis", "mpde": ".mpde: Xyce MPDE analysis, no engine analysis",
+    "data": ".data: Xyce tabular sweep, multi-run gold", "func": ".func: engine has no user functions (ngspice does)",
+    "global_param": ".global_param: Xyce-only global parameter card",
+    "sampling": ".sampling: Xyce UQ sampling", "embeddedsampling": ".embeddedsampling: Xyce UQ sampling",
+    "pce": ".pce: Xyce polynomial chaos", "lin": ".lin: Xyce S-parameter output", "noise": ".noise: gold holds Xyce noise columns, "
+    "not the ngspice spectra run_diff compares",
+}
 
 # Cases where Xyce's gold output follows Xyce-specific semantics, not SPICE3/ngspice (the engine's reference).
 DIALECT = {
     "Certification_Tests/BUG_302/": "element IC= applied without UIC",
+    "Certification_Tests/BUG_1325_SON/": "Xyce include path rules: absolute-path templates, Windows paths, drive letters, "
+                                         "nested paths relative to the top-level netlist",
     "Nonlinear/ConvergenceTests/Nox1Tran0.cir": "element IC= applied without UIC",
     "Certification_Tests/BUG_201_SON/": "element IC= applied without UIC",
     "PARSER/scalingFactors.cir": "Xyce reads 1X as 1e6",
@@ -51,27 +65,56 @@ def gold(prn):
         except ValueError: return None
     return head, rows
 
+def expand(text, d, depth=0):
+    """Splice .include/.inc/.lib <file> [section] in place so node_map sees the elements the engine sees."""
+    out = []
+    for ln in text.splitlines():
+        m = re.match(r"\s*\.(?:include|inc|lib)\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))(?:\s+(\S+))?\s*$", ln, re.I)
+        f = m and (m.group(1) or m.group(2) or m.group(3)).replace("\\", "/")
+        if not m or depth > 8 or not os.path.isfile(os.path.join(d, f)): out.append(ln); continue
+        body = open(os.path.join(d, f), errors="ignore").read()
+        if m.group(4):  # .lib file section: the lines between `.lib section` and `.endl`
+            b = re.search(r"^\s*\.lib\s+" + re.escape(m.group(4)) + r"\s*$(.*?)^\s*\.endl", body, re.I | re.M | re.S)
+            body = b.group(1) if b else ""
+        out.append(expand("*\n" + body, os.path.dirname(os.path.join(d, f)), depth + 1))
+    return "\n".join(out)
+
 def case(path, opts):
     rel = os.path.relpath(path, os.path.join(XYCE, "Netlists"))
     for key, why in DIALECT.items():
         if rel.startswith(key): return rel, "XYCE-DIALECT", why
     text = open(path, errors="ignore").read()
+    full = expand(text, os.path.dirname(path))
     g = os.path.join(XYCE, "OutputData", rel + ".prn")
-    if SKIP_CARDS.search(text): return rel, "SKIPPED", "uses " + SKIP_CARDS.search(text).group(1).lower()
+    if SKIP_CARDS.search(text): return rel, "SKIPPED", SKIP_WHY[SKIP_CARDS.search(text).group(1).lower()]
     gd = gold(g)
-    if not gd: return rel, "SKIPPED", "gold output is not a single run"
+    if not gd:
+        multi = len(re.findall(r"^\s*\.dc\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+", full, re.I | re.M))
+        return rel, "SKIPPED", ("nested .dc (two sources): the gold holds one run per outer value, run_diff sweeps one source"
+                                if multi else "gold output is not a single run (Xyce .step/.data/.mpde-style repeat)")
     head, rows = gd
-    try: an = rd.analysis(text)
+    try: an = rd.analysis(full)
     except (ValueError, IndexError, StopIteration): return rel, "SKIPPED", "analysis card syntax (e.g. NOOP)"
-    if an[0] not in ("op", "dc", "tran"): return rel, "SKIPPED", an[0]
-    nm = rd.node_map(text)
-    cols = {m.group(1).upper(): k for k, h in enumerate(head) if (m := re.fullmatch(r"V\((\w+)\)", h, re.I))}
-    cols = {n: k for n, k in cols.items() if n in nm}
-    if not cols or not rows: return rel, "SKIPPED", "no V(node) column"
+    if an[0] not in ("op", "dc", "tran", "ac"): return rel, "SKIPPED", an[1] if an[0] == "unsupported" else f".{an[0]}: no comparison for it here"
+    nm = rd.node_map(full)
+    pat = r"Re\(V\((\w+)\)\)" if an[0] == "ac" else r"V\((\w+)\)"  # .ac: Re(V(x)) Im(V(x)) column pairs
+    cols = {m.group(1).upper(): k for k, h in enumerate(head) if (m := re.fullmatch(pat, h, re.I))}
+    named = sorted(cols)
+    cols = {n: k for n, k in cols.items() if n in nm and (an[0] != "ac" or head[k + 1].lower() == f"im(v({n.lower()}))")}
+    if not cols or not rows:
+        hs = [h.upper() for h in head[2:]]
+        if named: why = f"gold V({named[0].lower()}) is not a node of the netlist (stale gold or internal node)"
+        elif any(h.startswith("{") for h in hs): why = "gold columns are .print expressions {...}"
+        elif any(h.startswith("N(") for h in hs): why = "gold columns include N() device internal variables"
+        elif any(re.match(r"(RE\(|IM\()?I[A-Z]?\(", h) for h in hs):
+            why = "gold has only branch-current columns I(...): engine dump prints node voltages, not MNA branch currents"
+        else: why = "no V(node) column in gold: " + " ".join(head[2:5])
+        return rel, "SKIPPED", why
     xs = [] if an[0] == "op" else [r[1] for r in rows]
-    vals = {n: [r[k] for r in rows] for n, k in cols.items()}
+    vals = ({n: [complex(r[k], r[k + 1]) for r in rows] for n, k in cols.items()} if an[0] == "ac"
+            else {n: [r[k] for r in rows] for n, k in cols.items()})
     with tempfile.TemporaryDirectory(prefix="xyce_") as tmp:
-        args = types.SimpleNamespace(**vars(opts), tmp=tmp)
+        args = types.SimpleNamespace(**vars(opts), tmp=tmp, basedir=os.path.dirname(path))
         st, wa, wr, note = rd.compare(args, text, an, "cpu", {n: nm[n] for n in cols}, (xs, vals))
     if st == "FAIL" and "SPICE parse error" in note: st = "PARSE-ERROR"  # syntax the engine lacks
     if st == "FAIL" and "TIMEOUT" in note: st = "TIMEOUT"  # run-time limit, not an accuracy verdict

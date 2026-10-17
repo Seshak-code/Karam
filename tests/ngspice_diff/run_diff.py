@@ -101,7 +101,8 @@ def run_engine(args, text, mode, kind, step=0.0, stop=0.0):
     path = os.path.join(args.tmp, "eng.cir")
     open(path, "w").write(text)
     cmd = [args.engine, path, mode, kind] + ([repr(step), repr(stop)] if kind == "tran" else [])
-    try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout).stdout
+    env = {**os.environ, **({"TREESPICE_BASEDIR": args.basedir} if getattr(args, "basedir", None) else {})}
+    try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env).stdout
     except subprocess.TimeoutExpired: return dict(conv=False, err="TIMEOUT", pts=[])
     conv, err, pts, total = False, "", [], None
     for ln in out.splitlines():
