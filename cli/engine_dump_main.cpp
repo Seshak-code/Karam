@@ -1,6 +1,6 @@
 // acutesim_engine_dump <netlist> <cpu|gpu> <dc|tran|ac|noise> [step stop]
 // Machine-readable waveform dump for differential testing (tests/ngspice_diff).
-// Prints: "CONVERGED <0|1>", "ERROR <text>", then one line per waveform point:
+// Prints: "CONVERGED <0|1>", "ERROR <text>", "BACKEND <what ran>", then one line per waveform point:
 //   <time> <v1> <v2> ...   (engine-internal node order)
 //   ac: <freq> <re1> <im1> <re2> <im2> ...
 //   (env TREESPICE_BASEDIR overrides the directory .include/.lib paths resolve against)
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     } else {
         r = session->runDC(req, cb);
     }
-    std::printf("CONVERGED %d\nERROR %s\n", r.converged ? 1 : 0, r.errorDetail.c_str());
+    std::printf("CONVERGED %d\nERROR %s\nBACKEND %s\n", r.converged ? 1 : 0, r.errorDetail.c_str(), r.backend.c_str());
     const auto& nz = r.extended.noise;
     for (size_t k = 0; k < nz.frequencies.size(); ++k)
         std::printf("%.9g %.9g %.9g\n", nz.frequencies[k], nz.onoise[k], nz.inoise[k]);

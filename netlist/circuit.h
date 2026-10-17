@@ -129,8 +129,6 @@ struct Inductor {
     int nodeCoil1;                // First coil terminal (node index)
     int nodeCoil2;                // Second coil terminal (node index)
     double inductance_henries;    // Inductance in Henries [H]
-    
-    double tolerance_percent = 0.0;
 
     // Generic PDK Support
     std::string model_name;       // e.g., "spiral_ind"

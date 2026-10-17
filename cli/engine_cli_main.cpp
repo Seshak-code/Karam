@@ -151,7 +151,8 @@ int main(int argc, char** argv) {
         std::cerr << "\n[WARN] " << result.errorDetail << "\n";
     }
 
-    std::cout << "\nProvenance: " << result.solverProvenance << "\n";
+    std::cout << "\nBackend: " << result.backend << "\n";
+    std::cout << "Provenance: " << result.solverProvenance << "\n";
 
     return result.converged ? 0 : 1;
 }

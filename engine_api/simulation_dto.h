@@ -233,6 +233,7 @@ struct SimulationResponseDTO {
     std::string errorMessage; // Proto compatibility
     std::string errorDetail;  // Backend consistency
     std::string solverProvenance;
+    std::string backend;  // what actually ran: "cpu", or "gpu (...)"; says why when gpu was asked for and not used
 
     double      solveTimeMs = 0.0;
     AnalysisTypeDTO analysisType = AnalysisTypeDTO::DC;

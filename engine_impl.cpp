@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <random>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -73,6 +74,15 @@ static CircuitSim::ExecutionMode selectExecMode(PrecisionMode prec) {
         return CircuitSim::ExecutionMode::GPU;
     }
     return CircuitSim::ExecutionMode::TENSOR_SOA_SIMD;
+}
+
+// What ran, for the response: GPU fronts are the only GPU work (large fronts, FP32 + refinement),
+// so a gpu request that factored none reports cpu and why.
+static std::string backendOf(const CircuitSim& sim, PrecisionMode prec) {
+    if (prec == PrecisionMode::Native_F64) return "cpu";
+    if (sim.execMode != CircuitSim::ExecutionMode::GPU) return "cpu (gpu requested, no GPU device available)";
+    if (sim.gpuFronts == 0) return "cpu (gpu requested, no front reached the GPU size threshold)";
+    return "gpu (" + std::to_string(sim.gpuFronts) + " fronts factored in FP32)";
 }
 
 // ── Helper: generate JobID ────────────────────────────────────────────────
@@ -165,6 +175,35 @@ static std::function<void(double)> sweepSetter(TensorNetlist& netlist, const std
     return {};
 }
 
+// Monte Carlo sample: each variation scales the named top-level element's value. Gaussian is
+// 1 + sigma*z (z ~ N(0,1)), Uniform is 1 + tolerance*u (u in [-1,1)), as ngspice's gauss()/unif().
+// The draw depends only on (seed, element name), so a sample reproduces and elements are independent.
+// Returns an error text for an unknown element or distribution.
+// ponytail: top-level R/C/L/V/I only (not inside .subckt instances); propertyName is not consulted.
+static std::string applyVariations(TensorNetlist& nl, const std::vector<MonteCarloVariationDTO>& vars, uint32_t seed) {
+    auto& g = nl.globalBlock;
+    for (const auto& v : vars) {
+        std::string name = v.componentName;
+        for (auto& ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        std::mt19937_64 rng(CircuitSim::fnv1a(name, seed));
+        auto u01 = [&] { return (double)(rng() >> 11) * (1.0 / 9007199254740992.0); };
+        double f;
+        if (v.distributionType == "Gaussian")
+            f = 1.0 + v.sigma * std::sqrt(-2.0 * std::log(1.0 - u01())) * std::cos(2.0 * M_PI * u01());
+        else if (v.distributionType == "Uniform") f = 1.0 + v.tolerance * (2.0 * u01() - 1.0);
+        else return "Monte Carlo: unknown distribution '" + v.distributionType + "' (Gaussian or Uniform)";
+        double* val = nullptr;
+        for (auto& e : g.resistors)       if (e.name == name) val = &e.resistance_ohms;
+        for (auto& e : g.capacitors)      if (e.name == name) val = &e.capacitance_farads;
+        for (auto& e : g.inductors)       if (e.name == name) val = &e.inductance_henries;
+        for (auto& e : g.voltageSources)  if (e.name == name) val = &e.voltage_V;
+        for (auto& e : g.currentSources)  if (e.name == name) val = &e.current_A;
+        if (!val) return "Monte Carlo: element '" + v.componentName + "' not found at top level";
+        *val *= f;
+    }
+    return "";
+}
+
 // A DC run: every combination of the dimensions' values, the first dimension fastest (ngspice: the first
 // .dc source is the innermost). One solve per point on a CircuitSim that keeps its last solution, so a point
 // is seeded by the previous one and a failed step is approached in halves (continuation) down to 1/256
@@ -191,7 +230,13 @@ static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseRe
     double runTempC = first.netlist.environment.ambient_temp_K - 273.15;
     std::unique_ptr<Run> run;
     auto build = [&](SPICEParseResult&& p) {
+        const int gpuSoFar = run ? run->sim.gpuFronts : 0;  // a TEMP re-parse keeps the count
         run = std::make_unique<Run>(std::move(p), prec);
+        run->sim.gpuFronts = gpuSoFar;
+        if (const std::string e = applyVariations(run->parsed.netlist, req.mc.variations, req.mcSeed); !e.empty()) {
+            r.errorDetail = e;
+            return false;
+        }
         run->sim.onConvergenceStep = [&cb](int it, double res) { cb.onConvergenceStep(it, res); };
         for (const auto& d : dims) {
             run->set.push_back(d.name == "TEMP" ? std::function<void(double)>() : sweepSetter(run->parsed.netlist, d.name));
@@ -243,6 +288,7 @@ static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseRe
         prev = idx;
         for (size_t d = 0; d < dims.size() && ++idx[d] == dims[d].values.size(); ++d) idx[d] = 0;
     }
+    if (run) r.backend = backendOf(run->sim, prec);
     return r;
 }
 
@@ -279,7 +325,13 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
         CircuitSim sim;
         sim.execMode = selectExecMode(precision_);
         sim.onConvergenceStep = [&](int it, double res) { cb.onConvergenceStep(it, res); };
-        return stepToResponse(sim.solveDC(parsed.netlist), jobId_, precision_);
+        if (const std::string e = applyVariations(parsed.netlist, req.mc.variations, req.mcSeed); !e.empty()) {
+            failure.errorDetail = e;
+            return failure;
+        }
+        SimulationResponseDTO r = stepToResponse(sim.solveDC(parsed.netlist), jobId_, precision_);
+        r.backend = backendOf(sim, precision_);
+        return r;
     }
     return dcRun(req, std::move(parsed), dims, precision_, cb, [this] { return status_.load() == JobStatus::Cancelled; });
 }
@@ -319,6 +371,7 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
     const auto X = sim.solveAC(netlist, freqs);
     r.converged    = X.size() == freqs.size();
     r.analysisType = AnalysisTypeDTO::AC;
+    r.backend      = backendOf(sim, precision_);
     for (size_t k = 0; k < X.size(); ++k) {
         WaveformDataPoint pt{freqs[k], {}, {}, {}};
         for (int i = 0; i < netlist.numGlobalNodes; ++i) {
@@ -376,6 +429,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
 
     result.iterations = static_cast<int>(stepIdx);
     result.analysisType = AnalysisTypeDTO::TRANSIENT;
+    result.backend = backendOf(sim, precision_);
     return result;
 }
 
@@ -437,9 +491,10 @@ SimulationResponseDTO SessionImpl::runMonteCarlo(const SimulationRequestDTO& req
 
     for (int i = 0; i < mc.sampleCount && status_.load() != JobStatus::Cancelled; ++i) {
         SimulationRequestDTO run_req = req;
+        run_req.mc     = mc;
         run_req.mcSeed = mc.seed + i;
         auto r = dispatch_dc_internal(run_req, cb);
-        if (!r.converged) agg.converged = false;
+        if (!r.converged) { agg.converged = false; agg.errorDetail = r.errorDetail; }
         if (!r.waveformPoints.empty()) {
             agg.waveformPoints.push_back(r.waveformPoints.front());
         }
@@ -476,6 +531,7 @@ SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
             r.extended.hasNoise = r.converged;
             r.extended.noise = {freqs, std::move(nz.onoise), std::move(nz.inoise), nz.onoiseTotal, nz.inoiseTotal};
         }
+        r.backend = backendOf(sim, precision_);
     }
     r.success = r.converged;  // driver-path consumers read success
     status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);

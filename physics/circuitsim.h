@@ -430,8 +430,11 @@ public:
       contractionPlan_ = std::make_unique<ContractionPlan>(planContraction(A));
       contractionCache_ = {};  // factors belong to the old plan
     }
-    return solveContraction(A, b, *contractionPlan_, 2, &contractionCache_);
+    SolverResult r = solveContraction(A, b, *contractionPlan_, 2, &contractionCache_, execMode == ExecutionMode::GPU);
+    gpuFronts += r.gpuFronts;
+    return r;
   }
+  int gpuFronts = 0;  // fronts factored on the GPU so far (what the engine reports as the backend)
 
   // Converged solution of the prior solve (seeder history, dV/dt)
   std::vector<double> prevVoltages_;
