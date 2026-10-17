@@ -616,6 +616,37 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             o.model = model;
             return o;
         };
+        // first(c, {"A", "B"}, def): the first alias the card gives (SPICE spellings vary)
+        auto first = [](const ModelCard* c, std::initializer_list<const char*> keys, double def) {
+            for (const char* k : keys) if (c->params.count(k)) return c->params.at(k);
+            return def;
+        };
+        // Resistors (ngspice restemp): a model card gives the value from its sheet resistance and the
+        // geometry, R = RSH (L - 2 SHORT) / (W - 2 NARROW), unless the instance gives it. The circuit
+        // runs at 27 C, so TC1/TC2 act through the model's TNOM only.
+        for (auto& r : blk.resistors) {
+            const double tc1 = r.tc1, tc2 = r.tc2;
+            const ModelCard* c = r.model_name.empty() ? nullptr : card(r.model_name);
+            if (c) {
+                if (c->type != "R") throw std::runtime_error(r.name + ": model " + c->name + " is " + c->type + ", not an R model");
+                supported(c, {"RSH", "TC1", "TC2", "TNOM", "DEFW", "W", "L", "NARROW", "SHORT"});
+                if (std::isnan(r.resistance_ohms)) {
+                    const double w = (r.width_m > 0 ? r.width_m : first(c, {"W", "DEFW"}, 10e-6)) - 2.0 * c->get("NARROW", 0.0);
+                    const double l = (r.length_m > 0 ? r.length_m : c->get("L", 10e-6)) - 2.0 * c->get("SHORT", 0.0);
+                    r.resistance_ohms = c->get("RSH", 0.0) * l / w;
+                    if (!(r.resistance_ohms != 0.0 && std::isfinite(r.resistance_ohms)))
+                        throw std::runtime_error(r.name + ": model " + c->name + " gives a resistance of " +
+                                                 std::to_string(r.resistance_ohms) + " (needs RSH, L and W)");
+                }
+                r.model_name.clear();
+            } else if (std::isnan(r.resistance_ohms)) throw std::runtime_error(r.name + ": no value and no model");
+            const double d = 27.0 - (c ? c->get("TNOM", 27.0) : 27.0);
+            const double f = 1.0 + (std::isnan(tc1) ? (c ? c->get("TC1", 0.0) : 0.0) : tc1) * d +
+                             (std::isnan(tc2) ? (c ? c->get("TC2", 0.0) : 0.0) : tc2) * d * d;
+            r.resistance_ohms *= f / r.m;
+            r.ac_ohms /= r.m;
+            r.m = 1.0;
+        }
         // Capacitors: a model card gives the value (ngspice capsetup/captemp) unless the
         // instance does; M multiplies. The circuit runs at 27 C, so TC1/TC2 act through TNOM only.
         for (auto& cap : blk.capacitors) {
@@ -668,11 +699,6 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             level1.push_back(m);
         }
         blk.mosfets = std::move(level1);
-        // first(c, {"A", "B"}, def): the first alias the card gives (SPICE spellings vary)
-        auto first = [](const ModelCard* c, std::initializer_list<const char*> keys, double def) {
-            for (const char* k : keys) if (c->params.count(k)) return c->params.at(k);
-            return def;
-        };
         // EG/XTI/XTB only act away from TNOM; the engine runs at TNOM.
         for (auto& d : blk.diodes) if (const ModelCard* c = kind(card(d.modelName), d.instanceName, {"D", "D"})) {
             supported(c, {"IS", "N", "RS", "CJO", "CJ0", "CJ", "VJ", "PB", "M", "MJ", "FC", "TT", "BV", "IBV",
@@ -815,24 +841,30 @@ void SPICEParser::parseResistor(const std::vector<std::string>& tok, TensorBlock
     r.name = tok[0];
     r.nodeTerminal1 = nodeIndex(tok[1]);
     r.nodeTerminal2 = nodeIndex(tok[2]);
-    size_t first = 4;  // "R1 a b r=1k" (IHP cap_cmim) as well as "R1 a b 1k"
-    if (const std::string k = toUpper(tok[3]); (k == "R" || k == "RESISTANCE") && tok.size() > 4) r.resistance_ohms = parseValue(tok[first++]);
-    else r.resistance_ohms = parseValue(tok[3]);
+    r.resistance_ohms = NAN;  // NAN: from the model (resolveBlock)
+    size_t i = 3;  // "R1 a b r=1k" (IHP cap_cmim), "R1 a b 1k", "R1 a b [1k] MODEL L= W="
+    if (const std::string k = toUpper(tok[3]); (k == "R" || k == "RESISTANCE") && tok.size() > 4) r.resistance_ohms = parseValue(tok[i = 4]), ++i;
+    else if (isValue(tok[3])) r.resistance_ohms = parseValue(tok[i++]);
+    if (i < tok.size() && modelNames_.count(toUpper(tok[i]))) r.model_name = tok[i++];
+    if (std::isnan(r.resistance_ohms) && r.model_name.empty()) r.resistance_ohms = parseValue(tok[3]);  // the error for a bad value
     if (r.resistance_ohms == 0.0) {  // an exact short: a 0 V branch (negative R is legal SPICE)
         blk.voltageSources.push_back({r.nodeTerminal1, r.nodeTerminal2, 0.0});
         return;
     }
 
     // tokenize() turns "KEY=val" into ["KEY", "val"]
-    for (size_t i = first; i < tok.size(); ++i) {
+    for (; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
         if (upper == "W")        r.width_m  = parseValue(tok[++i]);
         else if (upper == "L")   r.length_m = parseValue(tok[++i]);
-        else if (upper == "TC1" || upper == "TC2") parseValue(tok[++i]);  // R(T) = R(1 + tc1 (T-TNOM) + ...):
-        // exact no-ops, as the circuit always runs at TNOM = 27 C (.temp is not supported)
+        else if (upper == "M")   r.m = parseValue(tok[++i]);
+        else if (upper == "AC")  { r.ac_ohms = parseValue(tok[++i]); if (r.ac_ohms == 0.0) throw std::runtime_error(tok[0] + ": AC must not be 0"); }
+        else if (upper == "TC1") r.tc1 = parseValue(tok[++i]);
+        else if (upper == "TC2") r.tc2 = parseValue(tok[++i]);
         else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
     }
+    if (!(r.m > 0.0)) throw std::runtime_error(tok[0] + ": M must be > 0");
     blk.resistors.push_back(r);
 }
 

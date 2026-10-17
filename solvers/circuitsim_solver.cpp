@@ -788,6 +788,16 @@ bool CircuitSim::acSystem(TensorNetlist &netlist, ACSystem &sys) {
   limitJunctions_ = false;  // the Jacobian at the operating point itself
   stampAllElements(netlist, 0.0, lastSolution_, 0.0);
   limitJunctions_ = true;
+  int rtotal = 0;
+  for (const auto &sl : branchSlots(netlist, rtotal))  // AC=: the resistance .ac sees instead of R
+    for (const auto &r : sl.blk->resistors) {
+      if (std::isnan(r.ac_ohms)) continue;
+      const double dg = 1.0 / r.ac_ohms - 1.0 / r.resistance_ohms;
+      const int a = sl.map(r.nodeTerminal1), b = sl.map(r.nodeTerminal2);
+      if (a > 0) matrixBuilder.add(a - 1, a - 1, dg);
+      if (b > 0) matrixBuilder.add(b - 1, b - 1, dg);
+      if (a > 0 && b > 0) { matrixBuilder.add(a - 1, b - 1, -dg); matrixBuilder.add(b - 1, a - 1, -dg); }
+    }
   sys.G = matrixBuilder.createCsr();
   auto addC = [&](int r, int c, double v) {
     if (r >= 0 && c >= 0) { sys.cr.push_back(r); sys.cc.push_back(c); sys.cv.push_back(v); }

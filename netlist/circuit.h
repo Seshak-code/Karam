@@ -70,6 +70,11 @@ struct Resistor {
 
     double tolerance_percent = 0.0; // Monte Carlo Tolerance (e.g. 1.0 = 1%)
     std::string expression;         // Symbolic override (e.g. "Rload", "2*Vbias/Iref")
+
+    // Instance TC1/TC2 (NaN: the model's); the circuit runs at TNOM, so they act through a model TNOM only
+    double tc1 = NAN, tc2 = NAN;
+    double m = 1.0;                 // M=: parallel copies (applied by the parser's model resolution)
+    double ac_ohms = NAN;           // AC=: the resistance .ac uses (NaN: resistance_ohms)
 };
 
 /*
