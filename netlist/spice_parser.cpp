@@ -1174,19 +1174,28 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             o.model = m;
         }
         for (auto& j : blk.jfets) if (const ModelCard* c = card(j.modelName)) {
-            if (ambientK_ != tnomK) throw std::runtime_error(j.instanceName + ": JFET temperature dependence is not supported yet");
-            j.thermalVoltage_V_T_V = devtemp::vt(tnomK);
             if (c->type != "NJF" && c->type != "PJF" && c->type != "NJFET" && c->type != "PJFET")
                 throw std::runtime_error(j.instanceName + ": model " + c->name + " is " + c->type + ", not an NJF/PJF model");
-            supported(c, {"BETA", "VTO", "LAMBDA", "IS", "N", "B", "CGS", "CGD", "PB", "FC", "KF", "AF", "RD", "RS"});
-            bounded(c, {"BETA", "LAMBDA", "IS", "CGS", "CGD", "KF", "RD", "RS"}, {"N", "B", "PB"});
+            supported(c, {"BETA", "VTO", "LAMBDA", "IS", "N", "B", "CGS", "CGD", "PB", "FC", "KF", "AF", "RD", "RS",
+                          "TNOM", "XTI", "EG", "VTOTC", "BETATCE", "TCV", "BEX"});
+            bounded(c, {"BETA", "LAMBDA", "IS", "CGS", "CGD", "KF", "RD", "RS", "XTI"}, {"N", "B", "PB", "EG"});
+            // ngspice jfettemp: IS, PB and CGS/CGD by the junction laws; VTO by VTOTC (else TCV), BETA by BETATCE (else BEX)
+            const double T = ambientK_, Tn = c->get("TNOM", tnomC_) + 273.15, dT = T - Tn;
+            j.thermalVoltage_V_T_V = devtemp::vt(T);
             j.isNChannel = (c->type == "NJF" || c->type == "NJFET");
-            j.beta   = c->get("BETA", 1e-4) * j.m;
-            j.Vto    = c->get("VTO", -2.0);
+            j.beta   = c->get("BETA", 1e-4) * j.m * (c->params.count("BETATCE") ? std::pow(1.01, c->get("BETATCE", 0.0) * dT)
+                                                                                 : std::pow(T / Tn, c->get("BEX", 0.0)));
+            j.Vto    = c->params.count("VTOTC") ? c->get("VTO", -2.0) + c->get("VTOTC", 0.0) * dT
+                                                : c->get("VTO", -2.0) - c->get("TCV", 0.0) * dT;
             j.lambda = c->get("LAMBDA", 0.0);
             auto& k = j.card;
-            k.is = c->get("IS", 1e-14); k.n = c->get("N", 1.0); k.b = c->get("B", 1.0);
-            k.cgs = c->get("CGS", 0.0); k.cgd = c->get("CGD", 0.0); k.pb = c->get("PB", 1.0); k.fc = c->get("FC", 0.5);
+            k.n = c->get("N", 1.0); k.b = c->get("B", 1.0);
+            // ngspice (probed): N divides the band-gap term but not XTI, and XTI defaults to 0
+            k.is = c->get("IS", 1e-14) * std::exp((T / Tn - 1) * c->get("EG", 1.11) / (k.n * devtemp::vt(T))) *
+                   std::pow(T / Tn, c->get("XTI", 0.0));
+            k.pb = c->get("PB", 1.0);
+            const double capf = devtemp::junctionAt(k.pb, 0.5, Tn, T);
+            k.cgs = c->get("CGS", 0.0) * capf; k.cgd = c->get("CGD", 0.0) * capf; k.fc = c->get("FC", 0.5);
             k.kf = c->get("KF", 0.0); k.af = c->get("AF", 1.0);
             if (!(k.fc < 1.0 && k.pb > j.Vto))
                 throw std::runtime_error("model " + c->name + ": needs FC < 1 and PB > VTO");
