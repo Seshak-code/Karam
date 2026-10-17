@@ -25,6 +25,9 @@ struct OutputTable {
     std::vector<Column> columns;
 };
 
+// "tran", "ac", "dc" or "op".
+ENGINE_API std::string analysisName(const compute::orchestration::SimulationResponseDTO& r);
+
 // Evaluate `specs` over the response; an empty list (or "all") selects every node voltage and branch current.
 // Throws std::runtime_error on an unknown node or source, or on a device current (not supported yet).
 ENGINE_API OutputTable selectOutputs(const compute::orchestration::SimulationResponseDTO& r,

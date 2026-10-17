@@ -27,12 +27,6 @@ std::string squeeze(std::string s) {
     return s;
 }
 
-std::string analysisName(const SimulationResponseDTO& r) {
-    if (r.analysisType == AnalysisTypeDTO::TRANSIENT) return "tran";
-    if (r.analysisType == AnalysisTypeDTO::AC) return "ac";
-    return r.scaleName.empty() ? "op" : "dc";
-}
-
 // One expression, evaluated at every point of the response.
 class Selector {
 public:
@@ -147,6 +141,12 @@ void value(std::ostream& os, cplx v, bool complex_) {
 }
 
 }  // namespace
+
+std::string analysisName(const SimulationResponseDTO& r) {
+    if (r.analysisType == AnalysisTypeDTO::TRANSIENT) return "tran";
+    if (r.analysisType == AnalysisTypeDTO::AC) return "ac";
+    return r.scaleName.empty() ? "op" : "dc";
+}
 
 OutputTable selectOutputs(const SimulationResponseDTO& r, const std::vector<std::string>& specs) {
     OutputTable t;

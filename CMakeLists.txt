@@ -141,10 +141,12 @@ target_sources(acutesim_engine_objects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/output.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/measure.cpp
 
     # === Math ===
     ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/math/gpu_front_lu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/math/pole_zero.cpp
 
     # === Solvers ===
     ${CMAKE_CURRENT_SOURCE_DIR}/solvers/circuitsim_solver.cpp

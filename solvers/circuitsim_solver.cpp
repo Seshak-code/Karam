@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include "../infrastructure/safe_utils.h"
+#include "../math/pole_zero.h"
 #include "../physics/circuitsim.h"
 #include "../physics/device_physics.h"
 #include "../physics/physics_constants.h"
@@ -789,7 +790,7 @@ std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool
 
 std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
                                   const std::function<bool(const SolverStep &)> &onPoint) {
-  auto &[step, dtMin, endTol, hMax, h, t, landedOnCorner, tinySteps, corners] = tran_;
+  auto &[step, dtMin, endTol, hMax, h, t, landedOnCorner, tinySteps, accepted, corners] = tran_;
   while (stop - t > endTol) {
     const bool endClip = stop - t < h;
     double hTry = std::min(h, stop - t);
@@ -797,9 +798,14 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
     bool toCorner = false;
     for (const auto &next : corners)
       if (next(t + endTol) - t <= hTry) { hTry = next(t + endTol) - t; toCorner = true; }
-    if (landedOnCorner) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
+    // The second step is backward Euler too (ngspice stays at order 1 until LTE allows 2): the
+    // first step's i history is the start inrush, and a trapezoid step on it rings +-dI forever
+    // (OSDI devices at a UIC start, +-0.1 A on i(vdd)); BE stores the relaxed current instead.
+    const bool euler = landedOnCorner || accepted == 1;
+    if (accepted == 1) lteHold_ = std::max(lteHold_, 1);
+    if (euler) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
     SolverStep s = stepTransient(netlist, hTry, t);
-    if (landedOnCorner) setIntegrationMethod(tranMethod_);
+    if (euler) setIntegrationMethod(tranMethod_);
     if (!osdiFatal_.empty()) return "OSDI model error at t=" + std::to_string(t) + " s: " + osdiFatal_;
     if (!s.stats.converged || !(s.time > t)) {
       h = hTry * 0.25;
@@ -829,6 +835,7 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
     }
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
+    ++accepted;
     if (onPoint && !onPoint(s)) return "Cancelled.";
     const double hKept = h;
     h = std::min(hMax, taken * 2.0);
@@ -1202,6 +1209,110 @@ CircuitSim::NoiseResult CircuitSim::solveNoise(TensorNetlist &netlist, const std
   return r;
 }
 
+CircuitSim::PoleZeroResult CircuitSim::solvePoleZero(TensorNetlist &netlist, int inP, int inN, int outP, int outN,
+                                                     bool volt, bool wantPoles, bool wantZeros) {
+  PoleZeroResult r;
+  ACSystem sys;
+  if (!acSystem(netlist, sys)) { r.error = "pole-zero needs a converged DC operating point"; return r; }
+  const int n = sys.n, N = n + 1;
+  // (G + sC) x = 0 bordered: column `in` (the input source's injection), row `row` (shorted input / nulled output)
+  auto roots = [&](const std::vector<std::pair<int, double>> &col, const std::vector<std::pair<int, double>> &row,
+                   double corner, std::vector<std::complex<double>> &out) {
+    std::vector<double> A(N * N, 0.0), B(N * N, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int p = sys.G.row_pointer[i]; p < sys.G.row_pointer[i + 1]; ++p) A[i * N + sys.G.col_indices[p]] += sys.G.values[p];
+    for (size_t t = 0; t < sys.cv.size(); ++t) B[sys.cr[t] * N + sys.cc[t]] += sys.cv[t];
+    for (auto [i, v] : col) A[i * N + n] += v;
+    for (auto [j, v] : row) A[n * N + j] += v;
+    A[n * N + n] = corner;
+    return acutesim::finiteRoots(std::move(A), std::move(B), N, out);
+  };
+  auto pair = [&](int a, int b) {
+    std::vector<std::pair<int, double>> v;
+    if (a > 0) v.push_back({a - 1, 1.0});
+    if (b > 0) v.push_back({b - 1, -1.0});
+    return v;
+  };
+  for (int nd : {inP, inN, outP, outN})
+    if (nd < 0 || nd > netlist.numGlobalNodes) { r.error = "pole-zero node out of range"; return r; }
+  // Open input: border with a unit diagonal, which adds no root. Shorted input: the bordered system is singular
+  // when an ideal source already holds the pair (the short is then a no-op), so that case is the open matrix too.
+  if (wantPoles) {
+    if (volt) r.error = roots(pair(inP, inN), pair(inP, inN), 0.0, r.poles);
+    if (!volt || !r.error.empty()) r.error = roots({}, {}, 1.0, r.poles = {});
+  }
+  if (r.error.empty() && wantZeros) {
+    r.error = roots(pair(inP, inN), pair(outP, outN), 0.0, r.zeros);
+    if (!r.error.empty() && volt) {  // a source already holds the input pair: its value is the input (rhs of its branch row)
+      int total = 0;
+      for (const auto &sl : branchSlots(netlist, total))
+        for (size_t i = 0; i < sl.blk->voltageSources.size(); ++i) {
+          const int p = sl.map(sl.blk->voltageSources[i].nodePositive), m = sl.map(sl.blk->voltageSources[i].nodeNegative);
+          if ((p == inP && m == inN) || (p == inN && m == inP)) {
+            r.zeros.clear();
+            return r.error = roots({{sl.vs + (int)i, 1.0}}, pair(outP, outN), 0.0, r.zeros), r;
+          }
+        }
+    }
+  }
+  return r;
+}
+
+CircuitSim::SensResult CircuitSim::solveSens(TensorNetlist &netlist, int outNode, int refNode, const std::string &outSource) {
+  SensResult r;
+  ACSystem sys;
+  if (!acSystem(netlist, sys)) { r.error = "sensitivity needs a converged DC operating point"; return r; }
+  const int n = sys.n;
+  auto &g = netlist.globalBlock;
+  std::vector<double> e(n, 0.0);
+  if (!outSource.empty()) {
+    int total = 0;
+    const int vs = branchSlots(netlist, total)[0].vs;
+    const auto it = std::find_if(g.voltageSources.begin(), g.voltageSources.end(), [&](const VoltageSource &v) { return v.name == outSource; });
+    if (it == g.voltageSources.end()) { r.error = ".sens i(" + outSource + "): no such voltage source at the top level"; return r; }
+    e[vs + (it - g.voltageSources.begin())] = 1.0;
+  } else {
+    if (outNode > 0) e[outNode - 1] += 1.0;
+    if (refNode > 0) e[refNode - 1] -= 1.0;
+  }
+  MatrixConstructor T;  // J^T
+  T.setDimensions(n, n);
+  for (int i = 0; i < n; ++i)
+    for (int p = sys.G.row_pointer[i]; p < sys.G.row_pointer[i + 1]; ++p) T.add(sys.G.col_indices[p], i, sys.G.values[p]);
+  const SolverResult adj = solveLinear(T.createCsr(), e);
+  if ((int)adj.solution.size() != n) { r.error = "sensitivity: adjoint solve failed"; return r; }
+  const std::vector<double> v(lastSolution_.begin(), lastSolution_.begin() + netlist.numGlobalNodes);
+  auto lower = [](std::string s) { for (auto &c : s) c = (char)std::tolower((unsigned char)c); return s; };
+  auto d = [&](ComponentType t, int idx) {
+    const std::vector<double> b = sensRhs(netlist, t, idx, "R", v, n);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += adj.solution[i] * b[i];
+    return s;
+  };
+  auto add = [&](const std::string &name, double val) { r.names.push_back(lower(name)); r.values.push_back(val); };
+  for (size_t i = 0; i < g.resistors.size(); ++i) {
+    const double dR = d(ComponentType::RESISTOR, (int)i), R = g.resistors[i].resistance_ohms;
+    add(g.resistors[i].name, dR);
+    add(g.resistors[i].name + "_m", -R * dR);
+    add(g.resistors[i].name + "_scale", R * dR);
+  }
+  for (size_t i = 0; i < g.voltageSources.size(); ++i) add(g.voltageSources[i].name, d(ComponentType::VSOURCE, (int)i));
+  for (size_t i = 0; i < g.currentSources.size(); ++i) {
+    const double dI = d(ComponentType::ISOURCE, (int)i);
+    add(g.currentSources[i].name, dI);
+    add(g.currentSources[i].name + "_m", g.currentSources[i].current_A * dI);
+  }
+  // ponytail: only top-level R, V and I values; every other device (and any subcircuit instance) is counted, not guessed.
+  auto note = [&](const char *kind, size_t count) { if (count) r.unsupported.push_back(std::to_string(count) + " " + kind); };
+  note("switch(es)", g.switches.size()); note("controlled source(s)", g.voltageControlledVoltageSources.size() +
+      g.voltageControlledCurrentSources.size() + g.currentControlledVoltageSources.size() + g.currentControlledCurrentSources.size());
+  note("behavioural source(s)", g.behavioural.size()); note("diode(s)", g.diodes.size());
+  note("MOSFET(s)", g.mosfets.size()); note("BJT(s)", g.bjts.size()); note("JFET(s)", g.jfets.size());
+  note("OSDI device(s)", g.osdiDevices.size()); note("transmission line(s)", g.transmissionLines.size());
+  note("subcircuit instance(s)", netlist.instances.size());
+  return r;
+}
+
 bool CircuitSim::coldStartSweep(TensorNetlist &netlist, double totalTime,
                                 int nSubsteps,
                                 std::vector<double> &finalVoltages) {
@@ -1424,7 +1535,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       // If LTE exceeds tolerance, reject the step and retry with smaller dt.
       auto lteResult = lteController_.estimateLTE(
           netlist, nrEstimate, actualTimeStep, integrator->getType(),
-          [&](const std::function<void(double, const std::array<double, 3> &)> &visit) {
+          [&](const std::function<void(double, const std::array<double, 3> &, double)> &visit) {
             // diode / BJT charge branches, internal nodes included (as the MOS branches)
             auto getV = [&](int n) { return n > 0 && n <= (int)nrEstimate.size() ? nrEstimate[n - 1] : 0.0; };
             forEachJunction(netlist, [&](const Junction &j) {
@@ -1433,16 +1544,19 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
               for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
               double v[5], q[5];
               const int K = junctionCharges(j, x, v, q);
-              for (int k = 0; k < K; ++k) visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]});
+              for (int k = 0; k < K; ++k) {
+                const double dv = std::abs(v[k] - j.st->v[0][k]);
+                visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]}, dv > 1e-9 ? std::abs(q[k] - j.st->q[k]) / dv : 0.0);
+              }
             });
             // OSDI devices: their local node voltages
             forEachOsdi(netlist, [&](const OsdiRef &r) {
               const auto &h = r.in->vHist;
-              for (size_t k = 0; k < r.n.size(); ++k) visit(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]});
+              for (size_t k = 0; k < r.n.size(); ++k) visit(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]}, -1.0);
             });
           });
 
-      if (lteResult.requiresRejection && lteHold_ == 0) {
+      if (lteResult.requiresRejection && (lteHold_ == 0 || lteResult.deviceRejects)) {
         // LTE too large — timestep was too aggressive
         actualTimeStep = lteResult.suggestedDt;
         attempt++;
@@ -1508,34 +1622,6 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       setIntegrationMethod(tranMethod_);
     }
 
-    // Update Power Rail History (Local Decap)
-    for (size_t i = 0; i < netlist.globalBlock.powerRails.size(); ++i) {
-      const auto &rail = netlist.globalBlock.powerRails[i];
-      auto &hist = netlist.globalState.powerRailState[i];
-
-      double v_curr = 0.0;
-      if (rail.nodeRail > 0 && rail.nodeRail <= (int)finalVoltages.size())
-        v_curr = finalVoltages[rail.nodeRail - 1];
-
-      double i_curr = 0.0;
-      double C = rail.capacitance_F;
-      IntegrationType type = integrator->getType();
-
-      if (hist.v.empty())
-        hist.resize(3);
-
-      // I_cap = C * dv/dt (Trapezoidal integration)
-      if (type == IntegrationType::TRAPEZOIDAL) {
-        if (!hist.v.empty())
-          i_curr =
-              (2.0 * C / actualTimeStep) * (v_curr - hist.v[0]) - hist.i[0];
-      } else if (type == IntegrationType::GEAR_1_EULER) {
-        if (!hist.v.empty())
-          i_curr = (C / actualTimeStep) * (v_curr - hist.v[0]);
-      }
-
-      integrator->updateHistory(hist.v, hist.i, v_curr, i_curr);
-    }
   }
 
   if (!simulationConverged)

@@ -55,11 +55,21 @@ struct SPICEParseResult {
     // .dc SRC start stop step [SRC2 ...]: V/I source, resistor or TEMP; the first is the innermost sweep
     struct DcSweep { std::string name; double start = 0.0, stop = 0.0, step = 0.0; };
     std::vector<DcSweep> dcSweeps;
+    // .step: kind 'P' .param, 'T' temperature, 'E' V/I/R value; the first card is the outermost loop
+    struct Step { char kind; std::string name; std::vector<double> values; };
+    std::vector<Step> steps;
     std::vector<double> tempsC;      // .temp / .options temp= (Celsius, circuit temperature; empty = 27)
     std::string   noiseSource;       // .noise v(out[,ref]) src sweep n fstart fstop
     std::string   noiseSweep;
     int           noiseOut = 0, noiseRef = 0, noisePoints = 0;
     double        noiseStart = 0.0, noiseStop = 0.0;
+    // .pz in+ in- out+ out- cur|vol pol|zer|pz
+    bool          hasPZ = false, pzVolt = false, pzPoles = false, pzZeros = false;
+    int           pzNode[4] = {0, 0, 0, 0};
+    // .sens v(out[,ref]) | i(vsrc): DC sensitivity of one output
+    bool          hasSens = false;
+    std::string   sensSource;        // i(vsrc): the source name, else empty
+    int           sensOut = 0, sensRef = 0;
     std::string   acSweep;           // .ac dec|oct|lin n fstart fstop
     int           acPoints = 0;
     double        acStart = 0.0, acStop = 0.0;
@@ -72,7 +82,9 @@ public:
     /// Parse a complete SPICE netlist string.
     // baseDir: directory .include / .lib paths are relative to (empty: working directory)
     // tempC: the circuit temperature [C] instead of the netlist's .temp (NaN: the netlist's)
-    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "", double tempC = NAN);
+    // paramOverrides: upper-case global .param values that win over the netlist's (a .step param run)
+    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "", double tempC = NAN,
+                           const std::map<std::string, double>& paramOverrides = {});
 
 private:
     // ── Value and Token Helpers ────────────────────────────────────────
@@ -155,6 +167,8 @@ private:
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
     struct PendingIC { std::string node; double value; int line; bool nodeset; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
+    std::string pzNames_[4];                       // .pz node names, resolved likewise
+    std::string sensOut_, sensRef_;                // .sens v() node names, resolved likewise
     std::map<std::string, std::vector<PendingIC>> subcktICs_;   // .ic / .nodeset in a body (local names), applied per instance
     std::string noiseOut_, noiseRef_;              // .noise node names, resolved likewise
     std::set<std::string> globals_;                // .global node names
