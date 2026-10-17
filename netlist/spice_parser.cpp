@@ -863,11 +863,24 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         // bsim4va / bsim3_va (OpenVAF, loaded from TREESPICE_OSDI_PATH as bsim4.osdi / bsim3.osdi when needed).
         // Their geometry parameters are model parameters there, so each card plus instance geometry is one
         // OSDI model (shared by equal devices).
-        auto bsimOsdi = [&](const Mosfet& m, const ModelCard& c, bool v3) {
-            const char* module = v3 ? "bsim3_va" : "bsim4va";
+        // family: 3 BSIM3, 4 BSIM4, 10 BSIM-SOI (bsimsoi, B4SOI LEVEL 10/58: terminals d g s e [p [b [t]]])
+        auto bsimOsdi = [&](const Mosfet& m, const ModelCard& c, int family) {
+            const bool v3 = family == 3;
+            const char* module = v3 ? "bsim3_va" : family == 4 ? "bsim4va" : "bsimsoi";
+            const std::string tag = v3 ? "BSIM3" : family == 4 ? "BSIM4" : "BSIM-SOI";
             if (!std::isnan(m.inst.temp) || m.inst.dtemp != 0.0)
-                throw std::runtime_error(m.instanceName + ": TEMP/DTEMP on a BSIM" + (v3 ? "3" : "4") + " device is not supported yet");
-            if (!osdi::findModule(module)) osdi::loadLibrary(v3 ? "bsim3.osdi" : "bsim4.osdi");
+                throw std::runtime_error(m.instanceName + ": TEMP/DTEMP on a " + tag + " device is not supported yet");
+            if (family != 10 && !m.soiNodes.empty())
+                throw std::runtime_error(m.instanceName + ": expected 4 nodes (d g s b) for a " + tag + " model");
+            // ponytail: bsimsoi (4.6) and ngspice's native B4SOI (4.4) agree at DC, but their charges differ: a CS
+            // stage's gate current at 1 MHz is 33 % higher on bsimsoi with the body tied (ngspice loading the same .osdi
+            // agrees with the engine), and a floating body's gain is -1.36 vs -1.11. VERSION and VGSTCVMOD do not
+            // explain it; CAPMOD=3 is suspect. Until it is found, the analyses that see charges refuse. The
+            // netlist's own cards decide, so a request that adds .tran/.ac to a netlist without them is not caught.
+            if (family == 10 && (result_.tranStop > 0.0 || !result_.acSweep.empty() || !result_.noiseSweep.empty() || result_.hasPZ))
+                throw std::runtime_error(m.instanceName + ": BSIM-SOI (LEVEL 10/58) supports .op and .dc only so far (.tran/.ac/.noise/.pz "
+                                         "differ from ngspice's B4SOI charges)");
+            if (!osdi::findModule(module)) osdi::loadLibrary(v3 ? "bsim3.osdi" : family == 4 ? "bsim4.osdi" : "bsimsoi.osdi");
             std::map<std::string, double> p;
             for (const auto& [k, v] : c.params)  // binning bounds select the card; LEVEL names it
                 if (k != "LEVEL" && k != "LMIN" && k != "LMAX" && k != "WMIN" && k != "WMAX" && k != "LINTNOI") p[k] = v;
@@ -892,7 +905,9 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 }
             }
             std::string key = toUpper(c.name);
-            for (const auto& [k, v] : m.given) {
+            auto given = m.given;  // geometry, then what only the OSDI model knows (BSIM-SOI SOIMOD, RTH0, ...)
+            given.insert(m.osdiParams.begin(), m.osdiParams.end());
+            for (const auto& [k, v] : given) {
                 if (k == "NF" && v == 1.0) continue;
                 p[k] = v;
                 std::ostringstream kv;
@@ -904,7 +919,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             // body draws nothing. An area giving 1e-14 A at this temperature (b4temp TEMPMOD 0) stands in for
             // instances that give AS/PS (AD/PD) as 0, as sky130's subcircuits do, when the gate-sidewall JSWGS is 0.
             // Geometry left to BSIM4's defaults is not covered (its 4.5 and 4.8 defaults differ, BUG_807).
-            if (!v3 && p.count("VERSION") && p["VERSION"] < 4.6 && (!p.count("TEMPMOD") || p["TEMPMOD"] == 0.0)) {
+            if (family == 4 && p.count("VERSION") && p["VERSION"] < 4.6 && (!p.count("TEMPMOD") || p["TEMPMOD"] == 0.0)) {
                 auto get = [&](const char* k, double d) { return p.count(k) ? p[k] : d; };
                 const double Tn = p["TNOM"] + 273.15, T = ambientK_;
                 auto eg = [&](double t) { return get("BG0SUB", 1.16) - get("TBGASUB", 7.02e-4) * t * t / (t + get("TBGBSUB", 1108.0)); };
@@ -931,6 +946,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             o.instanceName = m.instanceName;
             o.modelName = c.name;
             o.nodes = {m.drain, m.gate, m.source, m.body};
+            o.nodes.insert(o.nodes.end(), m.soiNodes.begin(), m.soiNodes.end());
             if (m.extra.mult != 1.0) o.params.push_back({"m", m.extra.mult});
             o.model = model;
             return o;
@@ -1005,11 +1021,16 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         std::vector<Mosfet> level1;
         for (auto& m : blk.mosfets) {
             const ModelCard* c = kind(mosCard(m), m.instanceName, {"NMOS", "PMOS"});
-            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0 || level == 49.0 || level == 8.0) {
-                blk.osdiDevices.push_back(bsimOsdi(m, *c, level == 49.0 || level == 8.0));
+            if (const double level = c->get("LEVEL", 1.0); level == 54.0 || level == 14.0 || level == 49.0 || level == 8.0 ||
+                                                           level == 10.0 || level == 58.0) {
+                blk.osdiDevices.push_back(bsimOsdi(m, *c, level == 49.0 || level == 8.0 ? 3 : level == 10.0 || level == 58.0 ? 10 : 4));
                 continue;
             }
             const int level = (int)c->get("LEVEL", 1.0);
+            if (level >= 55 && level <= 57)
+                throw std::runtime_error("model " + c->name + ": LEVEL " + std::to_string(level) + " (B3SOI) is not supported yet; B4SOI is LEVEL 10/58");
+            if (!m.soiNodes.empty()) throw std::runtime_error(m.instanceName + ": expected 4 nodes (d g s b) for a LEVEL " + std::to_string(level) + " model");
+            if (!m.osdiParams.empty()) throw std::runtime_error(m.instanceName + ": parameter " + m.osdiParams.begin()->first + " is not supported yet");
             const bool hi = level == 2 || level == 3;  // native levels 2 and 3 (mos2*.c, mos3*.c)
             if (level != 1 && !hi) throw std::runtime_error("model " + c->name + ": LEVEL " + std::to_string(level) + " is not supported yet");
             if (m.extra.nf != 1) throw std::runtime_error(m.instanceName + ": NF is not supported yet (level " + std::to_string(level) + ")");
@@ -1554,19 +1575,25 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
     m.gate   = nodeIndex(tok[2]);
     m.source = nodeIndex(tok[3]);
     m.body   = nodeIndex(tok[4]);
-    m.modelName = tok[5];
-    const std::string mu = toUpper(tok[5]);  // a .model card, or a binned family NAME.0, NAME.1, ...
-    const auto bin = modelNames_.lower_bound(mu + ".");
-    if (!modelNames_.count(mu) && (bin == modelNames_.end() || bin->compare(0, mu.size() + 1, mu + ".") != 0))
+    auto isModel = [&](const std::string& t) {  // a .model card, or a binned family NAME.0, NAME.1, ...
+        const std::string mu = toUpper(t);
+        const auto bin = modelNames_.lower_bound(mu + ".");
+        return modelNames_.count(mu) || (bin != modelNames_.end() && bin->compare(0, mu.size() + 1, mu + ".") == 0);
+    };
+    size_t mi = 5;  // the model name: after 4 nodes, or after up to 3 more (BSIM-SOI P, B, T)
+    while (mi < 8 && mi + 1 < tok.size() && !isModel(tok[mi])) ++mi;
+    if (!isModel(tok[mi]))
         throw std::runtime_error(tok[0] + ": expected 4 nodes (d g s b), then a model name; '" + tok[5] +
                                  "' is not a .model card");
+    for (size_t k = 5; k < mi; ++k) m.soiNodes.push_back(nodeIndex(tok[k]));
+    m.modelName = tok[mi];
     m.w = m.l = 100e-6;  // SPICE DEFW / DEFL (not scaled)
 
     // tokenize() turns "W=4u" into ["W", "4u"]. AD/AS/PD/PS act through CJ/CJSW;
     // NRD/NRS only through RSH, which the model check rejects. SA/SB/SD and NF
     // reach BSIM4 (level 54); level 1 rejects NF != 1 when its card is resolved.
     // .option scale multiplies the lengths (areas by scale^2), as in ngspice.
-    for (size_t i = 6; i < tok.size(); ++i) {
+    for (size_t i = mi + 1; i < tok.size(); ++i) {
         std::string upper = toUpper(tok[i]);
         if (upper == "OFF") throw std::runtime_error(tok[0] + ": OFF is not supported yet");
         if (i + 1 >= tok.size()) throw std::runtime_error(tok[0] + ": parameter " + upper + " has no value");
@@ -1585,7 +1612,7 @@ void SPICEParser::parseMosfet(const std::vector<std::string>& tok, TensorBlock& 
         else if (upper == "NF")  m.extra.nf = (int)std::lround(parseValue(tok[++i]));
         else if (upper == "TEMP" || upper == "DTEMP") { (upper == "TEMP" ? m.inst.temp : m.inst.dtemp) = parseValue(tok[++i]); continue; }
         else if (upper == "M" || upper == "MULT") m.extra.mult = parseValue(tok[++i]);
-        else throw std::runtime_error(tok[0] + ": parameter " + upper + " is not supported yet");
+        else { m.osdiParams[upper] = parseValue(tok[++i]); continue; }  // checked where the model is known
         if (upper != "M" && upper != "MULT") {  // as written (scaled): a BSIM4 device gets exactly these
             const std::map<std::string, double> v = {{"W", m.w}, {"L", m.l}, {"AD", m.geo.ad}, {"AS", m.geo.as},
                 {"PD", m.geo.pd}, {"PS", m.geo.ps}, {"NRD", m.geo.nrd}, {"NRS", m.geo.nrs}, {"SA", m.geo.sa},
