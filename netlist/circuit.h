@@ -553,6 +553,11 @@ struct SimulationEnvironment {
     double global_voltage_scale = 1.0; // PVT Voltage Scale
     int monte_carlo_seed = 0;          // Deterministic seed for MC runs
     bool gmin_stepping = true;         // .options gminsteps=0 (ngspice): DC goes straight to source stepping
+
+    // .options the solver honours (ngspice names and defaults). itl4 0: the engine's own transient limit (50).
+    double reltol = 1e-3, abstol = 1e-12, vntol = 1e-6, trtol = 7.0, gmin = 1e-12, rshunt = 0.0;
+    int itl1 = 100, itl2 = 50, itl4 = 0, maxord = 2;
+    bool gear = false;                 // .options method=gear
     
     // Noise Profile
     bool thermal_noise_enabled = false;
@@ -799,6 +804,7 @@ struct JFET {
     int source = -1;                      // S terminal
     std::string modelName = "default";
     bool isNChannel = true;               // true=N-ch, false=P-ch
+    double m = 1.0;                       // parallel multiplier (scales beta)
     
     // Model Parameters
     double beta = 1e-4;                   // Transconductance parameter [A/V^2]
@@ -831,6 +837,9 @@ struct TransmissionLine {
     int nodePort2Pos, nodePort2Neg;       // Port 2 terminals
     double characteristicImpedance_Z0_ohms; // Z_0 [Ω]
     double propagationDelay_Td_s;         // T_d [seconds]
+    std::string name;
+    bool icGiven = false;                 // IC=v1,i1,v2,i2 (with UIC): port voltages and currents into the line
+    double ic[4] = {0, 0, 0, 0};
 };
 
 /*
@@ -1178,9 +1187,9 @@ struct TensorBlock {
         zenerDiodes.push_back(newD);
         updateNodeCount(anode); updateNodeCount(cathode);
     }
-    void addTransmissionLine(int p1p, int p1n, int p2p, int p2n, double Z0, double Td) {
+    void addTransmissionLine(int p1p, int p1n, int p2p, int p2n, double Z0, double Td, const std::string& name = "") {
         if (isFrozen) return;
-        transmissionLines.push_back({p1p, p1n, p2p, p2n, Z0, Td});
+        transmissionLines.push_back({p1p, p1n, p2p, p2n, Z0, Td, name});
         updateNodeCount(p1p); updateNodeCount(p1n); updateNodeCount(p2p); updateNodeCount(p2n);
     }
     void addProbe(const std::string& name, int nPos, int nNeg) {
@@ -1304,6 +1313,10 @@ struct BlockState {
     std::vector<History> powerRailState;
     std::vector<DeviceCharge> mosfetState, diodeState, bjtState, jfetState;
     std::vector<char> swOn, swPrev;  // per Switch: the state the last stamp used / the last accepted one
+    // Lossless line: the outgoing waves w = v + Z0*i at both ports after every accepted step (t[0] = 0),
+    // read back TD later; breaks: where a kink in w reaches the far port (the transient lands on them)
+    struct LineHistory { std::vector<double> t, w1, w2; std::set<double> breaks; };
+    std::vector<LineHistory> lineState;
     std::vector<std::shared_ptr<osdi::Instance>> osdiState;  // per OsdiDevice (TensorNetlist::instantiateOsdi)
     std::vector<std::vector<BusProbe::DigitalSample>> busProbeState; 
     // Future: BJT OP, etc.
@@ -1328,6 +1341,7 @@ struct BlockState {
         jfetState.resize(block.jfets.size());
         osdiState.resize(block.osdiDevices.size());
         busProbeState.resize(block.busProbes.size());
+        lineState.resize(block.transmissionLines.size());
     }
 };
 
@@ -1363,6 +1377,12 @@ public:
     // .ic V(node)=value: forced during the transient's DC bias, or the initial
     // node voltages with UIC
     std::vector<std::pair<int, double>> nodeICs;
+
+    // .nodeset V(node)=value: held at value through the first DC solve, then released
+    std::vector<std::pair<int, double>> nodeSets;
+
+    // Node names for messages: [i] = name of global node i, hierarchical for subcircuit internals ("x1.n"); "" if none
+    std::vector<std::string> nodeNames;
 
     void addModelCard(const ModelCard& card) {
         modelCards[card.name] = card;
@@ -1528,8 +1548,8 @@ public:
         globalBlock.addZenerDiode(name, anode, cathode, Vz, Rz, Izt);
         numGlobalNodes = std::max({numGlobalNodes, anode, cathode});
     }
-    void addTransmissionLine(int p1p, int p1n, int p2p, int p2n, double Z0, double Td) {
-        globalBlock.addTransmissionLine(p1p, p1n, p2p, p2n, Z0, Td);
+    void addTransmissionLine(int p1p, int p1n, int p2p, int p2n, double Z0, double Td, const std::string& name = "") {
+        globalBlock.addTransmissionLine(p1p, p1n, p2p, p2n, Z0, Td, name);
         numGlobalNodes = std::max({numGlobalNodes, p1p, p1n, p2p, p2n});
     }
     void addProbe(const std::string& name, int nPos, int nNeg) {

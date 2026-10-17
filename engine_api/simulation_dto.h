@@ -139,6 +139,14 @@ struct MonteCarloConfigDTO {
     std::vector<MonteCarloVariationDTO> variations;
 };
 
+// One value of a .step card, applied on top of the netlist: kind 'P' a .param, 'T' the temperature (Celsius),
+// 'E' the value of a V/I source or resistor.
+struct StepValueDTO {
+    char        kind;
+    std::string name;   // upper case
+    double      value;
+};
+
 struct SimulationRequestDTO {
     JobID    jobId;
     SimulationSourceDTO source;
@@ -153,6 +161,7 @@ struct SimulationRequestDTO {
     MonteCarloConfigDTO mc;
     
     uint32_t mcSeed = 0; 
+    std::vector<StepValueDTO> stepValues;  // set by the session for one run of a .step list; empty: the netlist's own
     uint64_t topologyHash = 0;
     std::string sessionToken;
 };
@@ -185,11 +194,26 @@ struct NoiseResultDTO {
     double inoiseTotal = 0.0;
 };
 
+struct PoleZeroResultDTO {
+    std::vector<double> poleRe, poleIm;  // every pole (conjugate pairs listed both), ngspice's pole(k) = re,im
+    std::vector<double> zeroRe, zeroIm;
+};
+
+struct SensResultDTO {
+    std::vector<std::string> names;     // ngspice's vector names, lower case: "r1", "r1_m", "r1_scale", "v1", "i1", "i1_m"
+    std::vector<double> values;         // d(output)/d(parameter), same order
+    std::vector<std::string> unsupported;  // device groups whose parameters were not computed, e.g. "2 BJT(s)" (never reported as 0)
+};
+
 struct ExtendedAnalysisResultsDTO {
     bool hasTF = false;
     TFResultDTO tf;
     bool hasNoise = false;
     NoiseResultDTO noise;
+    bool hasSens = false;
+    SensResultDTO sens;
+    bool hasPZ = false;
+    PoleZeroResultDTO pz;
     bool hasFourier = false;
     FourierResultDTO fourier;
 };
@@ -230,6 +254,16 @@ struct OutputRequestDTO {
     std::vector<std::string> specs;  // as written: "v(a,b)*2", "vdb(out)", "i(v1)", "all"
 };
 
+// One .meas result. step indexes the parts of a nested .dc / .temp / .step run (0 when there is one).
+struct MeasureResultDTO {
+    std::string name;      // lower case
+    double      value = 0.0;
+    bool        ok = false;
+    std::string extra;     // ngspice's trailing " targ=... trig=..." / " from=... to=..." / " at=..."
+    std::string error;     // ngspice's failure text when !ok
+    int         step = 0;
+};
+
 struct SimulationResponseDTO {
     JobID       jobId;
     int32_t     runIndex = -1;  
@@ -254,6 +288,8 @@ struct SimulationResponseDTO {
     std::string scaleName;  // what WaveformDataPoint::timeS is: "time", "frequency", "v-sweep", "i-sweep", "" (.op)
     std::vector<OutputRequestDTO> outputRequests;
     std::vector<std::string> outerNames;  // what WaveformDataPoint::outer holds: outer .dc sources, TEMP
+    bool stepped = false;  // the last outerNames are .step values (one plot per step in a raw file)
+    std::vector<MeasureResultDTO> measures;
     std::vector<double> timeVector;
     std::unordered_map<int, std::vector<double>> nodeVoltages;
     ExtendedAnalysisResultsDTO extended;

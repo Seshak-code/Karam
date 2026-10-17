@@ -8,6 +8,7 @@
 #include "engine_api/simulation_session.h"
 #include "engine_api/simulation_dto.h"
 #include "engine_api/engine_callbacks.h"
+#include "engine_api/measure.h"
 #include "engine_api/output.h"
 #include "netlist/numparam.h"
 
@@ -43,7 +44,7 @@ const char* kUsage =
     "db(), mag(), ph(), real(), imag(). Without .print the operating point lists every node.\n";
 
 struct Analysis {
-    std::string kind;  // op, dc, ac, tran, noise
+    std::string kind;  // op, dc, ac, tran, noise, pz, sens
     SimulationRequestDTO req;
 };
 
@@ -68,7 +69,7 @@ std::vector<std::string> analysisCards(const std::string& text) {
         std::string kw;
         ls >> kw;
         for (auto& c : kw) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (kw == ".op" || kw == ".dc" || kw == ".ac" || kw == ".tran" || kw == ".noise") kinds.push_back(kw.substr(1));
+        if (kw == ".op" || kw == ".dc" || kw == ".ac" || kw == ".tran" || kw == ".noise" || kw == ".pz" || kw == ".sens") kinds.push_back(kw.substr(1));
     }
     return kinds;
 }
@@ -100,6 +101,22 @@ void printNoise(std::ostream& os, const SimulationResponseDTO& r) {
     }
     std::snprintf(b, sizeof b, "onoise_total = %.6e\ninoise_total = %.6e\n", nz.onoiseTotal, nz.inoiseTotal);
     os << b;
+}
+
+// ngspice's pz table: pole(k) = re,im then zero(k) = re,im
+void printPZ(std::ostream& os, const SimulationResponseDTO& r) {
+    char b[160];
+    const auto& pz = r.extended.pz;
+    for (size_t k = 0; k < pz.poleRe.size(); ++k) { std::snprintf(b, sizeof b, "pole(%zu) = %.5e,%.6e\n", k + 1, pz.poleRe[k], pz.poleIm[k]); os << b; }
+    for (size_t k = 0; k < pz.zeroRe.size(); ++k) { std::snprintf(b, sizeof b, "zero(%zu) = %.5e,%.6e\n", k + 1, pz.zeroRe[k], pz.zeroIm[k]); os << b; }
+}
+
+// ngspice lists "name = value" per parameter; elements left out say so (a missing line is never a zero)
+void printSens(std::ostream& os, const SimulationResponseDTO& r) {
+    char b[160];
+    const auto& sn = r.extended.sens;
+    for (size_t k = 0; k < sn.names.size(); ++k) { std::snprintf(b, sizeof b, "%s = %.6e\n", sn.names[k].c_str(), sn.values[k]); os << b; }
+    for (const auto& u : sn.unsupported) os << "sensitivity of " << u << " parameters is not supported yet\n";
 }
 
 }  // namespace
@@ -190,6 +207,8 @@ int main(int argc, char** argv) {
         SimulationResponseDTO r = an.kind == "tran" ? session->runTransient(an.req, cb, nullptr)
                                 : an.kind == "ac"   ? session->runAC(an.req, cb)
                                 : an.kind == "noise" ? session->runNoise(an.req, cb)
+                                : an.kind == "sens" ? session->runSens(an.req, cb)
+                                : an.kind == "pz"   ? session->runPoleZero(an.req, cb)
                                                     : session->runDC(an.req, cb);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         if (!r.converged) {
@@ -198,13 +217,22 @@ int main(int argc, char** argv) {
             continue;
         }
         try {
-            if (an.kind == "noise") {
+            if (an.kind == "sens") {
+                if (!rawPath.empty()) throw std::runtime_error("raw output of .sens is not supported yet");
+                printSens(out, r);
+            } else if (an.kind == "pz") {
+                if (!rawPath.empty()) throw std::runtime_error("raw output of .pz is not supported yet");
+                printPZ(out, r);
+            } else if (an.kind == "noise") {
                 if (!rawPath.empty()) throw std::runtime_error("raw output of .noise is not supported yet");
                 printNoise(out, r);
             } else {
                 const auto prints = requestedSpecs(r, 'p');
-                if (!rawPath.empty()) writeRaw(rawFile, selectOutputs(r, requestedSpecs(r, 's')), title(text), ascii);  // ngspice: one plot, the inner sweep repeating
-                for (const auto& part : splitByOuter(r)) {  // a nested .dc / .temp list: one table per outer value
+                const auto saves = requestedSpecs(r, 's');
+                if (!rawPath.empty() && !r.stepped) writeRaw(rawFile, selectOutputs(r, saves), title(text), ascii);  // ngspice: one plot, the inner sweep repeating
+                int step = 0;
+                for (const auto& part : splitByOuter(r)) {  // a nested .dc / .temp / .step list: one table per outer value
+                    if (!rawPath.empty() && r.stepped) writeRaw(rawFile, selectOutputs(part, saves), title(text), ascii);  // one plot per step
                     if (!part.waveformPoints.empty() && !part.waveformPoints[0].outer.empty()) {
                         out << "Sweep:";
                         for (size_t i = 0; i < r.outerNames.size(); ++i) out << " " << r.outerNames[i] << "=" << part.waveformPoints[0].outer[i];
@@ -212,7 +240,8 @@ int main(int argc, char** argv) {
                     }
                     if (!prints.empty()) writeTable(out, selectOutputs(part, prints), title(text));
                     else if (part.scaleName.empty()) printOp(out, part);
-                    else if (rawPath.empty()) out << "." << an.kind << ": " << part.waveformPoints.size() << " points; add a .print card or -r FILE to see them\n";
+                    else if (rawPath.empty() && r.measures.empty()) out << "." << an.kind << ": " << part.waveformPoints.size() << " points; add a .print card or -r FILE to see them\n";
+                    writeMeasures(out, r, step++);
                 }
             }
         } catch (const std::exception& e) {

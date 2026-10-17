@@ -24,6 +24,7 @@
 // engine_api public DTO types
 #include "engine_api/simulation_dto.h"
 #include "engine_api/isimulation_engine.h"
+#include "engine_api/measure.h"
 
 #include <algorithm>
 #include <chrono>
@@ -109,22 +110,86 @@ static JobID generateJobID() {
 // Supports .model, .subckt/.ends, .param, waveform specs (PULSE, SIN), and SI suffixes.
 // Returns false (filling `failure`) on a parse error. It used to be logged and the
 // partial (or empty) netlist solved anyway, reporting "converged".
+static std::function<void(double)> sweepSetter(TensorNetlist& netlist, const std::string& name);
+
+// The request's netlist at circuit temperature tempC (NaN: the netlist's), with the values of this .step run applied.
+// Returns an error text, or "".
+static std::string parseRequest(const SimulationRequestDTO& req, double tempC, SPICEParseResult& out) {
+    std::map<std::string, double> params;
+    for (const auto& s : req.stepValues) {
+        if (s.kind == 'P') params[s.name] = s.value;
+        else if (s.kind == 'T') tempC = s.value;
+    }
+    out = SPICEParser().parse(req.source.payload, req.source.baseDir, tempC, params);
+    if (!out.success) return "SPICE parse error: " + out.errorMessage;
+    for (const auto& s : req.stepValues) {
+        if (s.kind != 'E') continue;
+        const auto set = sweepSetter(out.netlist, s.name);
+        if (!set) return ".step element '" + s.name + "' not found at top level (a V, I or R card)";
+        set(s.value);
+    }
+    return "";
+}
+
 // The corner temperature wins over the netlist's .temp (as an explicit .dc request wins over its .dc);
-// every temperature-dependent value is resolved by the parser. A .temp list is for .op/.dc (listOk) only.
+// every temperature-dependent value is resolved by the parser. A .temp list is for .op/.dc (listOk) only,
+// a .step list for the analyses that run it (stepOk).
 static bool deserialiseRequest(const SimulationRequestDTO& req, SPICEParseResult& out,
-                               SimulationResponseDTO& failure, bool listOk = false) {
+                               SimulationResponseDTO& failure, bool listOk = false, bool stepOk = false) {
     // ponytail: 27 is the DTO's default, so a corner asking for 27 C cannot override a netlist .temp
-    out = SPICEParser().parse(req.source.payload, req.source.baseDir,
-                              req.corner.temperature != 27.0 ? req.corner.temperature : NAN);
-    if (!out.success) {
-        failure.errorDetail = "SPICE parse error: " + out.errorMessage;
+    if (const std::string e = parseRequest(req, req.corner.temperature != 27.0 ? req.corner.temperature : NAN, out); !e.empty()) {
+        failure.errorDetail = e;
         return false;
     }
     if (!listOk && out.netlist.environment.temp_count > 1) {
         failure.errorDetail = TEMP_LIST_ERR;
         return false;
     }
+    if (!stepOk && !out.steps.empty() && req.stepValues.empty()) {
+        failure.errorDetail = ".step is not supported with this analysis yet";
+        return false;
+    }
     return true;
+}
+
+// A .step list: the analysis once per combination (the first card is the outermost loop). The runs join into one response
+// whose points carry the step values after any outer sweep's (fastest card first), so splitByOuter gives one block per step.
+static SimulationResponseDTO runSteps(const SimulationRequestDTO& req, const std::vector<SPICEParseResult::Step>& steps,
+                                      const std::function<SimulationResponseDTO(const SimulationRequestDTO&)>& run) {
+    SimulationResponseDTO all;
+    std::vector<size_t> idx(steps.size(), 0);
+    bool first = true;
+    for (bool more = true; more;) {
+        SimulationRequestDTO q = req;
+        std::vector<double> tag;
+        std::string at;
+        for (size_t k = 0; k < steps.size(); ++k) {
+            q.stepValues.push_back({steps[k].kind, steps[k].name, steps[k].values[idx[k]]});
+            at += (k ? " " : "") + steps[k].name + "=" + std::to_string(steps[k].values[idx[k]]);
+        }
+        for (size_t k = steps.size(); k-- > 0;) tag.push_back(steps[k].values[idx[k]]);
+        SimulationResponseDTO r = run(q);
+        if (!r.converged) {
+            r.errorDetail = "at .step " + at + ": " + r.errorDetail;
+            return r;
+        }
+        for (auto& pt : r.waveformPoints) pt.outer.insert(pt.outer.end(), tag.begin(), tag.end());
+        if (first) {
+            first = false;
+            all = std::move(r);
+            for (size_t k = steps.size(); k-- > 0;) all.outerNames.push_back(steps[k].name);
+            all.stepped = true;
+        } else {
+            all.waveformPoints.insert(all.waveformPoints.end(), std::make_move_iterator(r.waveformPoints.begin()),
+                                      std::make_move_iterator(r.waveformPoints.end()));
+        }
+        more = false;
+        for (size_t k = steps.size(); k-- > 0 && !more;) {
+            if (++idx[k] < steps[k].values.size()) more = true;
+            else idx[k] = 0;
+        }
+    }
+    return all;
 }
 
 // ============================================================================
@@ -164,6 +229,7 @@ SimulationResponseDTO SessionImpl::runDC(const SimulationRequestDTO& req,
     auto start = std::chrono::steady_clock::now();
 
     SimulationResponseDTO result = dispatch_dc_internal(req, cb);
+    if (result.converged) attachMeasures(result);
 
     auto elapsed = std::chrono::steady_clock::now() - start;
     result.solveTimeMs = std::chrono::duration<double, std::milli>(elapsed).count();
@@ -270,8 +336,8 @@ static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseRe
             if (dims[d].name == "TEMP") tempC = val[d];
         }
         if (tempC != runTempC) {
-            SPICEParseResult np = SPICEParser().parse(req.source.payload, req.source.baseDir, tempC);
-            if (!np.success) { r.converged = false; r.errorDetail = "SPICE parse error: " + np.errorMessage; break; }
+            SPICEParseResult np;
+            if (const std::string e = parseRequest(req, tempC, np); !e.empty()) { r.converged = false; r.errorDetail = e; break; }
             if (!build(std::move(np))) { r.converged = false; break; }
             runTempC = tempC;
             prev.clear();  // a new circuit: no continuation
@@ -312,7 +378,9 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
                                                           const EngineCallbacks& cb) {
     SPICEParseResult parsed;
     SimulationResponseDTO failure;
-    if (!deserialiseRequest(req, parsed, failure, true)) return failure;
+    if (!deserialiseRequest(req, parsed, failure, true, true)) return failure;
+    if (!parsed.steps.empty() && req.stepValues.empty())
+        return runSteps(req, parsed.steps, [&](const SimulationRequestDTO& q) { return dispatch_dc_internal(q, cb); });
     std::vector<DCConfigDTO> sweeps;  // innermost first
     if (!req.dc.sweepVariable.empty()) {  // an explicit request wins over the netlist's .dc
         sweeps.push_back(req.dc);
@@ -335,8 +403,13 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
     if (parsed.tempsC.size() > 1) {  // .temp t1 t2 ...: the whole run once per temperature, outermost
         for (const auto& d : dims)
             if (d.name == "TEMP") { failure.errorDetail = "a .temp list and a .dc TEMP sweep together are not supported yet"; return failure; }
+        for (const auto& s : req.stepValues)
+            if (s.kind == 'T') { failure.errorDetail = "a .temp list and .step temp together are not supported yet"; return failure; }
         dims.push_back({"TEMP", parsed.tempsC});
     }
+    for (const auto& s : req.stepValues)
+        for (const auto& d : dims)
+            if (s.kind == 'T' && d.name == "TEMP") { failure.errorDetail = "a .dc TEMP sweep and .step temp together are not supported yet"; return failure; }
     if (dims.empty()) {
         CircuitSim sim;
         sim.execMode = selectExecMode(precision_);
@@ -359,6 +432,7 @@ SimulationResponseDTO SessionImpl::runAC(const SimulationRequestDTO& req,
                                           const EngineCallbacks& cb) {
     status_.store(JobStatus::Running);
     SimulationResponseDTO result = dispatch_ac_internal(req, cb);
+    if (result.converged) attachMeasures(result);
     result.jobId = jobId_;
     result.success = result.converged;  // driver-path consumers read success
     status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
@@ -369,7 +443,9 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
                                                           const EngineCallbacks& cb) {
     SPICEParseResult parsed;
     SimulationResponseDTO r;
-    if (!deserialiseRequest(req, parsed, r)) return r;
+    if (!deserialiseRequest(req, parsed, r, false, true)) return r;
+    if (!parsed.steps.empty() && req.stepValues.empty())
+        return runSteps(req, parsed.steps, [&](const SimulationRequestDTO& q) { return dispatch_ac_internal(q, cb); });
     TensorNetlist& netlist = parsed.netlist;
     ACConfigDTO ac = req.ac;  // an explicit request wins over the netlist's .ac
     if (ac.points == 0) ac = {parsed.acSweep, parsed.acPoints, parsed.acStart, parsed.acStop};
@@ -414,6 +490,7 @@ SimulationResponseDTO SessionImpl::runTransient(const SimulationRequestDTO& req,
                                                   ResultChunkCallback streamCallback) {
     status_.store(JobStatus::Running);
     SimulationResponseDTO result = dispatch_tran_internal(req, cb, std::move(streamCallback));
+    if (result.converged) attachMeasures(result);
     result.jobId = jobId_;
     result.success = result.converged;  // driver-path consumers read success
     status_.store(result.converged ? JobStatus::Completed : JobStatus::Failed);
@@ -425,7 +502,9 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
                                                             ResultChunkCallback streamCb) {
     SPICEParseResult parsed;
     SimulationResponseDTO failure;
-    if (!deserialiseRequest(req, parsed, failure)) return failure;
+    if (!deserialiseRequest(req, parsed, failure, false, true)) return failure;
+    if (!parsed.steps.empty() && req.stepValues.empty())
+        return runSteps(req, parsed.steps, [&](const SimulationRequestDTO& q) { return dispatch_tran_internal(q, cb, streamCb); });
     TensorNetlist& netlist = parsed.netlist;
     const bool uic = parsed.tranUIC || req.transient.uic;
     const double  stopTime = req.transient.stopTimeS != 0 ? req.transient.stopTimeS : parsed.tranStop;  // else the netlist's .tran
@@ -544,7 +623,7 @@ SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
     if (deserialiseRequest(req, parsed, r)) {
         TensorNetlist& netlist = parsed.netlist;
         const auto freqs = CircuitSim::acFrequencies(parsed.noiseSweep, parsed.noisePoints,
-                                                     parsed.noiseStart, parsed.noiseStop);
+                                                     parsed.noiseStart, parsed.noiseStop, true);
         CircuitSim sim;
         sim.execMode = selectExecMode(precision_);
         if (parsed.noiseSource.empty() || freqs.empty())
@@ -561,6 +640,66 @@ SimulationResponseDTO SessionImpl::runNoise(const SimulationRequestDTO& req,
         r.backend = backendOf(sim, precision_);
     }
     r.success = r.converged;  // driver-path consumers read success
+    status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);
+    return r;
+}
+
+// ── Poles and zeros ───────────────────────────────────────────────────────
+SimulationResponseDTO SessionImpl::runPoleZero(const SimulationRequestDTO& req,
+                                                const EngineCallbacks& /*cb*/) {
+    status_.store(JobStatus::Running);
+    SimulationResponseDTO r;
+    r.jobId        = jobId_;
+    r.analysisType = AnalysisTypeDTO::POLE_ZERO;
+    SPICEParseResult parsed;
+    if (deserialiseRequest(req, parsed, r)) {
+        CircuitSim sim;
+        sim.execMode = selectExecMode(precision_);
+        if (!parsed.hasPZ)
+            r.errorDetail = "Pole-zero needs .pz in+ in- out+ out- cur|vol pol|zer|pz.";
+        else if (SolverStep dc = sim.solveDC(parsed.netlist); !dc.stats.converged)
+            r.errorDetail = "DC operating point failed before pole-zero analysis: " + dc.stats.error_detail;
+        else {
+            const int* n = parsed.pzNode;
+            auto pz = sim.solvePoleZero(parsed.netlist, n[0], n[1], n[2], n[3], parsed.pzVolt, parsed.pzPoles, parsed.pzZeros);
+            r.errorDetail = pz.error;
+            r.converged   = pz.error.empty();
+            r.extended.hasPZ = r.converged;
+            for (auto p : pz.poles) { r.extended.pz.poleRe.push_back(p.real()); r.extended.pz.poleIm.push_back(p.imag()); }
+            for (auto z : pz.zeros) { r.extended.pz.zeroRe.push_back(z.real()); r.extended.pz.zeroIm.push_back(z.imag()); }
+        }
+        r.backend = backendOf(sim, precision_);
+    }
+    r.success = r.converged;
+    status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);
+    return r;
+}
+
+// ── DC sensitivity ────────────────────────────────────────────────────────
+SimulationResponseDTO SessionImpl::runSens(const SimulationRequestDTO& req,
+                                            const EngineCallbacks& /*cb*/) {
+    status_.store(JobStatus::Running);
+    SimulationResponseDTO r;
+    r.jobId        = jobId_;
+    r.analysisType = AnalysisTypeDTO::SENSITIVITY;
+    SPICEParseResult parsed;
+    if (deserialiseRequest(req, parsed, r)) {
+        CircuitSim sim;
+        sim.execMode = selectExecMode(precision_);
+        if (!parsed.hasSens)
+            r.errorDetail = "Sensitivity needs .sens v(out[,ref]) or .sens i(vsrc).";
+        else if (SolverStep dc = sim.solveDC(parsed.netlist); !dc.stats.converged)
+            r.errorDetail = "DC operating point failed before sensitivity analysis: " + dc.stats.error_detail;
+        else {
+            auto sn = sim.solveSens(parsed.netlist, parsed.sensOut, parsed.sensRef, parsed.sensSource);
+            r.errorDetail = sn.error;
+            r.converged   = sn.error.empty();
+            r.extended.hasSens = r.converged;
+            r.extended.sens = {std::move(sn.names), std::move(sn.values), std::move(sn.unsupported)};
+        }
+        r.backend = backendOf(sim, precision_);
+    }
+    r.success = r.converged;
     status_.store(r.converged ? JobStatus::Completed : JobStatus::Failed);
     return r;
 }

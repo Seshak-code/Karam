@@ -11,6 +11,7 @@
 // exact Jacobian from the same code that folds a constant.
 #include <cmath>
 #include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -48,7 +49,8 @@ std::string text(const Expr &e);
 // Expand the (line number, text) lines of a netlist whose .include/.lib are already
 // spliced. Line 1 (the title) passes through. errLine: the line an error refers to.
 std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines,
-                                                int &errLine, double tempC = 27.0);  // tempC: TEMPER
+                                                int &errLine, double tempC = 27.0,  // tempC: TEMPER
+                                                const std::map<std::string, double> &overrides = {});  // upper-case global .param values that win over the netlist's
 
 // Evaluate node i. Env: time(), ref(k) (the Dual of e.refs[k]), strict (constants: /0 is an error).
 template <class Env>
