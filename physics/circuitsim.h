@@ -454,6 +454,7 @@ public:
     double step = 0, dtMin = 0, endTol = 0, hMax = 0, h = 0, t = 0;
     bool landedOnCorner = false;
     int tinySteps = 0;
+    int accepted = 0;  // steps taken so far
     std::vector<std::function<double(double)>> corners;  // next waveform corner after x, per source
   } tran_;
   void tranCorners(const TensorNetlist &netlist);

@@ -696,7 +696,7 @@ std::string CircuitSim::beginTransient(TensorNetlist &netlist, double step, bool
 
 std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
                                   const std::function<bool(const SolverStep &)> &onPoint) {
-  auto &[step, dtMin, endTol, hMax, h, t, landedOnCorner, tinySteps, corners] = tran_;
+  auto &[step, dtMin, endTol, hMax, h, t, landedOnCorner, tinySteps, accepted, corners] = tran_;
   while (stop - t > endTol) {
     const bool endClip = stop - t < h;
     double hTry = std::min(h, stop - t);
@@ -704,9 +704,14 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
     bool toCorner = false;
     for (const auto &next : corners)
       if (next(t + endTol) - t <= hTry) { hTry = next(t + endTol) - t; toCorner = true; }
-    if (landedOnCorner) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
+    // The second step is backward Euler too (ngspice stays at order 1 until LTE allows 2): the
+    // first step's i history is the start inrush, and a trapezoid step on it rings +-dI forever
+    // (OSDI devices at a UIC start, +-0.1 A on i(vdd)); BE stores the relaxed current instead.
+    const bool euler = landedOnCorner || accepted == 1;
+    if (accepted == 1) lteHold_ = std::max(lteHold_, 1);
+    if (euler) setIntegrationMethod(IntegrationType::GEAR_1_EULER);
     SolverStep s = stepTransient(netlist, hTry, t);
-    if (landedOnCorner) setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
+    if (euler) setIntegrationMethod(IntegrationType::TRAPEZOIDAL);
     if (!osdiFatal_.empty()) return "OSDI model error at t=" + std::to_string(t) + " s: " + osdiFatal_;
     if (!s.stats.converged || !(s.time > t)) {
       h = hTry * 0.25;
@@ -736,6 +741,7 @@ std::string CircuitSim::advanceTo(TensorNetlist &netlist, double stop,
     }
     landedOnCorner = toCorner && taken >= hTry * (1.0 - 1e-9);
     t = s.time;
+    ++accepted;
     if (onPoint && !onPoint(s)) return "Cancelled.";
     const double hKept = h;
     h = std::min(hMax, taken * 2.0);
@@ -1309,7 +1315,7 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
       // If LTE exceeds tolerance, reject the step and retry with smaller dt.
       auto lteResult = lteController_.estimateLTE(
           netlist, nrEstimate, actualTimeStep, integrator->getType(),
-          [&](const std::function<void(double, const std::array<double, 3> &)> &visit) {
+          [&](const std::function<void(double, const std::array<double, 3> &, double)> &visit) {
             // diode / BJT charge branches, internal nodes included (as the MOS branches)
             auto getV = [&](int n) { return n > 0 && n <= (int)nrEstimate.size() ? nrEstimate[n - 1] : 0.0; };
             forEachJunction(netlist, [&](const Junction &j) {
@@ -1318,16 +1324,19 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
               for (int k = 0; k < j.terms; ++k) x[k] = getV(j.n[k]);
               double v[5], q[5];
               const int K = junctionCharges(j, x, v, q);
-              for (int k = 0; k < K; ++k) visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]});
+              for (int k = 0; k < K; ++k) {
+                const double dv = std::abs(v[k] - j.st->v[0][k]);
+                visit(v[k], {j.st->v[0][k], j.st->v[1][k], j.st->v[2][k]}, dv > 1e-9 ? std::abs(q[k] - j.st->q[k]) / dv : 0.0);
+              }
             });
             // OSDI devices: their local node voltages
             forEachOsdi(netlist, [&](const OsdiRef &r) {
               const auto &h = r.in->vHist;
-              for (size_t k = 0; k < r.n.size(); ++k) visit(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]});
+              for (size_t k = 0; k < r.n.size(); ++k) visit(getV(r.n[k]), {h[0][k], h[1][k], h[2][k]}, -1.0);
             });
           });
 
-      if (lteResult.requiresRejection && lteHold_ == 0) {
+      if (lteResult.requiresRejection && (lteHold_ == 0 || lteResult.deviceRejects)) {
         // LTE too large — timestep was too aggressive
         actualTimeStep = lteResult.suggestedDt;
         attempt++;

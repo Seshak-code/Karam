@@ -66,8 +66,6 @@ DIALECT = {
 
 # Cases the engine cannot do yet (a missing feature or a convergence limit), not a dialect: ngspice solves them.
 OPEN = {
-    "SANDLER25/": "LM111 window detector: transient Newton fails at the 2.25 ms comparator flip (also with F in place of the "
-                  "B source, so it is the BJT macro, not B); ngspice completes",
     "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card: ngspice runs its BSIM4v5, the engine "
                   "BSIM4 4.8 (OSDI); v(1) 0.737 V vs ngspice 0.556 V, and ngspice with version=4.8 gives 0.739 V",
 }
