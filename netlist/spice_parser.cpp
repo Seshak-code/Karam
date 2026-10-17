@@ -446,12 +446,31 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                         result_.dcSweeps.push_back({name, parseValue(tok[i + 1]), parseValue(tok[i + 2]), parseValue(tok[i + 3])});
                     }
                 }
+                else if (keyword == ".PRINT" || keyword == ".SAVE" || keyword == ".PROBE") {
+                    OutputRequest out{keyword == ".PRINT" ? 'p' : 's', "", {}};
+                    int depth = 0;  // split at top-level blanks: v(a, b)*2 is one expression
+                    std::string cur;
+                    for (size_t i = keyword.size(); i <= line.size(); ++i) {
+                        const char c = i < line.size() ? line[i] : ' ';
+                        depth += (c == '(') - (c == ')');
+                        if (std::isspace(static_cast<unsigned char>(c)) && depth <= 0) {
+                            if (!cur.empty()) out.specs.push_back(cur);
+                            cur.clear();
+                        } else cur += c;
+                    }
+                    if (!out.specs.empty() && std::set<std::string>{"TRAN", "AC", "DC", "OP"}.count(toUpper(out.specs[0]))) {
+                        out.analysis = out.specs[0];
+                        for (auto& c : out.analysis) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        out.specs.erase(out.specs.begin());
+                    }
+                    if (out.specs.empty()) throw std::runtime_error(tok[0] + " needs at least one output");
+                    if (!inSubckt_) result_.outputs.push_back(std::move(out));
+                }
                 else if (keyword == ".END") break;
                 // Output-only (.four only prints a Fourier table) and first-pass cards; anything else changes the
                 // circuit or analysis (.step, .nodeset, ...) and used to be
                 // ignored silently.
-                else if (keyword != ".GLOBAL" && keyword != ".PRINT" && keyword != ".PLOT" &&
-                         keyword != ".SAVE" && keyword != ".PROBE" && keyword != ".MEAS" &&
+                else if (keyword != ".GLOBAL" && keyword != ".PLOT" && keyword != ".MEAS" &&
                          keyword != ".MEASURE" &&
                          keyword != ".WIDTH" && keyword != ".TITLE" && keyword != ".FOUR")
                     throw std::runtime_error(tok[0] + " is not supported yet");
@@ -485,7 +504,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 case 'X': {
                     // X<name> <nodes...> <subcktName>; expanded after parsing
                     requireFields(tok, 3);
-                    PendingInstance pi{toUpper(tok.back()), {}, lineNum};
+                    PendingInstance pi{toUpper(tok.back()), {}, lineNum, toUpper(tok[0])};
                     for (size_t i = 1; i + 1 < tok.size(); ++i)
                         pi.nodes.push_back(nodeIndex(tok[i]));
                     (inSubckt_ ? subcktChildren_[subcktName_] : topInstances_).push_back(pi);
@@ -1219,6 +1238,7 @@ void SPICEParser::parseVCVS(const std::vector<std::string>& tok, TensorBlock& bl
     e.ctrlPos = nodeIndex(tok[3]);
     e.ctrlNeg = nodeIndex(tok[4]);
     e.gain    = parseValue(tok[5]);
+    e.name    = toUpper(tok[0]);
     blk.voltageControlledVoltageSources.push_back(e);
 }
 
@@ -1293,6 +1313,7 @@ void SPICEParser::parseCCVS(const std::vector<std::string>& tok, TensorBlock& bl
     h.ctrlPos = h.ctrlNeg = 0;
     h.ctrlName = toUpper(tok[3]);
     h.rm = parseValue(tok[4]);
+    h.name = toUpper(tok[0]);
     blk.currentControlledVoltageSources.push_back(h);
 }
 
@@ -1441,6 +1462,7 @@ void SPICEParser::parseSubcktEnd() {
     if (!inSubckt_) throw std::runtime_error(".ends without .subckt");
     resolveControlledSources(subcktBlock_);
     inSubckt_ = false;
+    subcktNames_[subcktName_] = subcktNodeMap_;
     inductorIndex_.swap(savedInductorIndex_);
     subcktBlock_.numInternalNodes = nextLocalNode_ - 1;  // ports + internal nodes
 
@@ -1451,7 +1473,7 @@ void SPICEParser::parseSubcktEnd() {
 // One instance of `pi.subckt` with ports on global nodes `portNodes`: fresh
 // global nodes for its internal nodes, then its own X cards, recursively.
 void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes,
-                                 int depth) {
+                                 int depth, const std::string& path) {
     if (depth > 64) throw std::runtime_error("subcircuit nesting deeper than 64 (recursive .subckt?)");
     auto it = result_.netlist.blockDefinitions.find(pi.subckt);
     if (it == result_.netlist.blockDefinitions.end())
@@ -1470,12 +1492,15 @@ void SPICEParser::expandInstance(const PendingInstance& pi, const std::vector<in
         if (isNew) ++nextNode_;
         map.push_back(node->second);
     }
-    result_.netlist.addInstance(pi.subckt, map);
+    const std::string full = path + pi.name;
+    result_.netlist.addInstance(pi.subckt, map, full);
+    for (const auto& [local, l] : subcktNames_[pi.subckt])  // internal nodes are addressable as x1.n
+        if (l > (int)portNodes.size()) result_.nodeIndex.emplace(full + "." + local, map[l - 1]);
 
     for (const auto& child : subcktChildren_[pi.subckt]) {
         std::vector<int> childPorts;
         for (int l : child.nodes) childPorts.push_back(l == 0 ? 0 : map[l - 1]);
-        expandInstance(child, childPorts, depth + 1);
+        expandInstance(child, childPorts, depth + 1, full + ".");
     }
 }
 

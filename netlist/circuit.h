@@ -336,6 +336,7 @@ struct VCVS {
     int ctrlPos, ctrlNeg;
     double gain;
     std::string role;
+    std::string name;          // instance name (i(name))
 };
 
 struct VCCS {
@@ -350,6 +351,7 @@ struct CCVS {
     int ctrlPos, ctrlNeg;      // unused by the solver (legacy sense-node fields)
     double rm;
     std::string role;
+    std::string name;          // instance name (i(name))
     int ctrlSource = -1;       // index of the controlling V source in the same block
     std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
 };
@@ -1208,6 +1210,7 @@ struct BlockInstance {
     std::string blockName;                // Name of the TensorBlock template
     std::vector<int> nodeMapping;         // Maps local node index -> global node index
     std::map<std::string, double> parameters; // Instance-specific parameters (e.g. "W", "L")
+    std::string name;                     // hierarchical instance path (X1.X2), for branch-current names
 };
 
 // BlockState - Dynamic state for a block instance (Solving the Shared History Bug)
@@ -1311,7 +1314,7 @@ public:
         blockDefinitions[block.name] = block;
     }
     
-    void addInstance(const std::string& blockName, std::vector<int> nodeMap) {
+    void addInstance(const std::string& blockName, std::vector<int> nodeMap, const std::string& name = "") {
         // Sync numGlobalNodes with user-supplied mapping to avoid collisions
         for (int n : nodeMap) if (n > numGlobalNodes) numGlobalNodes = n;
 
@@ -1342,7 +1345,7 @@ public:
              }
         }
         
-        instances.push_back({blockName, nodeMap});
+        instances.push_back({blockName, nodeMap, {}, name});
         
         // Initialize state for new instance
         BlockState newState;

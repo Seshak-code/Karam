@@ -21,6 +21,9 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The one version string: treespice --version and EngineCapabilities::engineVersionString
+set(TREESPICE_VERSION "1.0-alpha")
+
 # ---------------------------------------------------------------------------
 # GPU (Phase 4): Dawn / WebGPU. OpenVLSI provides dawn_native when it builds the
 # engine as a subdirectory; standalone, -DTREESPICE_GPU=ON fetches the same Dawn
@@ -59,6 +62,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(acutesim_engine_objects OBJECT)
 target_compile_features(acutesim_engine_objects PUBLIC cxx_std_17)
+target_compile_definitions(acutesim_engine_objects PRIVATE TREESPICE_VERSION="${TREESPICE_VERSION}")
 
 # === HARDENING: Symbol Visibility Discipline ===
 target_compile_options(acutesim_engine_objects PRIVATE
@@ -101,7 +105,8 @@ target_include_directories(acutesim_engine_objects
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>              # "engine_api/x.h", "netlist/circuit.h"
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/engine_api>   # bare "simulation_dto.h"
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:include/treespice>
+        $<INSTALL_INTERFACE:include/treespice/engine_api>
 )
 
 # ---------------------------------------------------------------------------
@@ -135,6 +140,7 @@ target_sources(acutesim_engine_objects PRIVATE
     # === Infrastructure ===
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/postproc_engine.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/hardware_capabilities.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/infrastructure/output.cpp
 
     # === Math ===
     ${CMAKE_CURRENT_SOURCE_DIR}/math/contraction_solver.cpp
@@ -179,8 +185,17 @@ endif()
 # ---------------------------------------------------------------------------
 # CLI — Engine Consumer
 # ---------------------------------------------------------------------------
-add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
-target_link_libraries(acutesim_engine_cli PRIVATE acutesim_engine)
+add_executable(treespice cli/engine_cli_main.cpp)
+target_link_libraries(treespice PRIVATE acutesim_engine)
+
+# cmake --install build --prefix X: bin/treespice, lib/libacutesim_engine.a, include/treespice/engine_api/*.h
+# (the static library carries every object, so the OBJECT target needs no install)
+if(TREESPICE_STANDALONE)
+    include(GNUInstallDirs)
+    install(TARGETS treespice RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(TARGETS acutesim_engine ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(DIRECTORY engine_api DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/treespice FILES_MATCHING PATTERN "*.h")
+endif()
 
 # ---------------------------------------------------------------------------
 # Waveform dump tool — machine-readable output for tests/ngspice_diff

@@ -3,6 +3,9 @@
 // Prints: "CONVERGED <0|1>", "ERROR <text>", "BACKEND <what ran>", then one line per waveform point:
 //   <time> <v1> <v2> ...   (engine-internal node order)
 //   ac: <freq> <re1> <im1> <re2> <im2> ...
+//   then the branch currents (V/L/E/H/B-voltage, into the + terminal as ngspice's i(name)), after all the
+//   voltages: <i1> <i2> ... (ac: <re> <im> pairs). "NODES n1 n2 ..." ("-" if unnamed) and
+//   "BRANCHES b1 b2 ..." (lower case) precede the points and name the columns in order.
 //   (env TREESPICE_BASEDIR overrides the directory .include/.lib paths resolve against)
 //   noise: <freq> <onoise> <inoise> ... then "TOTAL <onoise_total> <inoise_total>"
 // A nested .dc / .temp list adds "SWEEP <name>=<value> ..." before the first row of each outer value
@@ -53,6 +56,11 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < nz.frequencies.size(); ++k)
         std::printf("%.9g %.9g %.9g\n", nz.frequencies[k], nz.onoise[k], nz.inoise[k]);
     if (r.extended.hasNoise) std::printf("TOTAL %.9g %.9g\n", nz.onoiseTotal, nz.inoiseTotal);
+    std::printf("NODES");
+    for (const auto& n : r.nodeNames) std::printf(" %s", n.empty() ? "-" : n.c_str());
+    std::printf("\nBRANCHES");
+    for (const auto& n : r.branchNames) std::printf(" %s", n.c_str());
+    std::printf("\n");
     const std::vector<double>* shown = nullptr;
     for (const auto& p : r.waveformPoints) {
         if (!p.outer.empty() && (!shown || *shown != p.outer)) {
@@ -66,6 +74,10 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < p.nodeVoltages.size(); ++i) {
             std::printf(" %.9g", p.nodeVoltages[i]);
             if (i < p.nodeVoltagesImag.size()) std::printf(" %.9g", p.nodeVoltagesImag[i]);
+        }
+        for (size_t i = 0; i < p.branchCurrents.size(); ++i) {
+            std::printf(" %.9g", p.branchCurrents[i]);
+            if (i < p.branchCurrentsImag.size()) std::printf(" %.9g", p.branchCurrentsImag[i]);
         }
         std::printf("\n");
     }

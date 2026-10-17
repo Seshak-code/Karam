@@ -59,12 +59,24 @@ static SimulationResponseDTO stepToResponse(const SolverStep& step,
     WaveformDataPoint pt;
     pt.timeS = step.time;
     pt.nodeVoltages = step.nodeVoltages;
+    pt.branchCurrents = step.branchCurrents;
     dto.waveformPoints.push_back(std::move(pt));
 
     // Trust provenance
     dto.solverProvenance = step.stats.provenance();
     dto.precisionMode    = prec;
     return dto;
+}
+
+static void nameColumns(SimulationResponseDTO& r, const SPICEParseResult& parsed, const CircuitSim& sim) {
+    r.nodeNames.assign(parsed.netlist.numGlobalNodes, "");
+    for (const auto& [name, idx] : parsed.nodeIndex)
+        if (idx >= 1 && idx <= parsed.netlist.numGlobalNodes && r.nodeNames[idx - 1].empty()) {
+            r.nodeNames[idx - 1] = name;
+            for (auto& c : r.nodeNames[idx - 1]) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    r.branchNames = sim.branchNames(parsed.netlist);
+    for (const auto& o : parsed.outputs) r.outputRequests.push_back({o.kind, o.analysis, o.specs});
 }
 
 // ── Helper: select CircuitSim ExecutionMode ────────────────────────────────
@@ -222,6 +234,7 @@ static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseRe
     };
     SimulationResponseDTO r;
     r.analysisType = AnalysisTypeDTO::DC;
+    r.scaleName = dims[0].name == "TEMP" ? "temp-sweep" : dims[0].name[0] == 'I' ? "i-sweep" : dims[0].name[0] == 'R' ? "res-sweep" : "v-sweep";
     long total = 1;
     for (size_t d = 0; d < dims.size(); ++d) {
         total *= static_cast<long>(dims[d].values.size());
@@ -281,14 +294,17 @@ static SimulationResponseDTO dcRun(const SimulationRequestDTO& req, SPICEParseRe
             r.errorDetail = "DC sweep failed at " + dims[0].name + "=" + std::to_string(val[0]) + ": " + s.stats.error_detail;
             break;
         }
-        WaveformDataPoint pt{val[0], s.nodeVoltages, {}, {}, {}};
+        WaveformDataPoint pt{val[0], s.nodeVoltages, {}, s.branchCurrents, {}, {}};
         pt.outer.assign(val.begin() + 1, val.end());
         r.waveformPoints.push_back(std::move(pt));
         cb.onProgress(static_cast<int>(k + 1), static_cast<int>(total));
         prev = idx;
         for (size_t d = 0; d < dims.size() && ++idx[d] == dims[d].values.size(); ++d) idx[d] = 0;
     }
-    if (run) r.backend = backendOf(run->sim, prec);
+    if (run) {
+        r.backend = backendOf(run->sim, prec);
+        nameColumns(r, run->parsed, run->sim);
+    }
     return r;
 }
 
@@ -331,6 +347,7 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
         }
         SimulationResponseDTO r = stepToResponse(sim.solveDC(parsed.netlist), jobId_, precision_);
         r.backend = backendOf(sim, precision_);
+        nameColumns(r, parsed, sim);
         return r;
     }
     return dcRun(req, std::move(parsed), dims, precision_, cb, [this] { return status_.load() == JobStatus::Cancelled; });
@@ -371,6 +388,7 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
     const auto X = sim.solveAC(netlist, freqs);
     r.converged    = X.size() == freqs.size();
     r.analysisType = AnalysisTypeDTO::AC;
+    r.scaleName    = "frequency";
     r.backend      = backendOf(sim, precision_);
     for (size_t k = 0; k < X.size(); ++k) {
         WaveformDataPoint pt{freqs[k], {}, {}, {}};
@@ -378,9 +396,15 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
             pt.nodeVoltages.push_back(X[k][i].real());
             pt.nodeVoltagesImag.push_back(X[k][i].imag());
         }
+        const int nb = sim.branchCount(netlist);
+        for (int i = netlist.numGlobalNodes; i < netlist.numGlobalNodes + nb && i < (int)X[k].size(); ++i) {
+            pt.branchCurrents.push_back(X[k][i].real());
+            pt.branchCurrentsImag.push_back(X[k][i].imag());
+        }
         r.waveformPoints.push_back(std::move(pt));
         cb.onProgress(static_cast<int>(k + 1), static_cast<int>(freqs.size()));
     }
+    nameColumns(r, parsed, sim);
     return r;
 }
 
@@ -404,8 +428,8 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
     if (!deserialiseRequest(req, parsed, failure)) return failure;
     TensorNetlist& netlist = parsed.netlist;
     const bool uic = parsed.tranUIC || req.transient.uic;
-    const double  stopTime = req.transient.stopTimeS;
-    const double  dt       = req.transient.stepSizeS;
+    const double  stopTime = req.transient.stopTimeS != 0 ? req.transient.stopTimeS : parsed.tranStop;  // else the netlist's .tran
+    const double  dt       = req.transient.stepSizeS != 0 ? req.transient.stepSizeS : parsed.tranStep;
 
     CircuitSim sim;
     sim.execMode = selectExecMode(precision_);
@@ -418,6 +442,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
             WaveformDataPoint pt;
             pt.timeS        = step.time;
             pt.nodeVoltages = step.nodeVoltages;
+            pt.branchCurrents = step.branchCurrents;
             result.waveformPoints.push_back(pt);
             if (streamCb) streamCb(pt, stepIdx);
             cb.onTimeStep(step.time, stopTime);
@@ -429,6 +454,8 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
 
     result.iterations = static_cast<int>(stepIdx);
     result.analysisType = AnalysisTypeDTO::TRANSIENT;
+    result.scaleName = "time";
+    nameColumns(result, parsed, sim);
     result.backend = backendOf(sim, precision_);
     return result;
 }
@@ -568,7 +595,7 @@ void EngineImpl::detectCapabilities() {
     capabilities_.neonSupported = true;
 #endif
 
-    capabilities_.engineVersionString = "AcuteSim Engine 1.0-alpha";
+    capabilities_.engineVersionString = "TreeSPICE " TREESPICE_VERSION;
 }
 
 std::unique_ptr<SimulationSession> EngineImpl::createSession() {

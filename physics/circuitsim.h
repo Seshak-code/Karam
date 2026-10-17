@@ -1330,17 +1330,18 @@ public:
     const BlockState *st;
     std::function<int(int)> map;   // local node -> global node
     int vs, ind, e, h, bv, dev;    // first matrix row of each branch kind (bv: voltage behavioural sources); dev: device internal nodes
+    const BlockInstance *inst = nullptr;
   };
   std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
     std::vector<BranchSlot> branchList;
-    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0});
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0, nullptr});
     for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
       auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
       if (it == nl.blockDefinitions.end()) continue;
       const auto *inst = &nl.instances[k];
       branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
         return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
-      }, 0, 0, 0, 0, 0, 0});
+      }, 0, 0, 0, 0, 0, 0, inst});
     }
     int next = nl.numGlobalNodes;
     for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
@@ -1356,6 +1357,31 @@ public:
     return branchList;
   }
   int systemSize(const TensorNetlist &nl) const { int t = 0; branchSlots(nl, t); return t; }
+
+  // The user-visible branch currents (V, L, E, H, B-voltage; ngspice's i(name)), in x order after
+  // the nodes, named like ngspice does in subcircuits: v.x1.v1. Device internals follow, unnamed.
+  int branchCount(const TensorNetlist &nl) const { int t = 0; return branchSlots(nl, t)[0].dev - nl.numGlobalNodes; }
+  std::vector<std::string> branchNames(const TensorNetlist &nl) const {
+    int t = 0;
+    const auto slots = branchSlots(nl, t);
+    std::vector<std::string> names(slots[0].dev - nl.numGlobalNodes);
+    auto put = [&](const BranchSlot &s, int row, const std::string &n) {
+      std::string full = s.inst ? n.substr(0, 1) + "." + s.inst->name + "." + n : n;
+      for (auto &c : full) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      names[row - nl.numGlobalNodes] = full;
+    };
+    for (const auto &s : slots) {
+      for (size_t i = 0; i < s.blk->voltageSources.size(); ++i) put(s, s.vs + i, s.blk->voltageSources[i].name);
+      for (size_t i = 0; i < s.blk->inductors.size(); ++i) put(s, s.ind + i, s.blk->inductors[i].name);
+      for (size_t i = 0; i < s.blk->voltageControlledVoltageSources.size(); ++i)
+        put(s, s.e + i, s.blk->voltageControlledVoltageSources[i].name);
+      for (size_t i = 0; i < s.blk->currentControlledVoltageSources.size(); ++i)
+        put(s, s.h + i, s.blk->currentControlledVoltageSources[i].name);
+      int row = s.bv;
+      for (const auto &b : s.blk->behavioural) if (b.voltage) put(s, row++, b.name);
+    }
+    return names;
+  }
 
   // Small-signal system at the last DC operating point: G (Newton Jacobian
   // without node gmin), reactive triplets C. Shared by solveAC and solveNoise.

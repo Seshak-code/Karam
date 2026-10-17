@@ -447,8 +447,10 @@ SolverStep CircuitSim::solveDC(TensorNetlist &netlist) {
   }
 
   lastSolution_ = voltageEstimate;  // full x (incl. branch currents) seeds transient
+  std::vector<double> branches(voltageEstimate.begin() + std::min<size_t>(netlist.numGlobalNodes, voltageEstimate.size()),
+                               voltageEstimate.begin() + std::min<size_t>(netlist.numGlobalNodes + branchCount(netlist), voltageEstimate.size()));
   voltageEstimate.resize(netlist.numGlobalNodes);  // API returns node voltages
-  return {0.0, voltageEstimate, stats, netlist.globalBlock.topologyHash};
+  return {0.0, voltageEstimate, stats, netlist.globalBlock.topologyHash, std::move(branches)};
 }
 
 // =============================================================================
@@ -1382,12 +1384,15 @@ SolverStep CircuitSim::stepTransient(TensorNetlist &netlist, double timeStep,
   neuralSeeder_.recordSolution(finalVoltages, lastResult.finalResidual,
                                lastResult.iterations);
   lastSolution_ = finalVoltages;                    // full x seeds the next step
+  std::vector<double> branches(finalVoltages.begin() + std::min<size_t>(netlist.numGlobalNodes, finalVoltages.size()),
+                               finalVoltages.begin() + std::min<size_t>(netlist.numGlobalNodes + branchCount(netlist), finalVoltages.size()));
   finalVoltages.resize(netlist.numGlobalNodes);     // API returns node voltages
 
   return {
       currentTime + actualTimeStep,
       finalVoltages,
       {lastResult.iterations, lastResult.finalResidual, simulationConverged},
-      netlist.globalBlock.topologyHash};
+      netlist.globalBlock.topologyHash,
+      std::move(branches)};
 }
 
