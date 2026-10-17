@@ -115,11 +115,13 @@ struct ACConfigDTO {
     double fStop  = 0.0;
 };
 
+// .dc sweepVariable: a V/I source, a resistor, or TEMP (Celsius)
 struct DCConfigDTO {
     std::string sweepVariable;
     double start = 0.0;
     double stop  = 1.8;
     double step  = 0.1;
+    std::vector<DCConfigDTO> outer;  // slower sweeps, next-slowest first (.dc V1 .. V2 ..: V2 is outer)
 };
 
 struct MonteCarloVariationDTO {
@@ -193,10 +195,11 @@ struct ExtendedAnalysisResultsDTO {
 };
 
 struct WaveformDataPoint {
-    double              timeS;            // time (tran), swept value (.dc), frequency (.ac)
+    double              timeS;            // time (tran), swept value (.dc, the innermost sweep), frequency (.ac)
     std::vector<double> nodeVoltages;     // real part for .ac
     std::vector<double> nodeVoltagesImag; // .ac only
     std::vector<double> branchCurrents;
+    std::vector<double> outer;            // values of the slower sweeps (SimulationResponseDTO::outerNames)
 };
 
 struct ConvergenceTelemetryDTO {
@@ -237,6 +240,7 @@ struct SimulationResponseDTO {
     PrecisionMode   precisionMode = PrecisionMode::Mixed;
 
     std::vector<WaveformDataPoint> waveformPoints;
+    std::vector<std::string> outerNames;  // what WaveformDataPoint::outer holds: outer .dc sources, TEMP
     std::vector<double> timeVector;
     std::unordered_map<int, std::vector<double>> nodeVoltages;
     ExtendedAnalysisResultsDTO extended;

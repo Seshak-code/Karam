@@ -47,8 +47,10 @@ struct SPICEParseResult {
     double        tranStep = 0.0;
     double        tranStart = 0.0;
     bool          tranUIC = false;   // .tran ... UIC: skip the DC operating point
-    std::string   dcSource;          // .dc SRC start stop step ("" = no sweep)
-    double        dcStart = 0.0, dcStop = 0.0, dcStep = 0.0;
+    // .dc SRC start stop step [SRC2 ...]: V/I source, resistor or TEMP; the first is the innermost sweep
+    struct DcSweep { std::string name; double start = 0.0, stop = 0.0, step = 0.0; };
+    std::vector<DcSweep> dcSweeps;
+    std::vector<double> tempsC;      // .temp / .options temp= (Celsius, circuit temperature; empty = 27)
     std::string   noiseSource;       // .noise v(out[,ref]) src sweep n fstart fstop
     std::string   noiseSweep;
     int           noiseOut = 0, noiseRef = 0, noisePoints = 0;
@@ -64,7 +66,8 @@ public:
 
     /// Parse a complete SPICE netlist string.
     // baseDir: directory .include / .lib paths are relative to (empty: working directory)
-    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "");
+    // tempC: the circuit temperature [C] instead of the netlist's .temp (NaN: the netlist's)
+    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "", double tempC = NAN);
 
 private:
     // ── Value and Token Helpers ────────────────────────────────────────
@@ -72,7 +75,7 @@ private:
     bool isValue(const std::string& s) const;
     static void requireFields(const std::vector<std::string>& tok, size_t n);
     static void requireLinearForm(const std::vector<std::string>& tok, size_t n);
-    double instanceArea(const std::vector<std::string>& tok, size_t from) const;
+    double instanceArea(const std::vector<std::string>& tok, size_t from, InstTemp* t = nullptr) const;  // t: accept TEMP, DTEMP
     static std::string toUpper(const std::string& s);
     static std::vector<std::string> tokenize(const std::string& line);
 
@@ -103,7 +106,9 @@ private:
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
-    // F/H name their controlling V source; resolve once the block is complete
+    static bool nonlinearForm(const std::vector<std::string>& tok);  // POLY / VALUE / VOL / CUR / TABLE
+    void parseBehav      (const std::string& line, const std::vector<std::string>& tok, TensorBlock& blk);
+    // F/H name their controlling V source, behavioural I() its source; resolve once the block is complete
     void resolveControlledSources(TensorBlock& blk);
 
     // ── Directive Parsers ─────────────────────────────────────────────
@@ -154,6 +159,10 @@ private:
     std::string resolveAt_;                 // block being resolved
     double scale_ = 1.0;                    // .option scale: MOSFET W, L, PD, PS (and AD, AS squared)                              // every .model name (first pass)
     std::map<std::string, std::shared_ptr<osdi::Model>> osdiModels_; // per card, shared by its N devices
+
+    double tnomC_ = 27.0;                   // .options tnom: where the models' parameters are given
+    double ambientK_ = 300.15;              // circuit temperature of this parse
+    double instK(const InstTemp& t) const { return t.kelvin(ambientK_); }
 
     // .param expressions (name -> value)
     std::map<std::string, double> params_;
