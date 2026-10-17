@@ -55,6 +55,9 @@ struct SPICEParseResult {
     // .dc SRC start stop step [SRC2 ...]: V/I source, resistor or TEMP; the first is the innermost sweep
     struct DcSweep { std::string name; double start = 0.0, stop = 0.0, step = 0.0; };
     std::vector<DcSweep> dcSweeps;
+    // .step: kind 'P' .param, 'T' temperature, 'E' V/I/R value; the first card is the outermost loop
+    struct Step { char kind; std::string name; std::vector<double> values; };
+    std::vector<Step> steps;
     std::vector<double> tempsC;      // .temp / .options temp= (Celsius, circuit temperature; empty = 27)
     std::string   noiseSource;       // .noise v(out[,ref]) src sweep n fstart fstop
     std::string   noiseSweep;
@@ -79,7 +82,9 @@ public:
     /// Parse a complete SPICE netlist string.
     // baseDir: directory .include / .lib paths are relative to (empty: working directory)
     // tempC: the circuit temperature [C] instead of the netlist's .temp (NaN: the netlist's)
-    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "", double tempC = NAN);
+    // paramOverrides: upper-case global .param values that win over the netlist's (a .step param run)
+    SPICEParseResult parse(const std::string& netlistText, const std::string& baseDir = "", double tempC = NAN,
+                           const std::map<std::string, double>& paramOverrides = {});
 
 private:
     // ── Value and Token Helpers ────────────────────────────────────────

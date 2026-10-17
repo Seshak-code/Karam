@@ -391,8 +391,11 @@ From `Roadmap.md` Phase 2, with pointers:
   error (the circuit always runs at 27 C); `m=` on a subcircuit instance is an
   error (ngspice scales every device inside). Errors inside `.lib` files carry the `.lib` card's line.
 - Junction-cap shortcut and other simplifications are marked `ponytail:` in code (grep for it).
-- `treespice` (cli/engine_cli_main.cpp): `.print`/`.save`/`.probe` select columns; `.plot`, `.meas` are still ignored. Device
-  terminal currents (`i(r1)`, `@m1[id]`) are errors. Raw output of `.noise` and `.four` is not supported.
+- `treespice` (cli/engine_cli_main.cpp): `.print`/`.save`/`.probe` select columns; `.plot` is still ignored. `.meas` (tran/dc/ac;
+  infrastructure/measure.cpp) prints `name = value` and fills `SimulationResponseDTO::measures`; the engine's transient
+  has no t=0 point, so FIND AT=0 fails. `.step` (param, temp, V/I/R; ngspice 47 has none) reruns the analysis per value
+  via `SimulationRequestDTO::stepValues`, one block/raw plot per step; model-parameter steps and `.step` with `.noise` are
+  errors. Device terminal currents (`i(r1)`, `@m1[id]`) are errors. Raw output of `.noise` and `.four` is not supported.
 
 ## 7. Gotchas learned the hard way
 

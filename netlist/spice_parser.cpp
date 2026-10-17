@@ -64,6 +64,69 @@ static std::string userNames(std::string s) {
     return s;
 }
 
+// Split at top-level blanks: v(a, b)*2 and 'x + 1' are one word each.
+static std::vector<std::string> splitTop(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    int depth = 0;
+    bool quoted = false;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        const char c = i < s.size() ? s[i] : ' ';
+        if (c == '\'') quoted = !quoted;
+        if (!quoted) depth += (c == '(') - (c == ')');
+        if (std::isspace(static_cast<unsigned char>(c)) && depth <= 0 && !quoted) {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else cur += c;
+    }
+    return out;
+}
+
+// .step [dec|oct|lin] param NAME | temp | V/I/R-element  list v1 v2 ...  |  start stop incr (points per decade/octave for dec/oct)
+static SPICEParseResult::Step parseStep(const std::vector<std::string>& w) {
+    auto low = [](std::string x) { for (auto& c : x) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return x; };
+    auto num = [](std::string x) {
+        if (x.size() >= 2 && (x.front() == '{' || x.front() == '\'')) x = x.substr(1, x.size() - 2);
+        try { return numparam::eval(x, [](const std::string&, double&) { return false; }); }
+        catch (const std::exception&) { throw std::runtime_error(".step: '" + x + "' is not a number"); }
+    };
+    size_t i = 0;
+    std::string mode = "lin";
+    if (i < w.size() && (low(w[i]) == "dec" || low(w[i]) == "oct" || low(w[i]) == "lin")) mode = low(w[i++]);
+    if (i >= w.size()) throw std::runtime_error(".step needs param NAME, temp or a source/resistor name");
+    SPICEParseResult::Step st;
+    const std::string what = low(w[i++]);
+    if (what == "param") {
+        if (i >= w.size()) throw std::runtime_error(".step param needs a name");
+        st.kind = 'P';
+        st.name = w[i++];
+    } else if (what == "temp") { st.kind = 'T'; st.name = "TEMP"; }
+    else {
+        if (what[0] != 'v' && what[0] != 'i' && what[0] != 'r')
+            throw std::runtime_error(".step sweeps a .param, temp, or a V, I or R element, not '" + what + "' (model parameters are not supported yet)");
+        st.kind = 'E';
+        st.name = what;
+    }
+    for (auto& c : st.name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (i < w.size() && low(w[i]) == "list") {
+        for (++i; i < w.size(); ++i) st.values.push_back(num(w[i]));
+        if (st.values.empty()) throw std::runtime_error(".step list needs at least one value");
+    } else if (w.size() - i == 3) {
+        const double a = num(w[i]), b = num(w[i + 1]), c = num(w[i + 2]);
+        if (mode == "lin") {
+            const double span = c != 0.0 ? (b - a) / c : -1.0;
+            if (!(span >= -1e-9)) throw std::runtime_error(".step increment must be non-zero and point from start to stop");
+            for (long k = 0, n = static_cast<long>(std::floor(span + 1e-9)); k <= n; ++k) st.values.push_back(a + static_cast<double>(k) * c);
+        } else {
+            if (!(a > 0 && b >= a && c >= 1)) throw std::runtime_error(".step " + mode + " needs 0 < start <= stop and points >= 1");
+            const double base = mode == "dec" ? 10.0 : 2.0;
+            for (long k = 0; a * std::pow(base, static_cast<double>(k) / std::round(c)) <= b * (1 + 1e-9); ++k)
+                st.values.push_back(a * std::pow(base, static_cast<double>(k) / std::round(c)));
+        }
+    } else throw std::runtime_error(".step expects list v1 v2 ... or start stop incr");
+    return st;
+}
+
 double SPICEParser::parseValue(const std::string& raw) const {
     // A bare .param name (numparam::expand replaced {expressions} and name=param, and
     // passes the evaluated global parameters as ".param NAME=value" lines)
@@ -285,7 +348,8 @@ std::vector<std::pair<int, std::string>> SPICEParser::expandIncludes(
 // Main Parse Entry Point
 // ============================================================================
 
-SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::string& baseDir, double tempC) {
+SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::string& baseDir, double tempC,
+                                    const std::map<std::string, double>& paramOverrides) {
     result_ = SPICEParseResult{};
     tnomC_ = 27.0;
     nodeMap_.clear();
@@ -327,6 +391,22 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     int incLine = 0;
     try {
         lines = expandIncludes(lines, baseDir, 0, incLine);
+        // .step and .meas are taken out before numparam sees them: their 'expr' and bare words are theirs
+        lines.erase(std::remove_if(lines.begin(), lines.end(), [&](const std::pair<int, std::string>& nl) {
+            if (nl.first == 1) return false;
+            const auto w = splitTop(nl.second);
+            if (w.empty()) return false;
+            const std::string k = toUpper(w[0]);
+            incLine = nl.first;
+            if (k == ".STEP") result_.steps.push_back(parseStep({w.begin() + 1, w.end()}));
+            else if (k == ".MEAS" || k == ".MEASURE") {
+                if (w.size() < 4) throw std::runtime_error(w[0] + " needs an analysis type, a name and a measurement");
+                std::string an = w[1];  // tran, dc, ac; another type (Xyce's tran_cont ...) is reported as an error when the analysis ends
+                for (auto& c : an) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                result_.outputs.push_back({'m', an, {w.begin() + 2, w.end()}});
+            } else return false;
+            return true;
+        }), lines.end());
         double circuitC = std::isnan(tempC) ? 27.0 : tempC;  // TEMPER: the last .temp / .options temp card, else 27
         for (const auto& [n, l] : lines) {
             const auto t = tokenize(l);
@@ -334,7 +414,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
             if (std::isnan(tempC) && !t.empty() && (toUpper(t[0]) == ".OPTIONS" || toUpper(t[0]) == ".OPTION"))
                 for (size_t i = 1; i + 1 < t.size(); ++i) if (toUpper(t[i]) == "TEMP") try { circuitC = parseValue(t[i + 1]); } catch (...) {}
         }
-        lines = numparam::expand(lines, incLine, circuitC);  // .param expressions, subckt parameters, .if
+        lines = numparam::expand(lines, incLine, circuitC, paramOverrides);  // .param expressions, subckt parameters, .if
     } catch (const std::exception& e) { return fail(incLine, e.what()); }
 
     // .param values are global in SPICE: resolve them before any card uses one
@@ -514,16 +594,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 }
                 else if (keyword == ".PRINT" || keyword == ".SAVE" || keyword == ".PROBE") {
                     OutputRequest out{keyword == ".PRINT" ? 'p' : 's', "", {}};
-                    int depth = 0;  // split at top-level blanks: v(a, b)*2 is one expression
-                    std::string cur;
-                    for (size_t i = keyword.size(); i <= line.size(); ++i) {
-                        const char c = i < line.size() ? line[i] : ' ';
-                        depth += (c == '(') - (c == ')');
-                        if (std::isspace(static_cast<unsigned char>(c)) && depth <= 0) {
-                            if (!cur.empty()) out.specs.push_back(cur);
-                            cur.clear();
-                        } else cur += c;
-                    }
+                    out.specs = splitTop(line.substr(keyword.size()));
                     if (!out.specs.empty() && std::set<std::string>{"TRAN", "AC", "DC", "OP"}.count(toUpper(out.specs[0]))) {
                         out.analysis = out.specs[0];
                         for (auto& c : out.analysis) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

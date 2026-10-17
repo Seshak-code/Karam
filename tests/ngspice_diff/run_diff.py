@@ -2,7 +2,7 @@
 """Differential test: TreeSPICE (acutesim_engine_dump) vs ngspice on the same SPICE netlists.
 Stdlib only. Usage: python3 tests/ngspice_diff/run_diff.py [-k substr] [--modes cpu,gpu] [-v]
 Exit status is non-zero if any netlist FAILs (or ngspice itself errors)."""
-import argparse, atexit, bisect, glob, math, os, re, shutil, subprocess, sys, tempfile
+import argparse, atexit, bisect, glob, itertools, math, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -41,6 +41,32 @@ def num(s):
 def temps(text):
     """The .temp card's list of Celsius values (ngspice itself takes one: each is run on its own)."""
     return next((list(map(num, t[1:])) for t in map(str.split, cards(text)) if t[0].lower() == ".temp"), [])
+
+def steps(text):
+    """.step cards (list v.. | start stop incr) of param NAME, temp or a V/I/R element, as (kind, name, values).
+    ngspice 47 has no .step: each combination (first card outermost, as the engine) is run on its own."""
+    out = []
+    for w in (t[1:] for t in map(str.split, cards(text)) if t[0].lower() == ".step"):
+        kind = w[0].lower() if w[0].lower() in ("param", "temp") else "elem"
+        name, rest = (w[1], w[2:]) if kind == "param" else (w[0], w[1:])
+        vals = (list(map(num, rest[1:])) if rest[0].lower() == "list" else
+                [num(rest[0]) + k * num(rest[2]) for k in range(int(math.floor((num(rest[1]) - num(rest[0])) / num(rest[2]) + 1e-9)) + 1)])
+        out.append((kind, name, vals))
+    return out
+
+def step_text(lines, combo):
+    """The netlist lines (after the title) with one .step combination applied; a temp step is returned apart."""
+    lines, temp = list(lines), None
+    for (kind, name, _), v in combo:
+        if kind == "param": lines.append(f".param {name}={v!r}")  # the last .param wins
+        elif kind == "temp": temp = v
+        else:
+            i = next(i for i, l in enumerate(lines) if l.split()[:1] and l.split()[0].lower() == name.lower())
+            w = lines[i].split()
+            k = next((j + 1 for j, x in enumerate(w) if x.lower() == "dc"), 3)  # V/I: after DC, else the first value; R: the value
+            w[k] = repr(v)
+            lines[i] = " ".join(w)
+    return lines, temp
 
 def toks(line): return re.sub(r"[(),=]", " ", line).split()
 
@@ -166,7 +192,7 @@ def run_ngspice(args, text, an, names, cur=()):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
-    drop = re.compile(r"\.(op|dc|tran|ac|noise|pz|sens|print|plot|four|end|osdi|save|probe|temp)\b", re.I)
+    drop = re.compile(r"\.(op|dc|tran|ac|noise|pz|sens|print|plot|four|end|osdi|save|probe|temp|step|meas|measure)\b", re.I)
     kept, skip = [], False
     for i, ln in enumerate(text.splitlines()):
         if i > 0 and ln.strip()[:1] == "+":
@@ -197,7 +223,7 @@ def run_ngspice(args, text, an, names, cur=()):
         ctl.insert(1, f"pre_osdi {dst}")
     cir = os.path.join(args.tmp, "ng.cir")
     rows = []
-    # ngspice takes one .temp value: a list is one run per value, the rows joined (the engine's order)
+    # ngspice takes one .temp value and has no .step: each .temp value and .step combination is run on its own, the rows joined
     if an[0] == "sens":
         cir = os.path.join(args.tmp, "ng.cir")
         open(cir, "w").write("\n".join(kept) + "\n" + "\n".join(ctl) + "\n")
@@ -216,13 +242,17 @@ def run_ngspice(args, text, an, names, cur=()):
             elif m: got[kind].append(complex(float(m.group(2)), float(m.group(3))))
         if not any(got.values()) and "Error" in p.stdout + p.stderr: raise RuntimeError("ngspice pz: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
         return [], dict(POLE=got["POL"], ZERO=got["ZER"])
-    for t in (temps(text) if an[0] in ("op", "dc") else temps(text)[:1]) or [None]:
-        if os.path.exists(out): os.remove(out)
-        open(cir, "w").write("\n".join(kept[:1] + ([f".temp {t!r}"] if t is not None else []) + kept[1:] + ctl) + "\n")
-        p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout, cwd=args.tmp)  # cwd: ngspice BSIM4v5 paramchk writes bsim4v5.out
-        if not os.path.exists(out) or os.path.getsize(out) == 0:
-            raise RuntimeError("ngspice produced no data: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
-        rows += [[float(x) for x in ln.split()] for ln in open(out) if ln.strip()]
+    sd = steps(text)
+    combos = itertools.product(*[[((k, n, vs), v) for v in vs] for k, n, vs in sd])
+    for combo in combos:
+        body, stemp = step_text(kept[1:], combo)
+        for t in ([stemp] if stemp is not None else temps(text) if an[0] in ("op", "dc") else temps(text)[:1]) or [None]:
+            if os.path.exists(out): os.remove(out)
+            open(cir, "w").write("\n".join(kept[:1] + ([f".temp {t!r}"] if t is not None else []) + body + ctl) + "\n")
+            p = subprocess.run([args.ngspice, "-b", cir], capture_output=True, text=True, timeout=args.timeout, cwd=args.tmp)  # cwd: ngspice BSIM4v5 paramchk writes bsim4v5.out
+            if not os.path.exists(out) or os.path.getsize(out) == 0:
+                raise RuntimeError("ngspice produced no data: " + " | ".join((p.stdout + p.stderr).strip().splitlines()[-3:]))
+            rows += [[float(x) for x in ln.split()] for ln in open(out) if ln.strip()]
     if an[0] == "noise":
         tot = dict(re.findall(r"(\w+_total) = (\S+)", p.stdout))
         return [r[0] for r in rows], {"onoise": [r[1] for r in rows], "inoise": [r[3] for r in rows],
@@ -410,6 +440,7 @@ def main():
         text = open(path).read()
         an = analysis(text)
         if len(temps(text)) > 1 and an[0] not in ("op", "dc"): an = ("unsupported", ".temp list with a transient/AC/noise run")
+        if steps(text) and an[0] not in ("op", "dc"): an = ("unsupported", ".step with a transient/AC/noise run: tests/cli_check.py runs it per step")
         if an[0] == "unsupported":
             print(f"{'SKIPPED':<19} {name} ({an[1]})"); continue
         missing = [l for l in osdi_libs(text) if not os.path.exists(os.path.join(OSDI_DIR, l))]

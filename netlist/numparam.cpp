@@ -523,7 +523,7 @@ struct Subckt {
 
 class Expander {
 public:
-    explicit Expander(int &errLine) : errLine_(errLine) {}
+    Expander(int &errLine, const std::map<std::string, double> &overrides) : errLine_(errLine), overrides_(overrides) {}
 
     Lines run(const Lines &in) {
         Lines top;
@@ -534,6 +534,7 @@ public:
             readSubckt(in, i, subckts_, nullptr);
         }
         for (const auto &[n, l] : top) { errLine_ = n; collectParams(l, global_, n); }
+        for (const auto &[name, v] : overrides_) { global_.raw[name] = num(v); global_.line.emplace(name, 0); }  // .step param
         Lines out = walk(top, global_, "", nullptr, nullptr, "");
         Lines params;  // the evaluated global parameters, for the parser's {NAME} / bare-name values
         for (const auto &[name, e] : global_.raw) {
@@ -553,6 +554,7 @@ public:
 
 private:
     int &errLine_;
+    const std::map<std::string, double> &overrides_;
     std::map<std::string, Subckt> subckts_;
     // The .subckt at in[i] up to its .ends, nested definitions into its kids; i ends on the .ends
     void readSubckt(const Lines &in, size_t &i, std::map<std::string, Subckt> &into, const Subckt *parent) {
@@ -765,9 +767,10 @@ std::string text(const Expr &e) {
     return out;
 }
 
-std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine, double tempC) {
+std::vector<std::pair<int, std::string>> expand(const std::vector<std::pair<int, std::string>> &lines, int &errLine, double tempC,
+                                                const std::map<std::string, double> &overrides) {
     temperC = tempC;
-    return Expander(errLine).run(lines);
+    return Expander(errLine, overrides).run(lines);
 }
 
 }}  // namespace acutesim::numparam

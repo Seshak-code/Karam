@@ -8,6 +8,7 @@
 #include "engine_api/simulation_session.h"
 #include "engine_api/simulation_dto.h"
 #include "engine_api/engine_callbacks.h"
+#include "engine_api/measure.h"
 #include "engine_api/output.h"
 #include "netlist/numparam.h"
 
@@ -227,8 +228,11 @@ int main(int argc, char** argv) {
                 printNoise(out, r);
             } else {
                 const auto prints = requestedSpecs(r, 'p');
-                if (!rawPath.empty()) writeRaw(rawFile, selectOutputs(r, requestedSpecs(r, 's')), title(text), ascii);  // ngspice: one plot, the inner sweep repeating
-                for (const auto& part : splitByOuter(r)) {  // a nested .dc / .temp list: one table per outer value
+                const auto saves = requestedSpecs(r, 's');
+                if (!rawPath.empty() && !r.stepped) writeRaw(rawFile, selectOutputs(r, saves), title(text), ascii);  // ngspice: one plot, the inner sweep repeating
+                int step = 0;
+                for (const auto& part : splitByOuter(r)) {  // a nested .dc / .temp / .step list: one table per outer value
+                    if (!rawPath.empty() && r.stepped) writeRaw(rawFile, selectOutputs(part, saves), title(text), ascii);  // one plot per step
                     if (!part.waveformPoints.empty() && !part.waveformPoints[0].outer.empty()) {
                         out << "Sweep:";
                         for (size_t i = 0; i < r.outerNames.size(); ++i) out << " " << r.outerNames[i] << "=" << part.waveformPoints[0].outer[i];
@@ -236,7 +240,8 @@ int main(int argc, char** argv) {
                     }
                     if (!prints.empty()) writeTable(out, selectOutputs(part, prints), title(text));
                     else if (part.scaleName.empty()) printOp(out, part);
-                    else if (rawPath.empty()) out << "." << an.kind << ": " << part.waveformPoints.size() << " points; add a .print card or -r FILE to see them\n";
+                    else if (rawPath.empty() && r.measures.empty()) out << "." << an.kind << ": " << part.waveformPoints.size() << " points; add a .print card or -r FILE to see them\n";
+                    writeMeasures(out, r, step++);
                 }
             }
         } catch (const std::exception& e) {
