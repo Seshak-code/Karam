@@ -458,7 +458,24 @@ public:
     std::vector<std::function<double(double)>> corners;  // next waveform corner after x, per source
   } tran_;
   void tranCorners(const TensorNetlist &netlist);
+  // Append an accepted step to a line's history and note a kink in either wave (its break is TD later)
+  static void pushLine(BlockState::LineHistory &h, double dt, double w1, double w2, double td);
   double lteTolerance_ = 1e-4;  // absolute LTE tolerance
+  // .options (SimulationEnvironment), applied at each analysis entry
+  double reltol_ = 1e-3, vntol_ = 1e-6, abstol_ = 1e-12, gmin_ = 1e-12, gshunt_ = 0.0;
+  int itl1_ = 100, itl2_ = 50, itl4_ = 0;
+  IntegrationType tranMethod_ = IntegrationType::TRAPEZOIDAL;
+  void applyOptions(const SimulationEnvironment &e) {
+    reltol_ = e.reltol; vntol_ = e.vntol; abstol_ = e.abstol; gmin_ = e.gmin;
+    gshunt_ = e.rshunt > 0.0 ? 1.0 / e.rshunt : 0.0;
+    itl1_ = e.itl1; itl2_ = e.itl2; itl4_ = e.itl4;
+    lteController_.setTRTOL(e.trtol);
+    lteTolerance_ = 1e-4 * e.reltol / 1e-3;  // the engine's LTE bound scales with RELTOL (default unchanged)
+    lteController_.setTolerance(lteTolerance_);
+    // ngspice: order 1 is backward Euler for either method; trapezoidal is order 2 at most
+    tranMethod_ = e.maxord <= 1 ? IntegrationType::GEAR_1_EULER : IntegrationType::TRAPEZOIDAL;
+  }
+  int nrLimit() const { return itl4_ > 0 ? itl4_ : PhysicsConstants::MAX_NR_ITER; }  // transient Newton iterations
 
   // Callbacks for orchestration
   std::function<void(int, double)> onConvergenceStep;
@@ -545,6 +562,7 @@ public:
       DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
                                     sd.thermalVoltage_V_T_V};
       params.Vt *= (temp_K / 300.15);
+      params.gmin = gmin_;
 
       Dual<double> v_diff_dual(v_diff, 1.0);
       Dual<double> i_d = diode_current_clamped(v_diff_dual, params);
@@ -561,6 +579,7 @@ public:
       zp.BV = z.breakdownVoltage_V;
       zp.IBV = z.currentAtBreakdown_A;
       zp.Rs = z.seriesResistance_Rs_ohms;
+      zp.gmin = gmin_;
       zp.N = z.emissionCoefficient_N;
       zp.Is = z.saturationCurrent_I_S_A;
       zp.Vt = z.thermalVoltage_V_T_V * (temp_K / 300.15);
@@ -837,6 +856,7 @@ public:
     bool bypass = bypassOn && limitJunctions_ && in.evalFlags == flags && in.evalAt.size() == L;
     for (size_t k = 0; bypass && k < L; ++k)
       bypass = std::abs(x[k] - in.evalAt[k]) <= 1e-3 * std::max(std::abs(x[k]), std::abs(in.evalAt[k])) + 1e-6;
+    in.gmin = gmin_;
     if (!bypass && !in.evaluate(x.data(), flags, 0.0)) {
       std::lock_guard<std::mutex> lock(osdiErrorMutex());  // devices evaluate in parallel
       osdiFatal_ = r.dev->instanceName + ": " + in.error();  // reported instead of a singular matrix
@@ -931,17 +951,17 @@ public:
                       const JShift *sh = nullptr) const {
     if (j.d) {
       v[0] = shifted(T(x[2] - x[1]), sh, 0);
-      q[0] = diode_iq(v[0], diodeModel(*j.d)).second;
+      q[0] = diode_iq(v[0], diodeModel(*j.d, gmin_)).second;
       return 1;
     }
     if (j.f) {
       const double t = jfetType(*j.f);
       v[0] = shifted(T(t * (x[1] - x[2])), sh, 0); v[1] = shifted(T(t * (x[1] - x[0])), sh, 1);
-      const auto c = jfet_charges(v[0], v[1], jfetModel(*j.f));
+      const auto c = jfet_charges(v[0], v[1], jfetModel(*j.f, gmin_));
       q[0] = c[0]; q[1] = c[1];
       return 2;
     }
-    const auto p = bjtModel(*j.q);
+    const auto p = bjtModel(*j.q, gmin_);
     const double t = p.type;
     for (int k = 0; k < 3; ++k) v[k] = t * (x[bjtFrom[k]] - x[bjtTo[k]]);
     v[3] = t * j.subSign * (x[3] - x[j.sub]);
@@ -968,19 +988,19 @@ public:
     double type = 1.0;
     const int *from, *to;
     if (j.d) {
-      const auto p = diodeModel(*j.d);
+      const auto p = diodeModel(*j.d, gmin_);
       if (p.rs > 0.0) { const T ir = (x[0] - x[2]) / p.rs; I[0] += ir; I[2] -= ir; }
       const T id = diode_iq(shifted(T(x[2] - x[1]), sh, 0), p).first;
       I[2] += id; I[1] -= id;
       from = diodeFrom; to = diodeTo;
     } else if (j.f) {
-      const auto p = jfetModel(*j.f);
+      const auto p = jfetModel(*j.f, gmin_);
       type = p.type;
       const auto e = jfet_eval(shifted(T(type * (x[1] - x[2])), sh, 0), shifted(T(type * (x[1] - x[0])), sh, 1), p);
       I[0] += type * (e.id - e.igd); I[2] += type * (-e.id - e.igs); I[1] += type * (e.igs + e.igd);
       from = jfetFrom; to = jfetTo;
     } else {
-      const auto p = bjtModel(*j.q);
+      const auto p = bjtModel(*j.q, gmin_);
       type = p.type;
       auto res = [&](int a, int b, double r) {
         if (r > 0.0) { const T i = (x[a] - x[b]) / r; I[a] += i; I[b] -= i; }
@@ -1059,7 +1079,7 @@ public:
     auto V = [&](int k) { return j.n[k] > 0 && j.n[k] <= (int)x.size() ? x[j.n[k] - 1] : 0.0; };
     auto *st = j.st;
     if (j.d) {
-      const auto m = diodeModel(*j.d);
+      const auto m = diodeModel(*j.d, gmin_);
       const double vcrit = compute_vcrit(m.vte, m.is), raw = V(2) - V(1);
       double vl = vcrit;
       if (st->jvState) {
@@ -1072,7 +1092,7 @@ public:
       return sh;
     }
     if (j.f) {  // both gate junctions start at -1 V (ngspice jfetload INITJCT)
-      const auto m = jfetModel(*j.f);
+      const auto m = jfetModel(*j.f, gmin_);
       const double vcrit = compute_vcrit(m.vt, m.is), raw[2] = {m.type * (V(1) - V(2)), m.type * (V(1) - V(0))};
       for (int k = 0; k < 2; ++k) {
         const double vl = st->jvState ? pnjlim(raw[k], st->jv[k], m.vt, vcrit) : -1.0;
@@ -1082,7 +1102,7 @@ public:
       st->jvState = 1;
       return sh;
     }
-    const auto m = bjtModel(*j.q);
+    const auto m = bjtModel(*j.q, gmin_);
     const double vt = m.vtf / j.q->card.nf, vcrit = compute_vcrit(vt, m.is);
     const double raw[2] = {m.type * (V(5) - V(6)), m.type * (V(5) - V(4))};
     for (int k = 0; k < 2; ++k) {
@@ -1177,22 +1197,28 @@ public:
   NoiseResult solveNoise(TensorNetlist &netlist, const std::vector<double> &freqs,
                          int outNode, int refNode, const std::string &inputSource);
 
-  // .ac frequencies as ngspice steps them: dec/oct multiply by 10^(1/n) / 2^(1/n)
-  // up to fstop (+1e-3 of a step, ngspice's reltol slack); lin gives n points;
-  // log (the GUI's sweep) gives n log-spaced points from f1 to f2.
-  static std::vector<double> acFrequencies(const std::string &sweep, int n, double f1, double f2) {
+  // The grid of ngspice 47's .ac (probed point by point). lin: n points, but n = 2 gives only the first.
+  // oct / dec: N = floor(log(f2/f1) * n) steps of 2^(1/n) / 10^(1/n). dec over more than one decade refits the
+  // step to (f2/f1)^(1/N) so the last point is f2 itself; oct, and dec within one decade, stop at the last point <= f2.
+  // .noise (noise = true) never refits and has no lin quirk.
+  // "log" (tf_analysis): n points from f1 to f2, evenly spaced in log.
+  static std::vector<double> acFrequencies(const std::string &sweep, int n, double f1, double f2, bool noise = false) {
     std::vector<double> f;
-    if (n < 1 || !(f1 > 0.0) || f2 < f1) return f;
+    if (n < 1 || !(f1 > 0.0 || (sweep == "lin" && f1 == 0.0)) || f2 < f1) return f;
     if (sweep == "lin" || sweep == "log") {
-      for (int k = 0; k < n; ++k) {
+      const int pts = sweep == "lin" && n == 2 && !noise ? 1 : n;
+      for (int k = 0; k < pts; ++k) {
         const double t = n == 1 ? 0.0 : double(k) / (n - 1);
         f.push_back(sweep == "lin" ? f1 + t * (f2 - f1) : f1 * std::pow(f2 / f1, t));
       }
       return f;
     }
-    const double delta = std::pow(sweep == "oct" ? 2.0 : 10.0, 1.0 / n);
-    for (int k = 0; f1 * std::pow(delta, k) <= f2 * (1.0 + 1e-3 * delta); ++k)
-      f.push_back(f1 * std::pow(delta, k));
+    const bool oct = sweep == "oct";
+    const double x = std::log(f2 / f1) / std::log(oct ? 2.0 : 10.0) * n;
+    const int steps = (int)std::floor(x + 1e-9);
+    const bool refit = !oct && !noise && x - n > 1e-9;
+    const double ratio = refit ? std::pow(f2 / f1, 1.0 / steps) : std::pow(oct ? 2.0 : 10.0, 1.0 / n);
+    for (int k = 0; k <= steps; ++k) f.push_back(k == steps && refit ? f2 : f1 * std::pow(ratio, k));
     return f;
   }
   
@@ -1305,9 +1331,6 @@ private:
 
   // NR Parameters (Using centralized PhysicsConstants)
   // Note: Kept as local constexpr for backward compatibility; prefer PhysicsConstants::
-  static constexpr double RELTOL = 1e-3;
-  static constexpr double VNTOL = 1e-6;
-  static constexpr double ABSTOL = PhysicsConstants::ABSTOL; 
   static constexpr int MAX_NR_ITER = PhysicsConstants::MAX_NR_ITER;
   static constexpr double PCG_TOL = 1e-10;
   static constexpr int PCG_MAX_ITER = 1000;
@@ -1334,7 +1357,7 @@ private:
     // 1. Check Voltage Updates (Standard RELTOL/VNTOL)
     for (size_t i = 0; i < v_new.size(); ++i) {
       double diff = std::abs(v_new[i] - v_old[i]);
-      double limit = RELTOL * std::max(std::abs(v_new[i]), std::abs(v_old[i])) + VNTOL;
+      double limit = reltol_ * std::max(std::abs(v_new[i]), std::abs(v_old[i])) + vntol_;
       if (!(diff <= limit)) return false;
     }
 
@@ -1358,25 +1381,26 @@ public:
     const TensorBlock *blk;
     const BlockState *st;
     std::function<int(int)> map;   // local node -> global node
-    int vs, ind, e, h, bv, dev;    // first matrix row of each branch kind (bv: voltage behavioural sources); dev: device internal nodes
+    int vs, ind, e, h, tl, bv, dev;  // first matrix row of each branch kind (tl: two per transmission line; bv: voltage behavioural sources); dev: device internal nodes
     const BlockInstance *inst = nullptr;
   };
   std::vector<BranchSlot> branchSlots(const TensorNetlist &nl, int &total) const {
     std::vector<BranchSlot> branchList;
-    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0, nullptr});
+    branchList.push_back({&nl.globalBlock, &nl.globalState, [](int x) { return x; }, 0, 0, 0, 0, 0, 0, 0, nullptr});
     for (size_t k = 0; k < nl.instances.size() && k < nl.instanceStates.size(); ++k) {
       auto it = nl.blockDefinitions.find(nl.instances[k].blockName);
       if (it == nl.blockDefinitions.end()) continue;
       const auto *inst = &nl.instances[k];
       branchList.push_back({&it->second, &nl.instanceStates[k], [inst](int x) {
         return (x <= 0 || x > (int)inst->nodeMapping.size()) ? 0 : inst->nodeMapping[x - 1];
-      }, 0, 0, 0, 0, 0, 0, inst});
+      }, 0, 0, 0, 0, 0, 0, 0, inst});
     }
     int next = nl.numGlobalNodes;
     for (auto &s : branchList) { s.vs = next; next += (int)s.blk->voltageSources.size(); }
     for (auto &s : branchList) { s.ind = next; next += (int)s.blk->inductors.size(); }
     for (auto &s : branchList) { s.e = next; next += (int)s.blk->voltageControlledVoltageSources.size(); }
     for (auto &s : branchList) { s.h = next; next += (int)s.blk->currentControlledVoltageSources.size(); }
+    for (auto &s : branchList) { s.tl = next; next += 2 * (int)s.blk->transmissionLines.size(); }
     for (auto &s : branchList) {
       s.bv = next;
       for (const auto &b : s.blk->behavioural) next += b.voltage;
@@ -1414,7 +1438,8 @@ public:
 
   // Small-signal system at the last DC operating point: G (Newton Jacobian
   // without node gmin), reactive triplets C. Shared by solveAC and solveNoise.
-  struct ACSystem { Csr_matrix G; std::vector<int> cr, cc; std::vector<double> cv; int n = 0; };
+  // dr/dc/dv/dtd: entries dv * e^(-jw dtd) (transmission lines), beside the jw*cv ones
+  struct ACSystem { Csr_matrix G; std::vector<int> cr, cc; std::vector<double> cv; std::vector<int> dr, dc; std::vector<double> dv, dtd; int n = 0; };
   bool acSystem(TensorNetlist &netlist, ACSystem &sys);
   // R(Y) = [[G, -wC], [wC, G]] for Y = G + jwC (transpose: R(Y)^T = R(Y^H)).
   static Csr_matrix acMatrix(const ACSystem &s, double w, bool transpose);
@@ -1451,6 +1476,7 @@ public:
       for (const auto &e : b.voltageControlledCurrentSources) mark({e.outPos, e.outNeg, e.ctrlPos, e.ctrlNeg});
       for (const auto &e : b.currentControlledVoltageSources) mark({e.outPos, e.outNeg});
       for (const auto &e : b.currentControlledCurrentSources) mark({e.outPos, e.outNeg});
+      for (const auto &e : b.transmissionLines) mark({e.nodePort1Pos, e.nodePort1Neg, e.nodePort2Pos, e.nodePort2Neg});
       for (const auto &e : b.behavioural) mark({e.outPos, e.outNeg});
       for (const auto &e : b.powerRails) mark({e.nodeRail});
       for (const auto &e : b.parasiticResistors) mark({e.node1, e.node2});
@@ -1474,6 +1500,20 @@ public:
     }
     return flux;
   }
+
+  // Outgoing waves of a lossless line at time t, linearly interpolated; before the first
+  // point (t < 0) and past the last they hold (the step cap TD keeps t - TD inside the history).
+  static void lineWaves(const BlockState::LineHistory &h, double t, double &w1, double &w2) {
+    if (h.t.empty()) { w1 = w2 = 0.0; return; }
+    const size_t k = std::upper_bound(h.t.begin(), h.t.end(), t) - h.t.begin();
+    if (k == 0) { w1 = h.w1[0]; w2 = h.w2[0]; return; }
+    if (k == h.t.size()) { w1 = h.w1.back(); w2 = h.w2.back(); return; }
+    const double f = (t - h.t[k - 1]) / (h.t[k] - h.t[k - 1]);
+    w1 = h.w1[k - 1] + f * (h.w1[k] - h.w1[k - 1]);
+    w2 = h.w2[k - 1] + f * (h.w2[k] - h.w2[k - 1]);
+  }
+  // AC build: transmission lines stamp only their frequency-independent half (acSystem adds the delayed half)
+  bool acLines_ = false;
 
   // All branch-element matrix entries + rhs. Stamping adds them to the matrix;
   // the KCL audit evaluates rhs - A x from the SAME triplets, so the two can
@@ -1546,6 +1586,24 @@ public:
         const int bc = sl.vs + f.ctrlSource;  // alpha * I(ctrl) leaves out+ through the source
         add(node(f.outPos), bc, f.alpha);
         add(node(f.outNeg), bc, -f.alpha);
+      }
+      // Lossless lines (ngspice TRA): branch currents i1, i2 flow into the + terminals. Transient:
+      // v1 - Z0 i1 = w2(t - TD), v2 - Z0 i2 = w1(t - TD) with w = v + Z0 i. DC: a short, v1 = v2, i1 = -i2.
+      // AC: the same equations with e^(-jw TD) on the far-port terms (acSystem adds those).
+      for (size_t k = 0; k < blk.transmissionLines.size(); ++k) {
+        const auto &t = blk.transmissionLines[k];
+        const int b1 = sl.tl + 2 * (int)k, b2 = b1 + 1;
+        const int p1 = node(t.nodePort1Pos), n1 = node(t.nodePort1Neg), p2 = node(t.nodePort2Pos), n2 = node(t.nodePort2Neg);
+        add(p1, b1, 1.0); add(n1, b1, -1.0); add(p2, b2, 1.0); add(n2, b2, -1.0);
+        if (tran || acLines_) {
+          const double z0 = t.characteristicImpedance_Z0_ohms;
+          add(b1, p1, 1.0); add(b1, n1, -1.0); add(b1, b1, -z0);
+          add(b2, p2, 1.0); add(b2, n2, -1.0); add(b2, b2, -z0);
+          if (tran && k < sl.st->lineState.size()) lineWaves(sl.st->lineState[k], time - t.propagationDelay_Td_s, S.rhs[b2], S.rhs[b1]);
+        } else {
+          add(b1, p1, 1.0); add(b1, n1, -1.0); add(b1, p2, -1.0); add(b1, n2, 1.0);
+          add(b2, b1, 1.0); add(b2, b2, 1.0);
+        }
       }
     }
   }
@@ -1665,8 +1723,8 @@ public:
     // 1.5 The transient OP's node gmin (addDiagonalConditioning(ptranGmin_)): the audit must
     // see the current the matrix holds, or a node at volts never passes KCL there (10 V at
     // 1e-12 S is 10 pA: a floating node behind a 1 ms RC failed every step at t = 0)
-    if (ptranGmin_ > 0.0)
-      for (int i = 1; i <= n; ++i) addRes(i, -ptranGmin_ * getV(i));
+    if (ptranGmin_ + gshunt_ > 0.0)
+      for (int i = 1; i <= n; ++i) addRes(i, -(ptranGmin_ + gshunt_) * getV(i));
 
     // 2. V sources, inductors, E/F/H: branch-current elements, audited from
     //    the same triplets they are stamped with (see buildBranchSystem below)
@@ -1696,6 +1754,7 @@ public:
       
       DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
                             sd.thermalVoltage_V_T_V};
+      params.gmin = gmin_;
       double i_d = diode_current_clamped(v_d, params);
       
       addRes(sd.anode, -i_d);
@@ -1706,7 +1765,7 @@ public:
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &t,
                                const BlockState::DeviceCharge *st) {
         const auto I = mosCurrents<double>({getV(t[0]), getV(t[1]), getV(t[2]), getV(t[3])},
-                                           mos1Params(m), st, h);
+                                           mos1Params(m, gmin_), st, h);
         for (int k = 0; k < 4; ++k) addRes(t[k], -I[k]);
     });
     // 3.6 Diodes and BJTs, global block and every instance: the stamped
@@ -1745,6 +1804,7 @@ public:
         params.BV = z.breakdownVoltage_V;
         params.IBV = z.currentAtBreakdown_A;
         params.Rs = z.seriesResistance_Rs_ohms;
+        params.gmin = gmin_;
         params.N = z.emissionCoefficient_N;
         params.Is = z.saturationCurrent_I_S_A;
         params.Vt = z.thermalVoltage_V_T_V;
@@ -2022,6 +2082,7 @@ public:
       double v_d = getV(sd.anode) - getV(sd.cathode);
       DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
                             sd.thermalVoltage_V_T_V};
+      params.gmin = gmin_;
       double i_d = diode_current_clamped(v_d, params);
       addRes(sd.anode, -i_d);
       addRes(sd.cathode, i_d);
@@ -2032,7 +2093,7 @@ public:
     // MOSFETs
     for (const auto &m : netlist.globalBlock.mosfets) {
       const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
-                                   mos1Params(m));
+                                   mos1Params(m, gmin_));
       addRes(m.drain, -c.d);
       addRes(m.source, -c.s);
       addRes(m.body, -c.b);
@@ -2045,7 +2106,7 @@ public:
       double vd = getV(z.anode) - getV(z.cathode);
       ZenerParams<double> zp;
       zp.BV = z.breakdownVoltage_V; zp.IBV = z.currentAtBreakdown_A;
-      zp.Rs = z.seriesResistance_Rs_ohms; zp.N = z.emissionCoefficient_N;
+      zp.Rs = z.seriesResistance_Rs_ohms; zp.N = z.emissionCoefficient_N; zp.gmin = gmin_;
       zp.Is = z.saturationCurrent_I_S_A; zp.Vt = z.thermalVoltage_V_T_V;
       double iz = zener_current(vd, zp);
       addRes(z.anode, -iz);
@@ -2183,7 +2244,7 @@ public:
               const auto& m = netlist.globalBlock.mosfets[index];
 
               // dI/dp of the same mos1_currents() the solve used: Vth (VTO), W, L
-              const Mos1Params<double> p = mos1Params(m);
+              const Mos1Params<double> p = mos1Params(m, gmin_);
               Mos1Params<Dual<double>> pd{p.polarity, p.beta, p.vto, p.lambda, p.gamma, p.phi, p.isat, p.vt};
               const double leff = m.l - 2.0 * m.card.ld;
               if (paramName == "Vth") pd.vto.grad = 1.0;
@@ -2294,15 +2355,6 @@ public:
                   vccs.gm, matrixBuilder, rhsVector);
     }
 
-    // 7. Transmission Lines (Phase 2 placeholder)
-    for (const auto &t : block.transmissionLines) {
-      // Simple resistive model for Phase 1
-      double z0 = t.characteristicImpedance_Z0_ohms;
-      stampResistor(mapNode(t.nodePort1Pos), mapNode(t.nodePort1Neg), z0,
-                    matrixBuilder);
-      stampResistor(mapNode(t.nodePort2Pos), mapNode(t.nodePort2Neg), z0,
-                    matrixBuilder);
-    }
   }
 
   /**
@@ -2496,7 +2548,7 @@ public:
     stampBranchSystem(netlist, h, time);
     forEachBehav(netlist, [&](const Behavioural &b, const BranchSlot &sl, int row) { stampBehav(b, sl, row, v_guess, time); });
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &n,
-                               const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m), st, h, v_guess); });
+                               const BlockState::DeviceCharge *st) { stampMos1(n, mos1Params(m, gmin_), st, h, v_guess); });
     forEachJunction(netlist, [&](const Junction &j) { stampJunction(j, v_guess, h); });
     forEachSwitch(netlist, [&](const SwitchRef &w, const std::array<int, 2> &c) {
       *w.on = !swAcOff_ && switchState(w, c, v_guess);
@@ -2519,6 +2571,7 @@ public:
     // the only gmin is the 1e-12 S across each junction (device models); a
     // node-to-ground leak settles floating junction nodes differently
     // (aac_10_bridge). Mid-ladder DC steps still pass gmin > 0 for conditioning.
+    gmin += gshunt_;  // .options rshunt: a resistor from every node to ground, in every analysis
     if (gmin <= 0.0) return;
     for (int i = 0; i < n; ++i)
       matrixBuilder.add(i, i, gmin);

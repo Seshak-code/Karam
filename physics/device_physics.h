@@ -31,6 +31,7 @@ struct DiodeParams
     T N;   // Emission Coefficient (1.0 for ideal)
     T Vt;  // Thermal Voltage [V] (kT/q = 25.865 mV at 27 C)
     T Rs;   // Series Parasitic Resistance [Ω]
+    T gmin = PhysicsConstants::JUNCTION_GMIN;  // GMIN across the junction (.options gmin)
 };
 
 /**
@@ -63,7 +64,7 @@ inline std::pair<T, T> diode_model_pair(T vd, const DiodeParams<P>& p, double ma
     // convergence; ngspice has none once converged). It lives here in the
     // junction model so the SoA kernels, the AoS stamps and both KCL audits
     // all carry it consistently.
-    T GMIN = T(PhysicsConstants::JUNCTION_GMIN);
+    T GMIN = T(p.gmin);
 
     // Linear Continuation Region
     if (arg > T(max_arg)) {
@@ -162,6 +163,7 @@ struct Mos1Params {
     P czbs = 0.0, czbssw = 0.0;              // bulk-source
     P mj = 0.5, mjsw = 0.5, pb = 0.8, fc = 0.5;
     P isats = -1.0;     // source junction saturation current; < 0: same as the drain's (isat)
+    P gmin = PhysicsConstants::JUNCTION_GMIN;  // bulk junction GMIN
 };
 
 // Threshold (type domain) at bulk bias vbx: VBS in normal mode, VBD reversed.
@@ -184,7 +186,7 @@ inline Mos1Currents<T> mos1_currents(T vd, T vg, T vs, T vb, const Mos1Params<P>
     const P type = p.polarity;
     const T vgs = type * (vg - vs), vds = type * (vd - vs), vbs = type * (vb - vs);
     const T vbd = vbs - vds, vgd = vgs - vds;
-    const DiodeParams<P> jd = {p.isat, P(1.0), p.vt}, js = {p.isats < P(0.0) ? p.isat : p.isats, P(1.0), p.vt};
+    const DiodeParams<P> jd = {p.isat, P(1.0), p.vt, P(0.0), p.gmin}, js = {p.isats < P(0.0) ? p.isat : p.isats, P(1.0), p.vt, P(0.0), p.gmin};
     const T cbs = diode_model_pair(vbs, js).first;
     const T cbd = diode_model_pair(vbd, jd).first;
 
@@ -305,6 +307,7 @@ struct DiodeModel {
     P cjsw = 0.0, mjsw = 0.33, vjsw = 1.0;                 // CJSW*PJ, MJSW, PHP
     P ikf = 0.0, ikr = 0.0;                                // knee currents (IKF*AREA, IKR*AREA); 0: none
     bool breakdown = false; P xbv = 0.0;                    // BV adjusted so I(-BV) = IBV (diotemp)
+    P gmin = PhysicsConstants::JUNCTION_GMIN;
 };
 
 // Breakdown voltage xbv such that the reverse current at -BV is IBV (ngspice
@@ -340,13 +343,14 @@ inline std::pair<T, T> diode_iq(T vd, const DiodeModel<P>& p)
         if (p.isw != P(0.0)) cdb = cdb + spice_junction(vd, p.isw, p.vtesw);
     }
     const T q = depletion_charge(vd, p.cjo, p.m, p.vj, p.fc) + depletion_charge(vd, p.cjsw, p.mjsw, p.vjsw, p.fc) + p.tt * cdb;
-    return {cdb + PhysicsConstants::JUNCTION_GMIN * vd, q};
+    return {cdb + p.gmin * vd, q};
 }
 
 // Gummel-Poon BJT, parameters resolved (AREA applied; ngspice bjt level 1
 // without temperature dependence, excess phase or bias-dependent RB).
 template <typename P>
 struct BjtModel {
+    P gmin = PhysicsConstants::JUNCTION_GMIN;       // GMIN across the junctions
     P type = 1.0;                                  // +1 NPN, -1 PNP
     P is = 1e-16, bf = 100.0, br = 1.0, vtf = PhysicsConstants::V_THERMAL_NOM, vtr = PhysicsConstants::V_THERMAL_NOM;  // NF*Vt, NR*Vt
     P invVaf = 0.0, invVar = 0.0, oikf = 0.0, oikr = 0.0;     // 1/VAF, 1/VAR, 1/(IKF*AREA), 1/(IKR*AREA)
@@ -387,7 +391,7 @@ template <typename T, typename P>
 inline BjtEval<T> bjt_gp(T vbe, T vbc, T vbx, T vsub, const BjtModel<P>& p)
 {
     using std::exp; using std::log; using std::sqrt;
-    const P gmin = PhysicsConstants::JUNCTION_GMIN;
+    const P gmin = p.gmin;
     const T cbe = spice_junction(vbe, p.is, p.vtf);
     const T cbc = spice_junction(vbc, p.is, p.vtr);
     const T cben = (p.ise != P(0.0) ? spice_junction(vbe, p.ise, p.vte) : T(0.0)) + gmin * vbe;
@@ -437,6 +441,7 @@ struct JfetModel {
     P beta = 1e-4, vto = -2.0, lambda = 0.0, b = 1.0;  // BETA*AREA, VTO, LAMBDA, B
     P is = 1e-14, vt = PhysicsConstants::V_THERMAL_NOM; // IS*AREA, N*Vt (gate junctions)
     P cgs = 0.0, cgd = 0.0, pb = 1.0, fc = 0.5;        // CGS*AREA, CGD*AREA, PB, FC
+    P gmin = PhysicsConstants::JUNCTION_GMIN;
 };
 
 // Drain current of the normal mode (vds >= 0) at overdrive vgst (ngspice jfetload).
@@ -461,8 +466,8 @@ inline JfetEval<T> jfet_eval(T vgs, T vgd, const JfetModel<P>& p)
 {
     const T vds = vgs - vgd;
     JfetEval<T> r;
-    r.igs = spice_junction(vgs, p.is, p.vt) + PhysicsConstants::JUNCTION_GMIN * vgs;
-    r.igd = spice_junction(vgd, p.is, p.vt) + PhysicsConstants::JUNCTION_GMIN * vgd;
+    r.igs = spice_junction(vgs, p.is, p.vt) + p.gmin * vgs;
+    r.igd = spice_junction(vgd, p.is, p.vt) + p.gmin * vgd;
     r.id = vds >= P(0.0) ? jfet_channel(vgs - p.vto, vds, p) : -jfet_channel(vgd - p.vto, -vds, p);
     return r;
 }
@@ -487,6 +492,7 @@ struct ZenerParams
     T N;      // Emission Coefficient (Forward)
     T Is;     // Saturation Current
     T Vt;     // Thermal Voltage
+    T gmin = PhysicsConstants::JUNCTION_GMIN;
 };
 
 /**
@@ -543,7 +549,7 @@ inline T zener_current(T vd, const ZenerParams<P>& p)
         }
     }
     
-    return i_fwd + i_rev + T(PhysicsConstants::JUNCTION_GMIN) * vd;  // as diode_model_pair
+    return i_fwd + i_rev + T(p.gmin) * vd;  // as diode_model_pair
 }
 
 // ============================================================================
