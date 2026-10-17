@@ -404,7 +404,6 @@ public:
 class CircuitSim {
 public:
   enum class ExecutionMode {
-      LEGACY_AOS = 0,
       TENSOR_SOA_SCALAR = 1,
       TENSOR_SOA_SIMD = 2,
       GPU = 3,
@@ -415,7 +414,7 @@ public:
   IntegratorArbiter arbiter;
   bool arbiterInitialized = false;
   std::unique_ptr<IIntegrationMethod> integrator;
-  ExecutionMode execMode = ExecutionMode::LEGACY_AOS;
+  ExecutionMode execMode = ExecutionMode::TENSOR_SOA_SIMD;
 
   // CSR pattern cache (Sparse Merge — Phase D5): rebuilt when a stamp falls
   // outside it (the topology hash ignores sources and node numbering)
@@ -513,10 +512,6 @@ public:
   // COMPONENT STAMPERS (Reusability Layer)
   // ===========================================================================
   // These helpers encapsulate the physics-to-matrix mapping.
-  // They are used by:
-  // 1. stampBlockNonLinear (AoS / Teaching Path)
-  // 2. stampSoABlock (SoA / Fast Path) [Partial coverage]
-  // 3. calculateSensitivity (Adjoint Method) [Future]
 
   void stampResistor(int n1, int n2, double R, MatrixConstructor& mb) {
       if (std::abs(R) < 1e-15) R = 1e-15; // Safety
@@ -531,66 +526,6 @@ public:
       } else if (n2 != 0) {
           mb.add(n2-1, n2-1, g);
       }
-  }
-
-  // Helper for Zener/Diode generic stamping
-  void stampTwoTerminalNonLinear(int n1, int n2, double g_eq, double i_eq, 
-                                 MatrixConstructor& mb, std::vector<double>& rhs) {
-      // Safety floor for M4 numerical stability
-      if (g_eq < 1e-15) g_eq = 1e-15;
-
-      // Stamp G (J = dI/dV)
-      if (n1 != 0 && n2 != 0) {
-          mb.add(n1-1, n1-1, g_eq);
-          mb.add(n2-1, n2-1, g_eq);
-          mb.add(n1-1, n2-1, -g_eq);
-          mb.add(n2-1, n1-1, -g_eq);
-      } else if (n1 != 0) {
-          mb.add(n1-1, n1-1, g_eq);
-      } else if (n2 != 0) {
-          mb.add(n2-1, n2-1, g_eq);
-      }
-
-      // Stamp RHS (Current Residual)
-      if (n1 != 0) rhs[n1-1] -= i_eq;
-      if (n2 != 0) rhs[n2-1] += i_eq;
-  }
-
-  void stampSchottky(const SchottkyDiode& sd, int nA, int nC, double v_diff, double temp_K,
-                     MatrixConstructor& mb, std::vector<double>& rhs) {
-      // Identical structure to Diode but different params/handling potentially
-      DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
-                                    sd.thermalVoltage_V_T_V};
-      params.Vt *= (temp_K / 300.15);
-      params.gmin = gmin_;
-
-      Dual<double> v_diff_dual(v_diff, 1.0);
-      Dual<double> i_d = diode_current_clamped(v_diff_dual, params);
-
-      double g_eq = i_d.grad;
-      double i_src = i_d.val - g_eq * v_diff;
-
-      stampTwoTerminalNonLinear(nA, nC, g_eq, i_src, mb, rhs);
-  }
-
-  void stampZener(const ZenerDiode& z, int nA, int nC, double v_diff, double temp_K,
-                  MatrixConstructor& mb, std::vector<double>& rhs) {
-      ZenerParams<double> zp;
-      zp.BV = z.breakdownVoltage_V;
-      zp.IBV = z.currentAtBreakdown_A;
-      zp.Rs = z.seriesResistance_Rs_ohms;
-      zp.gmin = gmin_;
-      zp.N = z.emissionCoefficient_N;
-      zp.Is = z.saturationCurrent_I_S_A;
-      zp.Vt = z.thermalVoltage_V_T_V * (temp_K / 300.15);
-
-      Dual<double> v_d(v_diff, 1.0);
-      Dual<double> result = zener_current(v_d, zp);
-
-      double g_eq = result.grad;
-      double i_src = result.val - g_eq * v_diff;
-
-      stampTwoTerminalNonLinear(nA, nC, g_eq, i_src, mb, rhs);
   }
 
   // MOSFET charge branches gs, gd, gb, bd, bs (mos1_charges) as terminal
@@ -1250,9 +1185,7 @@ public:
       if (corner.voltageScale > 0.1) {
           netlist.environment.global_voltage_scale = corner.voltageScale;
       }
-      
-      // Monte Carlo Seed (Phase 1.8.2)
-      netlist.environment.monte_carlo_seed = corner.monteCarloSeed;
+
   }
   
   // Deterministic RNG (FNV-1a Hash + Box-Muller)
@@ -1266,38 +1199,7 @@ public:
       return hash;
   }
   
-  // Returns standard normal sample N(0, 1)
-  double getGaussian(uint64_t hash) {
-      // Split 64-bit hash into two 32-bit uniform variates
-      uint32_t h1 = (uint32_t)(hash & 0xFFFFFFFF);
-      uint32_t h2 = (uint32_t)(hash >> 32);
-      
-      // Avoid 0 (log(0) is bad)
-      if (h1 == 0) h1 = 1; 
-      
-      double u1 = h1 / 4294967296.0;
-      double u2 = h2 / 4294967296.0;
-      
-      // Box-Muller Transform
-      return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * 3.14159265359 * u2);
-  }
-  
-  // Get MC-perturbed value
-  double getPerturbedValue(double nominal, double tolerance_pct, const std::string& name, int seed) {
-      if (tolerance_pct <= 1e-6 || seed == 0) return nominal;
-      
-      // Hash combining seed + name
-      uint64_t h = fnv1a(name, static_cast<uint64_t>(seed));
-      double z = getGaussian(h);
-      
-      // 3-sigma rule: tolerance is usually 3-sigma (or we treat it as 1-sigma?)
-      // Standard industry practice: Tolerance is usually 3-sigma limit.
-      // So sigma = tolerance / 3.
-      double sigma_pct = tolerance_pct / 3.0;
-      
-      double factor = 1.0 + (z * sigma_pct * 0.01);
-      return nominal * factor;
-  }
+
 
 private:
   MatrixConstructor matrixBuilder;
@@ -1483,8 +1385,6 @@ public:
       for (const auto &e : b.voltageSources) mark({e.nodePositive, e.nodeNegative});
       for (const auto &e : b.currentSources) mark({e.nodePositive, e.nodeNegative});
       for (const auto &e : b.diodes) mark({e.anode, e.cathode});
-      for (const auto &e : b.schottkyDiodes) mark({e.anode, e.cathode});
-      for (const auto &e : b.zenerDiodes) mark({e.anode, e.cathode});
       for (const auto &e : b.mosfets) mark({e.drain, e.gate, e.source, e.body});
       for (const auto &e : b.bjts) mark({e.nodeCollector, e.base, e.emitter, e.substrate});
       for (const auto &e : b.osdiDevices)
@@ -1497,7 +1397,6 @@ public:
       for (const auto &e : b.currentControlledCurrentSources) mark({e.outPos, e.outNeg});
       for (const auto &e : b.transmissionLines) mark({e.nodePort1Pos, e.nodePort1Neg, e.nodePort2Pos, e.nodePort2Neg});
       for (const auto &e : b.behavioural) mark({e.outPos, e.outNeg});
-      for (const auto &e : b.powerRails) mark({e.nodeRail});
       for (const auto &e : b.parasiticResistors) mark({e.node1, e.node2});
       for (const auto &e : b.parasiticCapacitors) mark({e.node1, e.node2});
     }
@@ -1765,21 +1664,6 @@ public:
         addRes(vccs.outNeg, i_vccs);
     }
 
-    // 3.25 Schottky Diode Audit
-    for (const auto &sd : netlist.globalBlock.schottkyDiodes) {
-      double v_a = getV(sd.anode);
-      double v_c = getV(sd.cathode);
-      double v_d = v_a - v_c;
-      
-      DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
-                            sd.thermalVoltage_V_T_V};
-      params.gmin = gmin_;
-      double i_d = diode_current_clamped(v_d, params);
-      
-      addRes(sd.anode, -i_d);
-      addRes(sd.cathode, i_d);
-    }
-
     // 3.55 MOSFETs, global block and every instance: the stamped mosCurrents()
     forEachMosfet(netlist, [&](const Mosfet &m, const std::array<int, 4> &t,
                                const BlockState::DeviceCharge *st) {
@@ -1813,28 +1697,6 @@ public:
     
     // 3.7 Hierarchical Instances — audited in Section 5 (parallel scheduler path)
     
-    // 3.7 Zener Audit
-    for (const auto &z : netlist.globalBlock.zenerDiodes) {
-        double v_a = getV(z.anode);
-        double v_c = getV(z.cathode);
-        double vd = v_a - v_c;
-        
-        ZenerParams<double> params;
-        params.BV = z.breakdownVoltage_V;
-        params.IBV = z.currentAtBreakdown_A;
-        params.Rs = z.seriesResistance_Rs_ohms;
-        params.gmin = gmin_;
-        params.N = z.emissionCoefficient_N;
-        params.Is = z.saturationCurrent_I_S_A;
-        params.Vt = z.thermalVoltage_V_T_V;
-        
-        double iz = zener_current(vd, params);
-        
-        // KCL: current leaves anode, enters cathode
-        addRes(z.anode, -iz);
-        addRes(z.cathode, iz);
-    }
-
     // 4. Capacitors (Transient Only)
     // If h > 0, we are in transient and must audit the displacement current
     if (h > 1e-15 && integrator) {
@@ -2096,19 +1958,6 @@ public:
       attributions.push_back(std::move(a));
     }
 
-    // Schottky Diodes
-    for (const auto &sd : netlist.globalBlock.schottkyDiodes) {
-      double v_d = getV(sd.anode) - getV(sd.cathode);
-      DiodeParams<double> params = {sd.saturationCurrent_I_S_A, sd.emissionCoefficient_N,
-                            sd.thermalVoltage_V_T_V};
-      params.gmin = gmin_;
-      double i_d = diode_current_clamped(v_d, params);
-      addRes(sd.anode, -i_d);
-      addRes(sd.cathode, i_d);
-      attributions.push_back({sd.instanceName, "SchottkyDiode",
-          {{sd.anode, -i_d}, {sd.cathode, i_d}}});
-    }
-
     // MOSFETs
     for (const auto &m : netlist.globalBlock.mosfets) {
       const auto c = mos1_currents(getV(m.drain), getV(m.gate), getV(m.source), getV(m.body),
@@ -2118,20 +1967,6 @@ public:
       addRes(m.body, -c.b);
       attributions.push_back({m.instanceName, "MOSFET",
           {{m.drain, -c.d}, {m.source, -c.s}, {m.body, -c.b}}});
-    }
-
-    // Zener Diodes
-    for (const auto &z : netlist.globalBlock.zenerDiodes) {
-      double vd = getV(z.anode) - getV(z.cathode);
-      ZenerParams<double> zp;
-      zp.BV = z.breakdownVoltage_V; zp.IBV = z.currentAtBreakdown_A;
-      zp.Rs = z.seriesResistance_Rs_ohms; zp.N = z.emissionCoefficient_N; zp.gmin = gmin_;
-      zp.Is = z.saturationCurrent_I_S_A; zp.Vt = z.thermalVoltage_V_T_V;
-      double iz = zener_current(vd, zp);
-      addRes(z.anode, -iz);
-      addRes(z.cathode, iz);
-      attributions.push_back({z.instanceName, "ZenerDiode",
-          {{z.anode, -iz}, {z.cathode, iz}}});
     }
 
     // Find worst node
@@ -2320,81 +2155,7 @@ public:
   // Phase 2: Numerical Integration Strategy
 
 
-  // --- SOLID/NASA Helper Functions ---
 
-  // --- SOLID/NASA Helper Functions ---
-
-  /**
-   * stampBlockLinear
-   * Stamps linear elements (Resistors, Sources, Capacitors) for a specific
-   * block instance.
-   */
-  void stampBlockLinear(const TensorBlock &block, const BlockState &state,
-                        const std::function<int(int)> &mapNode, double h, double time,
-                        const std::vector<double> &v_guess,
-                        double voltageScale = 1.0, int mcSeed = 0) {
-
-    // 1. Resistors
-    for (const auto &r : block.resistors) {
-      // MC Perturbation
-      double R = getPerturbedValue(r.resistance_ohms, r.tolerance_percent, r.name, mcSeed);
-      
-      stampResistor(mapNode(r.nodeTerminal1), mapNode(r.nodeTerminal2),
-                    R, matrixBuilder);
-    }
-    // 2. V sources, inductors (+K), E/F/H: branch-current elements, stamped
-    //    for every block by stampBranchSystem() from stampAllElements()
-    // 2.5 Power Rails (System Source)
-    for (size_t i = 0; i < block.powerRails.size(); ++i) {
-        const auto &rail = block.powerRails[i];
-        const auto &hist = state.powerRailState[i];
-        // Retrieve history (dc/transient)
-        double v_prev = 0.0;
-        double i_prev_cap = 0.0;
-        if (!hist.v.empty()) {
-            v_prev = hist.v[0];
-            i_prev_cap = hist.i[0]; // Stores capacitor current
-        }
-        
-        stampPowerRail(mapNode(rail.nodeRail), rail.nominal_V * voltageScale, rail.ripple_Vpp, rail.frequency_Hz,
-                       rail.ESR_ohms, rail.capacitance_F, h, time, 
-                       v_prev, i_prev_cap,
-                       matrixBuilder, rhsVector);
-    }
-
-    // 3. Current Sources
-    // 3. Current Sources
-    for (const auto &i : block.currentSources) {
-      double val = sourceValue(i, i.current_A, h, time);
-
-      int nP = mapNode(i.nodePositive);
-      int nN = mapNode(i.nodeNegative);
-      if (nP != 0)
-        rhsVector[nP - 1] -= val;
-      if (nN != 0)
-        rhsVector[nN - 1] += val;
-    }
-    // 4. Capacitors (Transient)
-    if (h > 1e-15 && integrator) {
-      for (size_t i = 0; i < block.capacitors.size(); ++i) {
-        const auto &c = block.capacitors[i];
-        const auto &hist = state.capacitorState[i];
-        double C = getPerturbedValue(c.capacitance_farads, c.tolerance_percent, c.name, mcSeed);
-        
-        integrator->stampCapacitor(mapNode(c.nodePlate1), mapNode(c.nodePlate2),
-                                   C, h, hist.v,
-                                   hist.i, matrixBuilder, rhsVector);
-      }
-    }
-
-    // 6. Dependent Sources: G here; E/F/H are branch elements
-    for (const auto &vccs : block.voltageControlledCurrentSources) {
-        stampVCCS(mapNode(vccs.ctrlPos), mapNode(vccs.ctrlNeg),
-                  mapNode(vccs.outPos), mapNode(vccs.outNeg),
-                  vccs.gm, matrixBuilder, rhsVector);
-    }
-
-  }
 
   /**
    * stampBlockNonLinear
@@ -2494,31 +2255,6 @@ public:
 
   }
 
-  void stampBlockNonLinear(const TensorBlock &block,
-                           const std::function<int(int)> &mapNode,
-                           const std::vector<double> &v_guess,
-                           double temp_K = 300.15) {
-    auto getV = [&](int globalNode) {
-      if (globalNode > 0 && globalNode <= (int)v_guess.size())
-        return v_guess[globalNode - 1];
-      return 0.0;
-    };
-
-    // 1.5 Schottky Diodes (Reuse Unified Diode Logic)
-    for (const auto &sd : block.schottkyDiodes) {
-      int nA = mapNode(sd.anode);
-      int nC = mapNode(sd.cathode);
-      stampSchottky(sd, nA, nC, getV(nA) - getV(nC), temp_K, matrixBuilder, rhsVector);
-    }
-
-    // 5. Zener Diodes
-    for (const auto &z : block.zenerDiodes) {
-        int nA = mapNode(z.anode);
-        int nC = mapNode(z.cathode);
-        
-        stampZener(z, nA, nC, getV(nA) - getV(nC), temp_K, matrixBuilder, rhsVector);
-    }
-  }
 
   /**
    * stampAllElements
@@ -2526,26 +2262,7 @@ public:
    */
   void stampAllElements(const TensorNetlist &netlist, double h,
                         const std::vector<double> &v_guess, double time) {
-    if (execMode == ExecutionMode::LEGACY_AOS) {
-        // A. Global Block
-        auto identityMap = [](int n) { return n; };
-        stampBlockLinear(netlist.globalBlock, netlist.globalState, identityMap, h, time, v_guess, netlist.environment.global_voltage_scale, netlist.environment.monte_carlo_seed);
-        stampBlockNonLinear(netlist.globalBlock, identityMap, v_guess, netlist.environment.ambient_temp_K);
-
-        // B. Hierarchical Batches
-        for (const auto &job : scheduler.jobs) {
-          const TensorBlock &block = *job.blockTmpl;
-          for (int instanceIdx : job.instanceIds) {
-            const auto &instance = netlist.instances[instanceIdx];
-            const auto &instState = netlist.instanceStates[instanceIdx];
-            auto mapNode = [&](int localNode) {
-              return (localNode <= 0) ? 0 : instance.nodeMapping[localNode - 1]; // NodeMapping check: 0->0, 1->mapping[0]
-            };
-            stampBlockLinear(block, instState, mapNode, h, time, v_guess, netlist.environment.global_voltage_scale, netlist.environment.monte_carlo_seed);
-            stampBlockNonLinear(block, mapNode, v_guess, netlist.environment.ambient_temp_K);
-          }
-        }
-    } else {
+    {
         // SoA Pathway (Flattened). tensorizeNetlist() stores DC values only, so
         // in transient re-evaluate every source at `time`, walking blocks in the
         // same order tensorizeNetlist() flattens them (global, then instances).

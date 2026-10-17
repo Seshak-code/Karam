@@ -681,78 +681,7 @@ inline std::array<T, 2> jfet_charges(T vgs, T vgd, const JfetModel<P>& p)
     return {depletion_charge(vgs, p.cgs, P(0.5), p.pb, p.fc), depletion_charge(vgd, p.cgd, P(0.5), p.pb, p.fc)};
 }
 
-// ============================================================================
-// ZENER DIODE PHYSICS
-// ============================================================================
 
-template <typename T>
-struct ZenerParams 
-{
-    T BV;     // Breakdown Voltage [V] (Positive value)
-    T IBV;    // Current at Breakdown [A] (Positive value)
-    T Rs;     // Series Resistance
-    T N;      // Emission Coefficient (Forward)
-    T Is;     // Saturation Current
-    T Vt;     // Thermal Voltage
-    T gmin = PhysicsConstants::JUNCTION_GMIN;
-};
-
-/**
- * zener_current
- * Models forward bias (exponential) and reverse breakdown (high current).
- */
-template <typename T, typename P>
-inline T zener_current(T vd, const ZenerParams<P>& p) 
-{
-    using std::exp;
-    using std::abs;
-    
-    // Forward Region
-    T i_fwd = p.Is * (exp(vd / (p.N * p.Vt)) - 1.0);
-    
-    // Reverse Breakdown Region
-    // Modeled as a diode in reverse with Vz = BV
-    // Soft knee approx or hard exponential?
-    // Using a simplified exponential model for breakdown:
-    // I_rev = -IBV * exp( -(vd + BV) / Vt_breakdown )? 
-    // Standard model sums a forward diode and a reverse "breakdown diode".
-    
-    T i_rev = 0.0;
-    T Vz = -p.BV; // Negative voltage for breakdown
-    
-    // If vd is near or below -BV
-    // If vd is near or below -BV
-    if (vd < -p.BV + T(0.5)) { 
-        T vd_z = -(vd + p.BV); // Voltage across Zener junction (positive when breakdown)
-        if (vd_z > 0.0) {
-             // Use linear continuation for breakdown exponential
-             auto n_vt = p.N * p.Vt;
-             T arg = vd_z / n_vt;
-             
-             T breakdown_current;
-             if (arg > 30.0) {
-                 double exp_max = std::exp(30.0);
-                 auto i_max = p.IBV * (exp_max - 1.0); // Assuming scaling matches IBV
-                 // Wait, IBV scaling logic in my head earlier `i_rev = -IBV * exp...`
-                 // formula: i_rev = -p.IBV * (exp(arg) - 1.0)
-                 // This assumes I at V=(-BV + Vt) is IBV*(e-1). 
-                 // Whatever, let's keep the formula structure but limit exp.
-                 
-                 // g_max = derivative of p.IBV*(exp(arg)-1) wrt vd_z
-                 // g_max = p.IBV * (1/n_vt) * exp(arg)
-                 auto g_max = (p.IBV / n_vt) * exp_max;
-                 T delta_v = vd_z - (n_vt * 30.0);
-                 breakdown_current = i_max + g_max * delta_v;
-             } else {
-                 breakdown_current = p.IBV * (exp(arg) - 1.0);
-             }
-             
-             i_rev = -breakdown_current;
-        }
-    }
-    
-    return i_fwd + i_rev + T(p.gmin) * vd;  // as diode_model_pair
-}
 
 // ============================================================================
 // END OF DEVICE PHYSICS
