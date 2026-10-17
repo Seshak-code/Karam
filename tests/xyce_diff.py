@@ -80,8 +80,9 @@ EXCLUDED = {
 }
 
 OPEN = {
-    "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card: ngspice runs its BSIM4v5, the engine "
-                  "BSIM4 4.8 (OSDI); v(1) 0.737 V vs ngspice 0.556 V, and ngspice with version=4.8 gives 0.739 V",
+    "Certification_Tests/BUG_807_SON/inverter_transient_xyce.cir": "BSIM4 version=4.5 card, PMOS body forward-biased, no AD/AS/PD/PS: "
+                  "ngspice's BSIM4v5 derives the default junction geometry differently from 4.8 (bsim4va); v(1) 0.737 V vs ngspice "
+                  "0.556 V, and ngspice with version=4.8 gives 0.739 V. Explicit zero geometry (sky130) is matched: x_bsim4_v45_zero_geo",
 }
 
 def gold(prn):

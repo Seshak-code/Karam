@@ -899,6 +899,28 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 kv << " " << k << "=" << std::setprecision(17) << v;
                 key += kv.str();
             }
+            // ponytail: ngspice runs VERSION < 4.6 cards on BSIM4v5, whose junction saturation current is 1e-14 A
+            // when the effective area and perimeter are both <= 0; bsim4va (4.8) leaves it 0, so a forward-biased
+            // body draws nothing. An area giving 1e-14 A at this temperature (b4temp TEMPMOD 0) stands in for
+            // instances that give AS/PS (AD/PD) as 0, as sky130's subcircuits do, when the gate-sidewall JSWGS is 0.
+            // Geometry left to BSIM4's defaults is not covered (its 4.5 and 4.8 defaults differ, BUG_807).
+            if (!v3 && p.count("VERSION") && p["VERSION"] < 4.6 && (!p.count("TEMPMOD") || p["TEMPMOD"] == 0.0)) {
+                auto get = [&](const char* k, double d) { return p.count(k) ? p[k] : d; };
+                const double Tn = p["TNOM"] + 273.15, T = ambientK_;
+                auto eg = [&](double t) { return get("BG0SUB", 1.16) - get("TBGASUB", 7.02e-4) * t * t / (t + get("TBGBSUB", 1108.0)); };
+                auto zeroGeo = [&](const char* a, const char* pr) {
+                    const auto ia = m.given.find(a), ip = m.given.find(pr);
+                    return ia != m.given.end() && ip != m.given.end() && ia->second <= 0.0 && ip->second <= 0.0;
+                };
+                auto shim = [&](const char* area, const char* per, double js, double xti, double nj, double jswg) {
+                    if (!zeroGeo(area, per) || js <= 0.0 || jswg != 0.0) return;
+                    const double jsT = js * std::exp((eg(Tn) / devtemp::vt(Tn) - eg(T) / devtemp::vt(T) + xti * std::log(T / Tn)) / nj);
+                    p[area] = 1e-14 / jsT;
+                };
+                const double jss = get("JSS", 1e-4), xtis = get("XTIS", 3.0), njs = get("NJS", 1.0);
+                shim("AS", "PS", jss, xtis, njs, get("JSWGS", 0.0));
+                shim("AD", "PD", get("JSD", jss), get("XTID", xtis), get("NJD", njs), get("JSWGD", get("JSWGS", 0.0)));
+            }
             auto& model = osdiModels_[key];
             if (!model) model = std::make_shared<osdi::Model>(osdi::findModule(module), c.name, p);
             OsdiDevice o;
