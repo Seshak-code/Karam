@@ -458,10 +458,11 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 case 'Q': parseBJT(tok, blk);         break;
                 case 'J': parseJFET(tok, blk);        break;
                 case 'N': parseOsdiDevice(tok, blk);  break;
-                case 'E': parseVCVS(tok, blk);        break;
-                case 'G': parseVCCS(tok, blk);        break;
-                case 'H': parseCCVS(tok, blk);        break;
-                case 'F': parseCCCS(tok, blk);        break;
+                case 'B': parseBehav(line, tok, blk); break;
+                case 'E': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseVCVS(tok, blk); break;
+                case 'G': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseVCCS(tok, blk); break;
+                case 'H': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseCCVS(tok, blk); break;
+                case 'F': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseCCCS(tok, blk); break;
                 // T used to be two unconnected resistors (silently wrong)
                 case 'T':
                     throw std::runtime_error(tok[0] + ": transmission lines are not supported yet");
@@ -1219,7 +1220,124 @@ void SPICEParser::parseCCCS(const std::vector<std::string>& tok, TensorBlock& bl
     blk.currentControlledCurrentSources.push_back(f);
 }
 
+bool SPICEParser::nonlinearForm(const std::vector<std::string>& tok) {
+    if (tok.size() < 4) return false;
+    const std::string k = toUpper(tok[3]);
+    return k == "POLY" || k == "VALUE" || k == "VOL" || k == "CUR" || k == "TABLE";
+}
+
+static std::string fmt(double v) {
+    std::ostringstream o;
+    o << std::setprecision(17) << v;
+    return o.str();
+}
+
+// B<name> n+ n- V=expr | I=expr;  E/G<name> n+ n- VALUE={expr} | TABLE {expr} = (x,y) ... | POLY(n) ...;
+// F/H<name> n+ n- POLY(n) Vsrc ... coefficients. `line` is the whole card (numparam::expand left the
+// expression as canonical text): tokenize() would flatten its punctuation.
+void SPICEParser::parseBehav(const std::string& line, const std::vector<std::string>& tok, TensorBlock& blk) {
+    const char t = static_cast<char>(std::toupper(static_cast<unsigned char>(tok[0][0])));
+    requireFields(tok, 4);
+    Behavioural b;
+    b.name = toUpper(tok[0]);
+    b.outPos = nodeIndex(tok[1]);
+    b.outNeg = nodeIndex(tok[2]);
+    b.voltage = t == 'E' || t == 'H';
+    const std::string kw = toUpper(tok[3]);
+    std::istringstream ws(line);
+    std::vector<std::string> w;
+    for (std::string x; ws >> x;) w.push_back(x);
+    auto afterEq = [&] {
+        const size_t eq = line.find('=');
+        return eq == std::string::npos ? std::string() : line.substr(eq + 1);
+    };
+    std::string text;
+    if (t == 'B') {
+        if (kw != "V" && kw != "I") throw std::runtime_error(tok[0] + ": expected V=<expression> or I=<expression>");
+        b.voltage = kw == "V";
+        text = afterEq();
+    } else if (kw == "POLY") {
+        // SPICE3: p0 + sum p_k m_k, the monomials m_k of the controls x1..xn by degree, each degree in
+        // non-decreasing index order (x1^2, x1*x2, x2^2, ...); fewer coefficients than terms leave the rest 0
+        if (tok.size() < 5) throw std::runtime_error(tok[0] + ": POLY needs its dimension");
+        const int n = static_cast<int>(parseValue(tok[4]));
+        const bool ctlNodes = t == 'E' || t == 'G';
+        const size_t first = 5 + (ctlNodes ? 2 : 1) * static_cast<size_t>(std::max(n, 0));
+        if (n < 1 || tok.size() < first) throw std::runtime_error(tok[0] + ": POLY(n) needs n >= 1 and its controls");
+        std::vector<std::string> x;
+        for (int i = 0; i < n; ++i)
+            x.push_back(ctlNodes ? "V(" + tok[5 + 2 * i] + "," + tok[6 + 2 * i] + ")" : "I(" + tok[5 + i] + ")");
+        std::vector<double> c;
+        for (size_t i = first; i < tok.size(); ++i) {
+            if (toUpper(tok[i]) == "IC") throw std::runtime_error(tok[0] + ": POLY IC is not supported yet");
+            c.push_back(parseValue(tok[i]));
+        }
+        text = "0";
+        std::vector<std::vector<int>> mono = {{}};  // the monomial of coefficient k, as control indices
+        for (int d = 1; mono.size() < c.size(); ++d) {
+            std::vector<std::vector<int>> deg = {{}};
+            for (int pos = 0; pos < d; ++pos) {
+                std::vector<std::vector<int>> next;
+                for (const auto& m : deg)
+                    for (int i = m.empty() ? 0 : m.back(); i < n; ++i) { next.push_back(m); next.back().push_back(i); }
+                deg = std::move(next);
+            }
+            mono.insert(mono.end(), deg.begin(), deg.end());
+        }
+        for (size_t k = 0; k < c.size(); ++k) {
+            text += "+(" + fmt(c[k]) + ")";
+            for (int i : mono[k]) text += "*" + x[i];
+        }
+    } else if (kw == "TABLE") {
+        if (w.size() < 7 || w[5] != "=") throw std::runtime_error(tok[0] + ": expected TABLE {expression} = (x,y) ...");
+        std::string pts = line.substr(line.find(" = ") + 3);
+        for (auto& ch : pts) if (ch == '(' || ch == ')' || ch == ',') ch = ' ';
+        std::istringstream in(pts);
+        std::vector<std::string> v;
+        for (std::string x; in >> x;) v.push_back(x);
+        if (v.size() < 4 || v.size() % 2) throw std::runtime_error(tok[0] + ": TABLE needs at least two (x,y) points");
+        text = "table(" + w[4];
+        double prev = -INFINITY;
+        for (size_t i = 0; i < v.size(); i += 2) {
+            const double xv = parseValue(v[i]);
+            if (!(xv > prev)) throw std::runtime_error(tok[0] + ": TABLE x values must increase");
+            prev = xv;
+            text += "," + fmt(xv) + "," + fmt(parseValue(v[i + 1]));
+        }
+        text += ")";
+    } else if (kw == "VALUE" || kw == "VOL" || kw == "CUR") {
+        if (t == 'F' || t == 'H') throw std::runtime_error(tok[0] + ": " + kw + " form is not supported yet");
+        text = afterEq();
+    } else throw std::runtime_error(tok[0] + ": " + kw + " form is not supported yet");
+
+    numparam::Expr e = numparam::parse(text, [](const std::string&, double&) { return false; });
+    for (const auto& r : e.refs) {
+        Behavioural::Ref br;
+        if (r.kind == 'V') { br.a = nodeIndex(r.a); br.b = r.b.empty() ? 0 : nodeIndex(r.b); }
+        else { br.kind = -1; br.src = r.a; }
+        b.refs.push_back(br);
+    }
+    b.expr = std::make_shared<const numparam::Expr>(std::move(e));
+    blk.behavioural.push_back(std::move(b));
+}
+
 void SPICEParser::resolveControlledSources(TensorBlock& blk) {
+    std::map<std::string, int> bvRank;  // voltage behavioural sources, in branch order
+    for (const auto& b : blk.behavioural) if (b.voltage) bvRank.emplace(b.name, (int)bvRank.size());
+    for (auto& b : blk.behavioural)
+        for (auto& r : b.refs) {
+            if (r.kind != -1) continue;
+            auto found = [&](const auto& list, int kind) {
+                for (size_t i = 0; i < list.size(); ++i)
+                    if (toUpper(list[i].name) == r.src) { r.kind = kind; r.a = (int)i; return true; }
+                return false;
+            };
+            if (!found(blk.voltageSources, 1) && !found(blk.inductors, 2)) {
+                if (auto it = bvRank.find(r.src); it != bvRank.end()) { r.kind = 3; r.a = it->second; }
+                else throw std::runtime_error(b.name + ": I(" + r.src + "): no V source, inductor or B voltage source of that name" +
+                                              (blk.name.empty() ? "" : " in subcircuit " + blk.name));
+            }
+        }
     auto find = [&](const std::string& name) {
         for (size_t i = 0; i < blk.voltageSources.size(); ++i)
             if (blk.voltageSources[i].name == name) return (int)i;

@@ -11,6 +11,7 @@
 #include <iostream>
 #include "../physics/physics_constants.h"
 #include "graph_canonical.h"
+#include "numparam.h"
 
 namespace osdi { class Model; class Instance; }
 
@@ -346,6 +347,24 @@ struct CCCS {
     std::string role;
     int ctrlSource = -1;       // index of the controlling V source in the same block
     std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
+};
+
+/*
+ * Behavioural source: B (V= / I=), E/G (VALUE, TABLE, POLY), F/H (POLY). The output (a voltage, which adds
+ * a branch current, or a current from + through the source to -) is expr over node voltages and branch
+ * currents; refs[k] binds expr->refs[k].
+ */
+struct Behavioural {
+    struct Ref {
+        int kind = 0;      // 0: V(a,b) over block-local nodes; I() of 1: V source a, 2: inductor a,
+        int a = 0, b = 0;  // 3: voltage behavioural source a (counted among the voltage ones)
+        std::string src;   // the source name I() gave, until the block is complete
+    };
+    std::string name;
+    int outPos = 0, outNeg = 0;
+    bool voltage = false;
+    std::shared_ptr<const acutesim::numparam::Expr> expr;
+    std::vector<Ref> refs;
 };
 
 // ============================================================================
@@ -788,6 +807,7 @@ struct TensorBlock {
     std::vector<VCCS> voltageControlledCurrentSources;
     std::vector<CCVS> currentControlledVoltageSources;
     std::vector<CCCS> currentControlledCurrentSources;
+    std::vector<Behavioural> behavioural;
     
     // Semiconductors
     std::vector<Diode> diodes;

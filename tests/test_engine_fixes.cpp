@@ -488,7 +488,8 @@ int main() {
         for (const auto& [e, want] : std::vector<std::pair<const char*, double>>{
                  {"2**3**2", 64}, {"2^3^2", 64}, {"-2**2", -4}, {"2**-1", 0.5}, {"nint(2.5)", 2}, {"nint(-2.5)", -2},
                  {"nint(3.5)", 4}, {"pwr(-2,3)", 8}, {"pow(-2,3)", -8}, {"5mil", 5e-3}, {"sqr(3)", 9}, {"2<>3", 1},
-                 {"-7%3", -1}, {"0?2:0?4:5", 5}, {"log(100)", std::log(100.0)}, {"temper", 27}, {"atanh(0.5)", std::atanh(0.5)}})
+                 {"-7%3", -1}, {"0?2:0?4:5", 5}, {"log(100)", std::log(100.0)}, {"temper", 27}, {"atanh(0.5)", std::atanh(0.5)},
+                 {"limit(5,0,1)", 1}, {"limit(-5,0,1)", 0}, {"limit(5,2)", 5}})
             if (std::abs(numparam::eval(e, none) - want) > 1e-12 * std::abs(want)) { std::printf("    %s\n", e); ++bad; }
         for (const char* e : {"1/0", "ln(0)", "1e400", "sqrt(-1)", "10%0", "min(3,1,2)"}) {
             bool threw = false;

@@ -11,7 +11,7 @@ ENGINE = next((p for p in (os.path.join(ROOT, "build", "acutesim_engine_dump"),
                            os.path.join(ROOT, "..", "build", "acutesim_engine", "acutesim_engine_dump"))
                if os.access(p, os.X_OK)), os.path.join(ROOT, "build", "acutesim_engine_dump"))
 GROUND = {"0", "GND"}  # ngspice: vss / ground are ordinary nodes
-NODE_POS = {**{c: [1, 2] for c in "RCLVIDHF"}, **{c: [1, 2, 3, 4] for c in "MEGT"},
+NODE_POS = {**{c: [1, 2] for c in "RCLVIDHFB"}, **{c: [1, 2, 3, 4] for c in "MEGT"},
             "Q": [1, 2, 3], "J": [1, 2, 3], "K": []}
 SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12, "f": 1e-15}
 
@@ -70,6 +70,8 @@ def node_map(text):
             w = re.sub(r"\s*=\s*", "=", line).split()
             w = w[:next((k for k, x in enumerate(w) if "=" in x or x.upper() == "PARAMS:"), len(w))]
             pos = range(1, len(w) - 1)
+        if c in "EGFH" and len(t) > 3 and t[3].upper() in ("POLY", "VALUE", "VOL", "CUR", "TABLE"):
+            pos = [1, 2]  # behavioural forms: the control nodes are not at the linear positions
         if c == "N":  # N<name> <terminals...> <model> [params]: terminals precede the first model name
             pos = range(1, next((k for k in range(1, len(t)) if t[k].upper() in models), 1))
         # Q c b e [s] model ...: the 4th field is a substrate node when the 5th is a name (engine rule)

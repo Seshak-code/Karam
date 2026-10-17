@@ -103,7 +103,9 @@ private:
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
-    // F/H name their controlling V source; resolve once the block is complete
+    static bool nonlinearForm(const std::vector<std::string>& tok);  // POLY / VALUE / VOL / CUR / TABLE
+    void parseBehav      (const std::string& line, const std::vector<std::string>& tok, TensorBlock& blk);
+    // F/H name their controlling V source, behavioural I() its source; resolve once the block is complete
     void resolveControlledSources(TensorBlock& blk);
 
     // ── Directive Parsers ─────────────────────────────────────────────
