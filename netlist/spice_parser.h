@@ -136,9 +136,10 @@ private:
     std::string      subcktName_;
     std::vector<std::string> subcktPorts_;
     TensorBlock      subcktBlock_;
+    std::map<std::string, std::map<std::string, int>> subcktNames_;  // subckt -> local node name -> index
     std::map<std::string, int> subcktNodeMap_;   // local node names of the body being parsed
     int              nextLocalNode_ = 1;
-    struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; };
+    struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; std::string name; };
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
     struct PendingIC { std::string node; double value; int line; };
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
@@ -147,7 +148,7 @@ private:
     std::map<std::string, std::map<int, std::string>> subcktGlobals_;  // subckt -> local index -> name
     std::map<std::string, std::vector<PendingInstance>> subcktChildren_;  // nodes are body-local
     std::map<std::string, int> savedInductorIndex_; // top-level K lookup, saved inside a body
-    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth);
+    void expandInstance(const PendingInstance& pi, const std::vector<int>& portNodes, int depth, const std::string& path = "");
 
     // Model cards collected during parse, merged into netlist at end
     std::map<std::string, ModelCard> modelCards_;

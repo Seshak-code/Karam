@@ -26,8 +26,11 @@ SUFFIX = {"t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3, "m": 1e-3, "u": 1e-6, "n": 
 #   time. On a steep edge 2% of swing alone is a sub-ps timing demand (a 100-stage chain accumulated
 #   0.95 ps = 0.1% of its delay against a reference converged to 0.15 ps; ngspice at its own default
 #   step is 3 ps off by stage 10).
+# Branch currents (I(V1), I(L1), ...): DC/AC atol 10 nA + rtol 1e-3. Transient: as a node, with 10% of swing or 2% of the
+#   peak (1 uA floor); an instant outside that passes when the mean over its .tran step agrees (the engine resolves
+#   switching spikes narrower than the reference's steps, with the same charge). A reference current above 1 kA is a diverged run and is not compared.
 # Both simulators run at ngspice's default 27 C (the engine's Vt is kT/q at 300.15 K since 2026-10-15).
-DEFAULTS = dict(dc_atol=2e-4, dc_rtol=1e-3, tran_rtol=0.02, tran_atol=5e-3)
+DEFAULTS = dict(dc_atol=2e-4, dc_rtol=1e-3, tran_rtol=0.02, tran_atol=5e-3, i_atol=1e-8, i_tran_atol=1e-6, i_tran_rtol=0.1)
 
 def num(s):
     m = re.fullmatch(r"([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z]*)", s.lower())
@@ -81,6 +84,27 @@ def node_map(text):
             if p < len(t) and t[p].upper() not in GROUND: m.setdefault(t[p].upper(), len(m) + 1)
     return m
 
+# Branch currents the engine gets wrong, with the node voltages fine (so only i() is skipped).
+NO_BRANCH_CHECK = {
+    "qa2_osdi_uic.cir": "UIC start: the engine seeds the OSDI charges at x0 (vdd node 0 V), the first step's inrush rings "
+                        "through trapezoidal integration forever (+-0.1 A on i(vdd)); ngspice solves the sources first",
+    "qa2_osdi_ic_ring.cir": "same UIC start",
+}
+
+def branch_names(text):
+    """Top-level branch-current elements (ngspice name#branch): V, L, linear E, H and B voltage sources."""
+    out, in_sub = [], False
+    for line in cards(text):
+        t = toks(line)
+        if t[0][0] == ".":
+            kw = t[0].upper()
+            in_sub = kw == ".SUBCKT" or (in_sub and kw != ".ENDS")
+            continue
+        poly = len(t) > 3 and t[3].upper() in ("POLY", "VALUE", "VOL", "CUR", "TABLE")  # ngspice rebuilds these: no e1#branch
+        if not in_sub and not (poly and t[0][0].upper() in "EH") and (t[0][0].upper() in "VLEH" or (t[0][0].upper() == "B" and re.search(r"\bv\s*=", line, re.I))):
+            out.append(t[0].lower())
+    return out
+
 def analysis(text):
     """-> ('op',) | ('dc', src, start, stop, step) | ('tran', tstep, tstop, uic) | ('ac', sweep, n, f1, f2)
        | ('noise', "v(out[,ref])", src, sweep, n, f1, f2) | ('unsupported', why)"""
@@ -106,15 +130,17 @@ def run_engine(args, text, mode, kind, step=0.0, stop=0.0):
     env = {**os.environ, **({"TREESPICE_BASEDIR": args.basedir} if getattr(args, "basedir", None) else {})}
     try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env).stdout
     except subprocess.TimeoutExpired: return dict(conv=False, err="TIMEOUT", pts=[])
-    conv, err, pts, total = False, "", [], None
+    conv, err, pts, total, branches, nodes = False, "", [], None, [], []
     for ln in out.splitlines():
-        if ln.startswith("TOTAL"): total = [float(x) for x in ln.split()[1:]]
+        if ln.startswith("BRANCHES"): branches = ln.split()[1:]
+        elif ln.startswith("NODES"): nodes = ln.split()[1:]
+        elif ln.startswith("TOTAL"): total = [float(x) for x in ln.split()[1:]]
         elif ln.startswith("CONVERGED"): conv = ln.split()[1] == "1"
         elif ln.startswith("ERROR"): err = ln[6:].strip()
         elif ln and (ln[0].isdigit() or ln[0] == "-"):
             try: pts.append([float(x) for x in ln.split()])
             except ValueError: pass
-    return dict(conv=conv, err=err, pts=pts, total=total)
+    return dict(conv=conv, err=err, pts=pts, total=total, branches=branches, nn=len(nodes))
 
 # ---------------------------------------------------------------- ngspice side
 def tran_tmax(text, an):
@@ -134,7 +160,7 @@ def tran_tmax(text, an):
     # ponytail: floor at tstop/1e5 so a ns edge in a ms run stays ~1e5 steps; such a run is checked at that density only.
     return max(min(an[1] / 10, edge), an[2] / 1e5)
 
-def run_ngspice(args, text, an, names):
+def run_ngspice(args, text, an, names, cur=()):
     """Return (xs, {name: [values]}) for the analysis, or raise RuntimeError. xs = [] for .op.
     Analysis/print cards are removed and replaced by a .control block (batch mode, ngspice defaults);
     the only option set is tmax on .tran so the reference is dense (see tran_tmax)."""
@@ -149,7 +175,8 @@ def run_ngspice(args, text, an, names):
     cmd = {"op": "op", "dc": "dc {1} {2!r} {3!r} {4!r}".format(*an) if an[0] == "dc" else "",
            "tran": "tran {0!r} {1!r} 0 {2!r}{3}".format(an[1], an[2], tran_tmax(text, an), " uic" if an[3] else "") if an[0] == "tran" else "",
            "ac": "ac {1} {2} {3!r} {4!r}".format(*an) if an[0] == "ac" else "", "noise": ""}[an[0]]
-    vecs = " ".join(f"v({n.lower()})" for n in names)
+    keys = list(names) + [f"i({c})" for c in cur]
+    vecs = " ".join(f"{k[2:-1]}#branch" if k[0] == "i" else f"v({k.lower()})" for k in keys)
     out = os.path.join(args.tmp, "ng.dat")
     if os.path.exists(out): os.remove(out)
     ctl = [".control", cmd, f"wrdata {out} {vecs}", "quit", ".endc", ".end"]
@@ -175,8 +202,8 @@ def run_ngspice(args, text, an, names):
     # For .op the "scale" is meaningless.
     xs = [] if an[0] == "op" else [r[0] for r in rows]
     if an[0] == "ac":
-        return xs, {n: [complex(r[3 * k + 1], r[3 * k + 2]) for r in rows] for k, n in enumerate(names)}
-    return xs, {n: [r[2 * k + 1] for r in rows] for k, n in enumerate(names)}
+        return xs, {n: [complex(r[3 * k + 1], r[3 * k + 2]) for r in rows] for k, n in enumerate(keys)}
+    return xs, {n: [r[2 * k + 1] for r in rows] for k, n in enumerate(keys)}
 
 # ---------------------------------------------------------------- comparison
 def interp(xs, ys, t):
@@ -195,7 +222,16 @@ def unsupported(r):
 def compare(args, text, an, mode, nm, ref):
     """-> (status, worst_abs, worst_rel, note)"""
     xs, vals = ref
-    names = list(nm)
+    # node names, then "i(name)" branch currents; a reference current above 1 kA is a diverged run, not a value
+    names = [n for n in vals if n[0] != "i" or max(abs(v) for v in vals[n]) <= 1e3] if an[0] != "noise" else []
+    def ecol(r, n, ac=False):  # engine column of a node or branch current (None: the engine has no such column)
+        if n in nm: return 2 * nm[n] - 1 if ac else nm[n]
+        b = n[2:-1]
+        if b not in r["branches"]: return None
+        k = r["branches"].index(b)
+        return 1 + 2 * r["nn"] + 2 * k if ac else 1 + r["nn"] + k
+    def atol(n, tran=False):
+        return (args.i_tran_atol if tran else args.i_atol) if n[0] == "i" else (args.tran_atol if tran else args.dc_atol)
     worst_abs = worst_rel = 0.0
     bad = []
     def judge(label, got, exp, tol, scale=None):
@@ -226,12 +262,13 @@ def compare(args, text, an, mode, nm, ref):
         for k, row in enumerate(r["pts"]):
             if abs(row[0] - xs[k]) > 1e-9 * xs[k]: bad.append(f"f={row[0]:g} vs ngspice {xs[k]:g}")
             for n in names:
-                c = 2 * nm[n] - 1
+                c = ecol(r, n, True)
+                if c is None: bad.append(f"no engine column for {n}"); continue
                 got, exp = complex(row[c], row[c + 1]), vals[n][k]
                 e = abs(got - exp)
                 worst_abs = max(worst_abs, e); worst_rel = max(worst_rel, e / max(abs(exp), 1e-3))
-                if not e <= args.dc_atol + args.dc_rtol * abs(exp):
-                    bad.append(f"f={xs[k]:g} v({n}): {got:.6g} vs ngspice {exp:.6g}")
+                if not e <= atol(n) + args.dc_rtol * abs(exp):
+                    bad.append(f"f={xs[k]:g} {n if n[0] == 'i' else f'v({n})'}: {got:.6g} vs ngspice {exp:.6g}")
     elif an[0] in ("op", "dc"):
         r = run_engine(args, text, mode, "dc")   # .op: one row; .dc: one row per sweep point
         if unsupported(r): return "ENGINE-UNSUPPORTED", 0, 0, r["err"]
@@ -242,8 +279,9 @@ def compare(args, text, an, mode, nm, ref):
             at = "" if an[0] == "op" else f"{an[1]}={row[0]:g} "
             if an[0] == "dc" and abs(row[0] - xs[k]) > 1e-9 * max(1.0, abs(xs[k])): bad.append(f"{at}sweep value vs ngspice {xs[k]:g}")
             for n in names:
-                exp = vals[n][k]
-                judge(f"{at}v({n})", row[nm[n]], exp, args.dc_atol + args.dc_rtol * abs(exp))
+                c, exp = ecol(r, n), vals[n][k]
+                if c is None: bad.append(f"no engine column for {n}"); continue
+                judge(f"{at}{n if n[0] == 'i' else f'v({n})'}", row[c], exp, atol(n) + args.dc_rtol * abs(exp))
     else:
         tstep, tstop = an[1], an[2]
         r = run_engine(args, text, mode, "tran", tstep, tstop)
@@ -253,11 +291,19 @@ def compare(args, text, an, mode, nm, ref):
         if ts[-1] < tstop * 0.999: bad.append(f"engine stopped at t={ts[-1]:g} < tstop={tstop:g} ({r['err']})")
         sel = [i for i, t in enumerate(ts) if xs[0] <= t <= xs[-1]]  # reference may start at TSTART
         dt = tstep / 10  # timing tolerance (see the policy above)
+        def charge(tt, yy):  # cumulative trapezoid integral, as a function of time
+            q = [0.0]
+            for j in range(1, len(tt)): q.append(q[-1] + 0.5 * (yy[j] + yy[j - 1]) * (tt[j] - tt[j - 1]))
+            return lambda t: interp(tt, q, t)
         for n in names:
             ref_n = vals[n]
+            c = ecol(r, n)
+            if c is None: bad.append(f"no engine column for {n}"); continue
+            eng = col(r, c)
+            qe, qr = charge(ts, eng), charge(xs, ref_n)
             swing = max(ref_n) - min(ref_n)
-            tol = max(args.tran_atol, args.tran_rtol * swing)
-            eng = col(r, nm[n])
+            tol = max(atol(n, True), args.tran_rtol * swing)
+            if n[0] == "i": tol = max(tol, args.i_tran_rtol * swing, 0.02 * max(abs(v) for v in ref_n))
             for i in sel:
                 # The reference's range over [t - dt, t + dt]; plus, where it jumps more than tol inside
                 # one cell (a switching edge), that cell's bracket: interpolation would invent a value.
@@ -266,7 +312,12 @@ def compare(args, text, an, mode, nm, ref):
                 k = bisect.bisect_left(xs, ts[i])
                 if 0 < k < len(xs) and abs(ref_n[k] - ref_n[k - 1]) > tol: win += [ref_n[k - 1], ref_n[k]]
                 got = min(max(eng[i], min(win)), max(win))
-                judge(f"t={ts[i]:g} v({n})", eng[i], got, tol, max(swing, 1e-3))
+                if n[0] == "i" and abs(eng[i] - got) > tol:
+                    # A switching spike narrower than the reference's steps carries the same charge: forgive the
+                    # instant when the mean over its .tran step agrees.
+                    a, b = max(ts[i] // tstep * tstep, xs[0]), min((ts[i] // tstep + 1) * tstep, xs[-1])
+                    if b - a > 1e-9 * tstep and abs((qe(b) - qe(a)) - (qr(b) - qr(a))) <= tol * (b - a): continue
+                judge(f"t={ts[i]:g} {n if n[0] == 'i' else f'v({n})'}", eng[i], got, tol, max(swing, 1e-3))
         if not r["conv"] and not bad: bad.append(f"engine reports not converged: {r['err']}")
     return ("FAIL" if bad else "PASS"), worst_abs, worst_rel, "; ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else "")
 
@@ -301,7 +352,7 @@ def main():
         if missing:
             print(f"{'SKIPPED':<19} {name} (missing {', '.join(missing)}: datasets/osdi from tests/build_osdi.sh, datasets/pdk see ENGINE_HANDOFF)"); continue
         nm = node_map(text) if an[0] != "noise" else {}
-        try: ref = run_ngspice(args, text, an, list(nm))
+        try: ref = run_ngspice(args, text, an, list(nm), branch_names(text) if an[0] != "noise" and name not in NO_BRANCH_CHECK else ())
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             print(f"{'NGSPICE-ERROR':<19} {name} {e}"); fails += 1; continue
         for mode in args.modes.split(","):

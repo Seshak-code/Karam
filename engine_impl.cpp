@@ -57,12 +57,23 @@ static SimulationResponseDTO stepToResponse(const SolverStep& step,
     WaveformDataPoint pt;
     pt.timeS = step.time;
     pt.nodeVoltages = step.nodeVoltages;
+    pt.branchCurrents = step.branchCurrents;
     dto.waveformPoints.push_back(std::move(pt));
 
     // Trust provenance
     dto.solverProvenance = step.stats.provenance();
     dto.precisionMode    = prec;
     return dto;
+}
+
+static void nameColumns(SimulationResponseDTO& r, const SPICEParseResult& parsed, const CircuitSim& sim) {
+    r.nodeNames.assign(parsed.netlist.numGlobalNodes, "");
+    for (const auto& [name, idx] : parsed.nodeIndex)
+        if (idx >= 1 && idx <= parsed.netlist.numGlobalNodes && r.nodeNames[idx - 1].empty()) {
+            r.nodeNames[idx - 1] = name;
+            for (auto& c : r.nodeNames[idx - 1]) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    r.branchNames = sim.branchNames(parsed.netlist);
 }
 
 // ── Helper: select CircuitSim ExecutionMode ────────────────────────────────
@@ -183,7 +194,7 @@ static SimulationResponseDTO dcSweep(CircuitSim& sim, TensorNetlist& netlist, co
                             s.stats.error_detail;
             break;
         }
-        r.waveformPoints.push_back({*value, s.nodeVoltages});
+        r.waveformPoints.push_back({*value, s.nodeVoltages, {}, s.branchCurrents});
         cb.onProgress(static_cast<int>(k + 1), static_cast<int>(n + 1));
     }
     return r;
@@ -207,8 +218,11 @@ SimulationResponseDTO SessionImpl::dispatch_dc_internal(const SimulationRequestD
         cb.onConvergenceStep(it, res);
     };
 
-    if (sweep.sweepVariable.empty()) return stepToResponse(sim.solveDC(netlist), jobId_, precision_);
-    return dcSweep(sim, netlist, sweep, cb, [this] { return status_.load() == JobStatus::Cancelled; });
+    SimulationResponseDTO r = sweep.sweepVariable.empty()
+        ? stepToResponse(sim.solveDC(netlist), jobId_, precision_)
+        : dcSweep(sim, netlist, sweep, cb, [this] { return status_.load() == JobStatus::Cancelled; });
+    nameColumns(r, parsed, sim);
+    return r;
 }
 
 
@@ -252,9 +266,15 @@ SimulationResponseDTO SessionImpl::dispatch_ac_internal(const SimulationRequestD
             pt.nodeVoltages.push_back(X[k][i].real());
             pt.nodeVoltagesImag.push_back(X[k][i].imag());
         }
+        const int nb = sim.branchCount(netlist);
+        for (int i = netlist.numGlobalNodes; i < netlist.numGlobalNodes + nb && i < (int)X[k].size(); ++i) {
+            pt.branchCurrents.push_back(X[k][i].real());
+            pt.branchCurrentsImag.push_back(X[k][i].imag());
+        }
         r.waveformPoints.push_back(std::move(pt));
         cb.onProgress(static_cast<int>(k + 1), static_cast<int>(freqs.size()));
     }
+    nameColumns(r, parsed, sim);
     return r;
 }
 
@@ -292,6 +312,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
             WaveformDataPoint pt;
             pt.timeS        = step.time;
             pt.nodeVoltages = step.nodeVoltages;
+            pt.branchCurrents = step.branchCurrents;
             result.waveformPoints.push_back(pt);
             if (streamCb) streamCb(pt, stepIdx);
             cb.onTimeStep(step.time, stopTime);
@@ -303,6 +324,7 @@ SimulationResponseDTO SessionImpl::dispatch_tran_internal(const SimulationReques
 
     result.iterations = static_cast<int>(stepIdx);
     result.analysisType = AnalysisTypeDTO::TRANSIENT;
+    nameColumns(result, parsed, sim);
     return result;
 }
 

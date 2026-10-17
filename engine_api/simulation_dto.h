@@ -196,7 +196,8 @@ struct WaveformDataPoint {
     double              timeS;            // time (tran), swept value (.dc), frequency (.ac)
     std::vector<double> nodeVoltages;     // real part for .ac
     std::vector<double> nodeVoltagesImag; // .ac only
-    std::vector<double> branchCurrents;
+    std::vector<double> branchCurrents;     // SimulationResponseDTO::branchNames order; real part for .ac
+    std::vector<double> branchCurrentsImag; // .ac only
 };
 
 struct ConvergenceTelemetryDTO {
@@ -236,6 +237,9 @@ struct SimulationResponseDTO {
     PrecisionMode   precisionMode = PrecisionMode::Mixed;
 
     std::vector<WaveformDataPoint> waveformPoints;
+    // Column names, lower case as ngspice prints them: nodeNames[i] is nodeVoltages[i] ("" if unnamed);
+    // branchNames[i] is branchCurrents[i] (the current into the + terminal of v1, l1, e1, h1, b1).
+    std::vector<std::string> nodeNames, branchNames;
     std::vector<double> timeVector;
     std::unordered_map<int, std::vector<double>> nodeVoltages;
     ExtendedAnalysisResultsDTO extended;
