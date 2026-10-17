@@ -86,7 +86,9 @@ jobs:
           ls -l datasets/osdi
 
       - name: Differential test vs ngspice ${{ env.NGSPICE_VERSION }}
-        run: "$PY" tests/ngspice_diff/run_diff.py --engine "$BIN/acutesim_engine_dump$EXE" --ngspice "$NGSPICE"
+        run: |
+          "$PY" tests/ngspice_diff/run_diff.py --engine "$BIN/acutesim_engine_dump$EXE" --ngspice "$NGSPICE"
 
       - name: CLI against ngspice
-        run: "$PY" tests/cli_check.py --treespice "$BIN/treespice$EXE" --ngspice "$NGSPICE"
+        run: |
+          "$PY" tests/cli_check.py --treespice "$BIN/treespice$EXE" --ngspice "$NGSPICE"
