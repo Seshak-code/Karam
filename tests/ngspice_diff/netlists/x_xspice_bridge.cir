@@ -1,0 +1,13 @@
+* XSPICE bridges: dac_bridge ramps at fixed slopes from where it is (a reversal mid-ramp, a U input heading for
+* out_undef); adc_bridge with unequal rise/fall delays and its U band, sensing a slow PWL
+vd d_a 0 pwl(0 0 1n 0 1.001n 3 1.5n 3 1.501n 0 3n 0 3.001n 1.5 4n 1.5 4.001n 3)
+a_in [d_a] [d] adcq
+.model adcq adc_bridge(in_low=1 in_high=2 rise_delay=1p fall_delay=1p)
+a_dac [d] [va] dac
+.model dac dac_bridge(out_low=0.2 out_high=3 out_undef=1.1 t_rise=1n t_fall=0.4n)
+rl va 0 1k
+vin vi 0 pwl(0 0 2n 3 4n 0)
+a_adc [vi] [da] adc
+.model adc adc_bridge(in_low=1 in_high=2 rise_delay=0.3n fall_delay=0.6n)
+.tran 0.05n 6n
+.end

@@ -9,6 +9,7 @@
 #include <set>
 #include <cassert>
 #include <iostream>
+#include "../physics/xspice.h"
 #include "../physics/physics_constants.h"
 #include "graph_canonical.h"
 #include "numparam.h"
@@ -1222,6 +1223,7 @@ class TensorNetlist {
 public:
     std::map<std::string, TensorBlock> blockDefinitions; // Library of blocks
     TensorBlock globalBlock;                             // Top-level components
+    std::shared_ptr<const xspice::Net> digital;          // XSPICE A devices and their event nodes (top level), or null
     
     // State Storage (Per-instance)
     BlockState globalState;

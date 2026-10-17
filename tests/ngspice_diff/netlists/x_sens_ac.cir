@@ -1,0 +1,8 @@
+* Sens Reference: AC Sensitivity of RC Filter
+v1 in 0 dc 0 ac 1
+r1 in out 1k
+c1 out 0 1u
+
+.sens v(out) ac dec 2 10 1k
+.print sens r1 c1
+.end

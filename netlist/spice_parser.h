@@ -121,6 +121,8 @@ private:
     void parseSwitch     (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseJFET       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseOsdiDevice (const std::vector<std::string>& tok, TensorBlock& blk);
+    void parseXspice     (const std::string& line, int lineNum);  // A<name> ports... model: resolved once the models are known
+    void resolveXspice   (int& line);  // line: the A card an error refers to
     void parseVCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseVCCS       (const std::vector<std::string>& tok, TensorBlock& blk);
     void parseCCVS       (const std::vector<std::string>& tok, TensorBlock& blk);
@@ -166,6 +168,8 @@ private:
     struct PendingInstance { std::string subckt; std::vector<int> nodes; int line; std::string name; };
     std::vector<PendingInstance> topInstances_;   // nodes are global indices
     struct PendingIC { std::string node; double value; int line; bool nodeset; };
+    struct PendingA { std::string name, model; std::vector<std::vector<std::string>> groups; int line; };
+    std::vector<PendingA> pendingA_;                // XSPICE A lines, resolved after parsing
     std::vector<PendingIC> pendingICs_;           // resolved once every node is known
     std::string pzNames_[4];                       // .pz node names, resolved likewise
     std::string sensOut_, sensRef_;                // .sens v() node names, resolved likewise

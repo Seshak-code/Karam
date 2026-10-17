@@ -357,6 +357,7 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     inSubckt_ = false;
     topInstances_.clear();
     pendingICs_.clear();
+    pendingA_.clear();
     subcktICs_.clear();
     globals_.clear();
     subcktGlobals_.clear();
@@ -375,6 +376,14 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
     osdiModels_.clear();
 
     auto lines = preprocessLines(netlistText);
+    // .control ... .endc is ngspice's interactive script, not circuit
+    for (auto it = lines.begin(); it != lines.end();) {
+        const std::string k = toUpper(it->second.substr(0, it->second.find_first_of(" \t")));
+        if (k != ".CONTROL") { ++it; continue; }
+        auto e = it;
+        while (e != lines.end() && toUpper(e->second.substr(0, e->second.find_first_of(" \t"))) != ".ENDC") ++e;
+        it = lines.erase(it, e == lines.end() ? e : std::next(e));
+    }
     if (lines.empty()) {
         result_.success = false;
         result_.errorMessage = "Empty netlist";
@@ -632,6 +641,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
                 case 'J': parseJFET(tok, blk);        break;
                 case 'S': case 'W': parseSwitch(tok, blk); break;
                 case 'N': parseOsdiDevice(tok, blk);  break;
+                case 'A':
+                    if (inSubckt_) throw std::runtime_error(tok[0] + ": XSPICE A devices inside a .subckt are not supported yet");
+                    parseXspice(line, lineNum);
+                    break;
                 case 'B': parseBehav(line, tok, blk); break;
                 case 'E': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseVCVS(tok, blk); break;
                 case 'G': nonlinearForm(tok) ? parseBehav(line, tok, blk) : parseVCCS(tok, blk); break;
@@ -669,6 +682,10 @@ SPICEParseResult SPICEParser::parse(const std::string& netlistText, const std::s
         std::cerr << "Warning: .options method=gear (maxord > 1) runs as trapezoidal\n";
     try { resolveControlledSources(result_.netlist.globalBlock); }
     catch (const std::exception& e) { return fail(lines.back().first, e.what()); }
+
+    // XSPICE A devices (their analog ports are top-level nodes, counted below)
+    int aLine = 0;
+    try { resolveXspice(aLine); } catch (const std::exception& e) { return fail(aLine ? aLine : lines.back().first, e.what()); }
 
     // Finalize: compute numGlobalNodes from nodeMap (max index)
     result_.nodeIndex = nodeMap_;
@@ -1772,7 +1789,8 @@ void SPICEParser::parseModelCard(const std::vector<std::string>& tok) {
     // Parse optional parameters (key=value pairs flattened by tokenizer)
     for (size_t i = 3; i + 1 < tok.size(); i += 2) {
         std::string key = toUpper(tok[i]);
-        double val = parseValue(tok[i + 1]);
+        const std::string word = toUpper(tok[i + 1]);  // XSPICE booleans (inertial_delay=false)
+        double val = word == "TRUE" ? 1.0 : word == "FALSE" ? 0.0 : parseValue(tok[i + 1]);
         card.params[key] = val;
 
         // Extract well-known fields
@@ -2021,3 +2039,156 @@ void SPICEParser::parseParam(const std::vector<std::string>& tok) {
 }
 
 } // namespace acutesim
+
+namespace acutesim {
+
+// A<name> <ports> <model>: a port is a node, NULL, ~node (an inverted digital input), or a [ ... ] vector;
+// %d / %v before a port name its type (the model decides it anyway).
+void SPICEParser::parseXspice(const std::string& line, int lineNum) {
+    std::string spaced;
+    for (char c : line) spaced += c == '[' || c == ']' ? std::string(" ") + c + " " : std::string(1, c);
+    std::istringstream ss(spaced);
+    std::vector<std::string> w;
+    for (std::string t; ss >> t;) w.push_back(t);
+    if (w.size() < 3) throw std::runtime_error(w[0] + ": expected ports, then a model name");
+    PendingA a{w[0], w.back(), {}, lineNum};
+    for (size_t i = 1; i + 1 < w.size(); ++i) {
+        if (w[i][0] == '%') {
+            if (w[i] != "%d" && w[i] != "%v") throw std::runtime_error(a.name + ": port type " + w[i] + " is not supported yet");
+            continue;
+        }
+        if (w[i] == "]") throw std::runtime_error(a.name + ": ']' without '['");
+        if (w[i] != "[") { a.groups.push_back({w[i]}); continue; }
+        std::vector<std::string> g;
+        for (++i; i + 1 < w.size() && w[i] != "]"; ++i)
+            if (w[i][0] != '%') g.push_back(w[i]);
+        if (i + 1 >= w.size()) throw std::runtime_error(a.name + ": '[' without ']'");
+        a.groups.push_back(g);
+    }
+    pendingA_.push_back(a);
+}
+
+// The A devices against their .model cards: ngspice 47's d_buffer ... d_dff, adc_bridge and dac_bridge
+// (parameters and defaults probed; see physics/xspice.h). A dac_bridge output becomes a voltage source.
+void SPICEParser::resolveXspice(int& at) {
+    if (pendingA_.empty()) return;
+    using xspice::Kind;
+    static const std::map<std::string, Kind> kinds = {
+        {"D_BUFFER", Kind::BUF}, {"D_INVERTER", Kind::INV}, {"D_AND", Kind::AND}, {"D_NAND", Kind::NAND},
+        {"D_OR", Kind::OR}, {"D_NOR", Kind::NOR}, {"D_XOR", Kind::XOR}, {"D_XNOR", Kind::XNOR},
+        {"D_TRISTATE", Kind::TRI}, {"D_PULLUP", Kind::PULLUP}, {"D_PULLDOWN", Kind::PULLDOWN}, {"D_DFF", Kind::DFF},
+        {"ADC_BRIDGE", Kind::ADC}, {"DAC_BRIDGE", Kind::DAC}};
+    auto net = std::make_shared<xspice::Net>();
+    std::map<std::string, int> dnode;  // upper-case name -> digital node
+    auto digital = [&](const std::string& n, const std::string& inst, bool nullOk, bool invOk) -> xspice::Port {
+        if (toUpper(n) == "NULL") {
+            if (!nullOk) throw std::runtime_error(inst + ": this port cannot be NULL");
+            return {};
+        }
+        const bool inv = n[0] == '~';
+        if (inv && !invOk) throw std::runtime_error(inst + ": an inverted (~) output is not supported yet");
+        const std::string name = inv ? n.substr(1) : n, key = toUpper(name);
+        if (nodeMap_.count(key)) throw std::runtime_error(inst + ": node " + name + " is analog; a digital port needs an event node");
+        auto [it, fresh] = dnode.emplace(key, (int)net->nodes.size());
+        if (fresh) {
+            std::string low = name;
+            for (auto& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            net->nodes.push_back(low);
+        }
+        return {it->second, inv};
+    };
+    for (const auto& a : pendingA_) {
+        at = a.line;
+        const auto mc = modelCards_.find(toUpper(a.model));
+        if (mc == modelCards_.end()) throw std::runtime_error(a.name + ": no .model card " + a.model);
+        const ModelCard* c = &mc->second;
+        const auto k = kinds.find(c->type);
+        if (k == kinds.end()) throw std::runtime_error(a.name + ": XSPICE model type " + c->type + " is not supported yet");
+        xspice::Inst x;
+        x.name = a.name;
+        x.kind = k->second;
+        auto single = [&](size_t g) {
+            if (g >= a.groups.size() || a.groups[g].size() != 1) throw std::runtime_error(a.name + ": expected a single port at position " + std::to_string(g + 1));
+            return a.groups[g][0];
+        };
+        auto need = [&](size_t n) {
+            if (a.groups.size() != n) throw std::runtime_error(a.name + ": " + c->type + " takes " + std::to_string(n) + " ports, got " + std::to_string(a.groups.size()));
+        };
+        std::set<std::string> allowed;
+        switch (x.kind) {
+        case Kind::BUF: case Kind::INV:
+            need(2);
+            x.in = {digital(single(0), a.name, false, true)};
+            x.out = {digital(single(1), a.name, false, false)};
+            allowed = {"RISE_DELAY", "FALL_DELAY", "INPUT_LOAD", "INERTIAL_DELAY"};
+            break;
+        case Kind::AND: case Kind::NAND: case Kind::OR: case Kind::NOR: case Kind::XOR: case Kind::XNOR:
+            need(2);
+            for (const auto& n : a.groups[0]) x.in.push_back(digital(n, a.name, false, true));
+            if (x.in.empty()) throw std::runtime_error(a.name + ": no inputs");
+            x.out = {digital(single(1), a.name, false, false)};
+            allowed = {"RISE_DELAY", "FALL_DELAY", "INPUT_LOAD", "INERTIAL_DELAY"};
+            break;
+        case Kind::TRI:
+            need(3);
+            x.in = {digital(single(0), a.name, false, true), digital(single(1), a.name, false, true)};
+            x.out = {digital(single(2), a.name, false, false)};
+            allowed = {"DELAY", "INPUT_LOAD", "ENABLE_LOAD"};
+            break;
+        case Kind::PULLUP: case Kind::PULLDOWN:
+            need(1);
+            x.out = {digital(single(0), a.name, false, false)};
+            allowed = {"LOAD"};
+            break;
+        case Kind::DFF:
+            need(6);
+            x.in = {digital(single(0), a.name, false, true), digital(single(1), a.name, false, true),
+                    digital(single(2), a.name, true, true), digital(single(3), a.name, true, true)};
+            x.out = {digital(single(4), a.name, true, false), digital(single(5), a.name, true, false)};
+            allowed = {"CLK_DELAY", "SET_DELAY", "RESET_DELAY", "IC", "RISE_DELAY", "FALL_DELAY", "DATA_LOAD", "CLK_LOAD", "SET_LOAD", "RESET_LOAD"};
+            break;
+        case Kind::ADC: case Kind::DAC: {
+            need(2);
+            const bool adc = x.kind == Kind::ADC;
+            const auto& an = a.groups[adc ? 0 : 1];
+            const auto& dn = a.groups[adc ? 1 : 0];
+            if (an.size() != dn.size() || an.empty()) throw std::runtime_error(a.name + ": the analog and digital port vectors differ in size");
+            for (size_t i = 0; i < an.size(); ++i) {
+                if (dnode.count(toUpper(an[i]))) throw std::runtime_error(a.name + ": node " + an[i] + " is digital; this port is analog");
+                x.analog.push_back(nodeIndex(an[i]));
+                (adc ? x.out : x.in).push_back(digital(dn[i], a.name, false, !adc));
+                if (!adc) {  // the output: an ideal source to ground, ramped by the simulation (ngspice: a#branch)
+                    VoltageSource v{};
+                    v.name = toUpper(a.name) + "#" + std::to_string(i);
+                    v.nodePositive = x.analog.back();
+                    v.nodeNegative = 0;
+                    x.vsrc.push_back((int)result_.netlist.globalBlock.voltageSources.size());
+                    result_.netlist.globalBlock.voltageSources.push_back(v);
+                }
+            }
+            allowed = adc ? std::set<std::string>{"IN_LOW", "IN_HIGH", "RISE_DELAY", "FALL_DELAY", "IN_LOAD", "FAMILY"}
+                          : std::set<std::string>{"OUT_LOW", "OUT_HIGH", "OUT_UNDEF", "T_RISE", "T_FALL", "INPUT_LOAD", "FAMILY"};
+            break;
+        }
+        }
+        for (const auto& [key, v] : c->params)
+            if (!allowed.count(key)) throw std::runtime_error("model " + c->name + ": parameter " + key + " is not a " + c->type + " parameter");
+        if (c->get("INERTIAL_DELAY", 0.0) != 0.0) throw std::runtime_error("model " + c->name + ": inertial_delay is not supported yet");
+        const double d = c->get("DELAY", 1e-9);  // d_tristate
+        x.rise = x.kind == Kind::TRI ? d : c->get("RISE_DELAY", 1e-9);
+        x.fall = x.kind == Kind::TRI ? d : c->get("FALL_DELAY", 1e-9);
+        x.clk = c->get("CLK_DELAY", 1e-9); x.set = c->get("SET_DELAY", 1e-9); x.reset = c->get("RESET_DELAY", 1e-9);
+        const double ic = c->get("IC", 0.0);
+        x.ic = ic == 1.0 ? xspice::L1 : ic == 0.0 ? xspice::L0 : xspice::LU;
+        x.lo = c->get("IN_LOW", 0.1); x.hi = c->get("IN_HIGH", 0.9);
+        x.vlo = c->get("OUT_LOW", 0.0); x.vhi = c->get("OUT_HIGH", 1.0); x.vun = c->get("OUT_UNDEF", 0.5);
+        x.trise = c->get("T_RISE", 1e-9); x.tfall = c->get("T_FALL", 1e-9);
+        if (!(x.hi > x.lo)) throw std::runtime_error("model " + c->name + ": in_high must be > in_low");
+        if (x.kind == Kind::DAC && !(x.trise > 0.0 && x.tfall > 0.0 && x.vhi != x.vlo))
+            throw std::runtime_error("model " + c->name + ": needs t_rise, t_fall > 0 and out_high != out_low");
+        net->insts.push_back(std::move(x));
+    }
+    result_.netlist.digital = net;
+}
+
+}  // namespace acutesim

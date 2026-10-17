@@ -1,0 +1,30 @@
+* XSPICE Reference 4: Tristate Bus with Pullup and Driver Contention
+a_pu bus pullup_mod
+.model pullup_mod d_pullup
+
+* Driver A
+a_tri_a in_a en_a bus tri_mod
+.model tri_mod d_tristate(delay=0.5n)
+
+* Driver B
+a_tri_b in_b en_b bus tri_mod
+
+* Control sources
+vin_a in_a_src 0 pulse(0 3 0 0.1n 0.1n 4n 8n)
+ven_a en_a_src 0 pulse(3 0 2n 0.1n 0.1n 4n 8n)
+
+vin_b in_b_src 0 pulse(3 0 0 0.1n 0.1n 4n 8n)
+ven_b en_b_src 0 pulse(0 3 5n 0.1n 0.1n 4n 8n)
+
+a_adc_ina [in_a_src] [in_a] adc_mod
+a_adc_ena [en_a_src] [en_a] adc_mod
+a_adc_inb [in_b_src] [in_b] adc_mod
+a_adc_enb [en_b_src] [en_b] adc_mod
+.model adc_mod adc_bridge(in_low=1.0 in_high=2.0)
+
+.tran 0.1n 12n
+.control
+run
+eprint in_a en_a in_b en_b bus
+.endc
+.end

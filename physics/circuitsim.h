@@ -448,6 +448,14 @@ public:
   // the kink measure the kink (an inductor's voltage jumps with dI/dt), not truncation error, and
   // rejected step after step down to femtoseconds. Three refill a trapezoidal history past it.
   int lteHold_ = 0;
+  // XSPICE A devices of the transient in progress (netlist.digital), or null
+  std::unique_ptr<xspice::Sim> xsim_;
+  std::vector<double> adcPrev_;  // node voltages at the accepted point before the current one (adc_bridge crossings)
+  double adcPrevT_ = 0;
+  const xspice::Sim *digital() const { return xsim_.get(); }
+  // Settle the digital part at t = 0 against the analog solution x; its dac_bridge outputs become DC values.
+  // Returns whether an adc_bridge would read x differently from its last settle.
+  bool settleDigital(TensorNetlist &netlist, const std::vector<double> &x);
   // runTransient's loop state, kept between advanceTo calls
   struct TranLoop {
     double step = 0, dtMin = 0, endTol = 0, hMax = 0, h = 0, t = 0;
