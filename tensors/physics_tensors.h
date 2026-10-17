@@ -37,7 +37,7 @@ inline Mos1Params<double> mos1Params(const Mosfet& m) {
     }
     p.vto = c.vto; p.lambda = c.lambda; p.gamma = c.gamma; p.phi = c.phi;
     p.beta = c.kp * m.w / leff * M;
-    p.isat = c.is * M;
+    p.isat = c.is * M; p.vt = c.vt;
     if (c.js > 0.0 && m.geo.ad > 0.0 && m.geo.as > 0.0) { p.isat = c.js * m.geo.ad * M; p.isats = c.js * m.geo.as * M; }  // ngspice mos1temp
     p.cox = c.tox > 0.0 ? 3.9 * 8.854214871e-12 / c.tox * m.w * leff * M : 0.0;
     p.cgso = c.cgso * m.w * M; p.cgdo = c.cgdo * m.w * M; p.cgbo = c.cgbo * leff * M;
@@ -55,19 +55,11 @@ inline Mos1Params<double> mos1Params(const Mosfet& m) {
 // .model values (AREA applied as ngspice does: currents and capacitances
 // scale, resistances divide). Devices built without a card keep the IS/N or
 // IS/BF/BR they were constructed with and SPICE defaults for the rest.
-// tempK: the engine's simple junction temperature law (Vt ~ T, IS with XTI = 3,
-// EG = 1.11), unchanged at 300.15 K; the other parameters do not track T.
-inline void junctionAtTemp(double tempK, double& vt, double& is) {
-    const double vt0 = vt, ts = tempK / 300.15;
-    vt *= ts;
-    is *= std::pow(ts, 3.0) * std::exp(1.11 / vt0 - 1.11 / vt);
-}
-
-inline DiodeModel<double> diodeModel(const Diode& d, double tempK = 300.15) {
+// The parser holds them at the instance temperature (Vt in thermalVoltage_V_T_V, IS, betas, junctions).
+inline DiodeModel<double> diodeModel(const Diode& d) {
     const auto& c = d.card;
     DiodeModel<double> p;
-    double vt = d.thermalVoltage_V_T_V, is = d.saturationCurrent_I_S_A;
-    if (tempK != 300.15) junctionAtTemp(tempK, vt, is);
+    const double vt = d.thermalVoltage_V_T_V, is = d.saturationCurrent_I_S_A;
     p.is = is * d.area;
     p.vte = d.emissionCoefficient_N * vt;
     p.rs = c.rs / d.area;
@@ -80,23 +72,20 @@ inline DiodeModel<double> diodeModel(const Diode& d, double tempK = 300.15) {
     return p;
 }
 
-inline JfetModel<double> jfetModel(const JFET& j, double tempK = 300.15) {
+inline JfetModel<double> jfetModel(const JFET& j) {
     const auto& c = j.card;
-    double vt = j.thermalVoltage_V_T_V, is = c.is;
-    if (tempK != 300.15) junctionAtTemp(tempK, vt, is);
     JfetModel<double> p;
     p.type = j.isNChannel ? 1.0 : -1.0;
     p.beta = j.beta * j.area; p.vto = j.Vto; p.lambda = j.lambda; p.b = c.b;
-    p.is = is * j.area; p.vt = c.n * vt;
+    p.is = c.is * j.area; p.vt = c.n * j.thermalVoltage_V_T_V;
     p.cgs = c.cgs * j.area; p.cgd = c.cgd * j.area; p.pb = c.pb; p.fc = c.fc;
     return p;
 }
 
-inline BjtModel<double> bjtModel(const BJT& q, double tempK = 300.15) {
+inline BjtModel<double> bjtModel(const BJT& q) {
     const auto& c = q.card;
     const double a = q.area;
-    double vt = q.thermalVoltage_V_T_V, is = q.saturationCurrent_I_S_A;
-    if (tempK != 300.15) junctionAtTemp(tempK, vt, is);
+    const double vt = q.thermalVoltage_V_T_V, is = q.saturationCurrent_I_S_A;
     BjtModel<double> p;
     p.type = q.isNPN ? 1.0 : -1.0;
     p.is = is * a; p.bf = q.betaF; p.br = q.betaR;

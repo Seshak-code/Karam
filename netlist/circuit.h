@@ -11,6 +11,7 @@
 #include <iostream>
 #include "../physics/physics_constants.h"
 #include "graph_canonical.h"
+#include "numparam.h"
 
 namespace osdi { class Model; class Instance; }
 
@@ -57,6 +58,14 @@ struct ModelCard {
  *   G[n1][n1] += 1/R, G[n2][n2] += 1/R
  *   G[n1][n2] -= 1/R, G[n2][n1] -= 1/R
  */
+inline constexpr const char* TEMP_LIST_ERR = "a .temp list is supported for .op/.dc only";
+
+// Instance temperature (ngspice TEMP in Celsius, DTEMP offset): TEMP wins, else DTEMP shifts the circuit's.
+struct InstTemp {
+    double temp = NAN, dtemp = 0.0;
+    double kelvin(double circuitK) const { return std::isnan(temp) ? circuitK + dtemp : temp + 273.15; }
+};
+
 struct Resistor {
     std::string name;             // e.g. "R1"
     int nodeTerminal1;            // First terminal (node index)
@@ -71,10 +80,12 @@ struct Resistor {
     double tolerance_percent = 0.0; // Monte Carlo Tolerance (e.g. 1.0 = 1%)
     std::string expression;         // Symbolic override (e.g. "Rload", "2*Vbias/Iref")
 
-    // Instance TC1/TC2 (NaN: the model's); the circuit runs at TNOM, so they act through a model TNOM only
-    double tc1 = NAN, tc2 = NAN;
+    double tc1 = 0.0, tc2 = 0.0;    // TC1, TC2: applied by the parser's resolve step, with inst
+    bool tc1Given = false, tc2Given = false;  // an instance TC overrides the model's
     double m = 1.0;                 // M=: parallel copies (applied by the parser's model resolution)
     double ac_ohms = NAN;           // AC=: the resistance .ac uses (NaN: resistance_ohms)
+    InstTemp inst;
+    double tcFactor = 1.0;          // resistance_ohms / nominal: .dc sweeps the nominal value
 };
 
 /*
@@ -112,13 +123,16 @@ struct Capacitor {
     double width_m = 0.0;
     double length_m = 0.0;
     double m = 1.0;               // Multiplier
-    double tc1 = NAN, tc2 = NAN;  // instance TC1/TC2 (NaN: the model's); act through a model TNOM only
 
     double tolerance_percent = 0.0;
     std::string expression;         // Symbolic override for capacitance
 
     bool   icGiven = false;           // IC= (initial voltage), used only with UIC
     double ic_V    = 0.0;
+
+    bool   tc1Given = false, tc2Given = false;  // instance TC1/TC2 override the model's
+    double tc1 = 0.0, tc2 = 0.0;
+    InstTemp inst;
 };
 
 /*
@@ -396,6 +410,24 @@ struct CCCS {
     std::string ctrlName;      // its instance name (parser resolves ctrlSource from it)
 };
 
+/*
+ * Behavioural source: B (V= / I=), E/G (VALUE, TABLE, POLY), F/H (POLY). The output (a voltage, which adds
+ * a branch current, or a current from + through the source to -) is expr over node voltages and branch
+ * currents; refs[k] binds expr->refs[k].
+ */
+struct Behavioural {
+    struct Ref {
+        int kind = 0;      // 0: V(a,b) over block-local nodes; I() of 1: V source a, 2: inductor a,
+        int a = 0, b = 0;  // 3: voltage behavioural source a (counted among the voltage ones)
+        std::string src;   // the source name I() gave, until the block is complete
+    };
+    std::string name;
+    int outPos = 0, outNeg = 0;
+    bool voltage = false;
+    std::shared_ptr<const acutesim::numparam::Expr> expr;
+    std::vector<Ref> refs;
+};
+
 // ============================================================================
 // SYSTEM SIMULATION SOURCES (Phase 2.9)
 // ============================================================================
@@ -512,6 +544,7 @@ struct BusProbe {
  */
 struct SimulationEnvironment {
     double ambient_temp_K = 300.15;   // 27°C
+    int temp_count = 1;               // values in the netlist's .temp list: more than one is for .op/.dc only
     double temp_ramp_K_per_s = 0.0;   // For thermal cycling
     
     // Process Corners (Monte Carlo)
@@ -575,6 +608,7 @@ struct Diode {
     } card;
     double area = 1.0;
     double pj = 0.0, mult = 1.0;  // PJ= (sidewall perimeter) and M= (the sidewall terms scale by M, not by AREA)
+    InstTemp inst;  // card and saturation current are held at the instance temperature (resolved by the parser)
 };
 
 /*
@@ -682,7 +716,9 @@ struct Mosfet {
         double mj = 0.5, mjsw = 0.33, pb = 0.8, fc = 0.5;
         double js = 0.0;                                    // bulk junction saturation current density [A/m^2]
         double kf = 0.0, af = 1.0;                          // flicker noise (AF is the frequency exponent in ngspice mos1noise)
+        double vt = PhysicsConstants::V_THERMAL_NOM;        // bulk junctions' kT/q at the instance temperature
     } card;
+    InstTemp inst;  // card is held at the instance temperature (resolved by the parser)
 
     // Noise Parameters
     double KF = 0.0;     // Flicker noise coefficient
@@ -722,6 +758,7 @@ struct BJT {
         double tf = 0.0, xtf = 0.0, vtf = 0.0, itf = 0.0, tr = 0.0;
     } card;
     double area = 1.0;
+    InstTemp inst;  // card, IS and betas are held at the instance temperature (resolved by the parser)
 
     double temperature_K = 300.15;
 };
@@ -851,6 +888,7 @@ struct TensorBlock {
     std::vector<VCCS> voltageControlledCurrentSources;
     std::vector<CCVS> currentControlledVoltageSources;
     std::vector<CCCS> currentControlledCurrentSources;
+    std::vector<Behavioural> behavioural;
     
     // Semiconductors
     std::vector<Diode> diodes;
