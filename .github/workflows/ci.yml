@@ -72,9 +72,8 @@ jobs:
             fi
             echo "NGSPICE=$HOME/ngspice/bin/ngspice" >> "$GITHUB_ENV" ;;
           Windows)  # MSYS2's gcc build from the same source: the official MSVC build's numbers differ from it
-            ng="$(cygpath -m '${{ steps.msys2.outputs.msys2-location }}')/ucrt64/bin/ngspice.exe"
-            "$ng" -v | head -2
-            echo "NGSPICE=$ng" >> "$GITHUB_ENV" ;;
+            # ngspice_con: the console build (ngspice.exe is the GUI one, which waits on its window)
+            echo "NGSPICE=$(cygpath -m '${{ steps.msys2.outputs.msys2-location }}')/ucrt64/bin/ngspice_con.exe" >> "$GITHUB_ENV" ;;
           macOS)
             brew install ngspice > /dev/null
             echo "NGSPICE=$(brew --prefix)/bin/ngspice" >> "$GITHUB_ENV" ;;
