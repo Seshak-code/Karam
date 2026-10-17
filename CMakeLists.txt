@@ -21,6 +21,9 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The one version string: treespice --version and EngineCapabilities::engineVersionString
+set(TREESPICE_VERSION "1.0-alpha")
+
 # ---------------------------------------------------------------------------
 # GPU (Phase 4): Dawn / WebGPU. OpenVLSI provides dawn_native when it builds the
 # engine as a subdirectory; standalone, -DTREESPICE_GPU=ON fetches the same Dawn
@@ -50,6 +53,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(acutesim_engine_objects OBJECT)
 target_compile_features(acutesim_engine_objects PUBLIC cxx_std_17)
+target_compile_definitions(acutesim_engine_objects PRIVATE TREESPICE_VERSION="${TREESPICE_VERSION}")
 
 # === HARDENING: Symbol Visibility Discipline ===
 target_compile_options(acutesim_engine_objects PRIVATE
@@ -171,8 +175,8 @@ endif()
 # ---------------------------------------------------------------------------
 # CLI — Engine Consumer
 # ---------------------------------------------------------------------------
-add_executable(acutesim_engine_cli cli/engine_cli_main.cpp)
-target_link_libraries(acutesim_engine_cli PRIVATE acutesim_engine)
+add_executable(treespice cli/engine_cli_main.cpp)
+target_link_libraries(treespice PRIVATE acutesim_engine)
 
 # ---------------------------------------------------------------------------
 # Waveform dump tool — machine-readable output for tests/ngspice_diff

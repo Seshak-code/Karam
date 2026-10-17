@@ -465,7 +465,7 @@ void EngineImpl::detectCapabilities() {
     capabilities_.neonSupported = true;
 #endif
 
-    capabilities_.engineVersionString = "AcuteSim Engine 1.0-alpha";
+    capabilities_.engineVersionString = "TreeSPICE " TREESPICE_VERSION;
 }
 
 std::unique_ptr<SimulationSession> EngineImpl::createSession() {
